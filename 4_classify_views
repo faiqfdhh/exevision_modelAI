@@ -1,0 +1,133 @@
+import os
+import json
+import shutil
+import numpy as np
+from tqdm import tqdm
+
+# --- Configuration ---
+FEATURES_DIR = "./squat/extracted_features1/pose"
+VIDEOS_DIR = "./squat/dataset_videos_all"
+SORTED_DIR = "./squat/classified_videos"
+
+# --- Thresholds ---
+PURE_SIDE_WIDTH = 0.08       # Width < 0.08 is SIDE
+ROTATION_THRESHOLD = 0.15    # Shoulder Z-diff > 0.15 is DIAGONAL
+NOSE_Z_THRESHOLD = 0.05      # Nose Z > 0.05 means BACK view
+
+def get_view_label(keypoints_img):
+    # Indices: 0=Nose, 11=L_Shoulder, 12=R_Shoulder, 23=L_Hip, 24=R_Hip
+    valid_frames = 0
+    total_shoulder_width = 0
+    total_shoulder_depth = 0
+    total_nose_hip_diff = 0 
+
+    # Check first 60 frames
+    frames_to_check = min(len(keypoints_img), 60)
+
+    for i in range(frames_to_check):
+        frame = keypoints_img[i]
+        
+        if frame[0][0] == 0.0: continue # Skip empty
+        
+        # 1. Width (X-axis)
+        width = abs(frame[11][0] - frame[12][0])
+        
+        # 2. Rotation (Shoulder Z-axis diff)
+        depth = abs(frame[11][2] - frame[12][2])
+        
+        # 3. Front/Back Indicator (Nose Z relative to Hips)
+        # MediaPipe Z: Negative = Closer, Positive = Further
+        nose_z = frame[0][2]
+        # Average hip Z is usually ~0 in World landmarks, but varying in Image landmarks
+        # We assume Image landmarks here. 
+        avg_hip_z = (frame[23][2] + frame[24][2]) / 2.0
+        
+        # If Nose Z is LARGER than Hip Z, nose is further away -> BACK view
+        # If Nose Z is SMALLER than Hip Z, nose is closer -> FRONT view
+        nose_rel_z = nose_z - avg_hip_z
+        
+        total_shoulder_width += width
+        total_shoulder_depth += depth
+        total_nose_hip_diff += nose_rel_z
+        valid_frames += 1
+
+    if valid_frames < 5: return "unknown"
+
+    avg_width = total_shoulder_width / valid_frames
+    avg_rot = total_shoulder_depth / valid_frames
+    avg_nose_diff = total_nose_hip_diff / valid_frames
+    
+    # --- Classification Logic ---
+    
+    # 1. Side Check
+    if avg_width < PURE_SIDE_WIDTH:
+        return "side"
+
+    # 2. Front vs Back Check
+    # In your data: Front Nose Z ~ -0.2, Back Nose Z ~ +0.1 to +0.7
+    if avg_nose_diff > NOSE_Z_THRESHOLD:
+        facing = "back"
+    else:
+        facing = "front"
+
+    # 3. Rotation Check (Diagonal)
+    if avg_rot > ROTATION_THRESHOLD:
+        return f"{facing}_side"
+    else:
+        return facing
+
+def run_separation(debug_mode=False):
+    for view in ["front", "back", "side", "front_side", "back_side", "unknown"]:
+        os.makedirs(os.path.join(SORTED_DIR, view), exist_ok=True)
+
+    json_files = [f for f in os.listdir(FEATURES_DIR) if f.endswith(".json")]
+    
+    # Validation List (Your Ground Truth)
+    debug_ids = ["25708_2", "25734_3", "25737_1", "25742_3", "25760_7"]
+
+    if debug_mode:
+        print("\n=== DEBUG VALIDATION ===")
+        for vid_id in debug_ids:
+            path = os.path.join(FEATURES_DIR, f"{vid_id}.json")
+            if os.path.exists(path):
+                with open(path, 'r') as f: data = json.load(f)
+                label = get_view_label(data["keypoints_img"])
+                print(f"Video {vid_id} -> {label}")
+        return
+
+    print(f"Sorting {len(json_files)} videos...")
+    stats = {k:0 for k in ["front", "back", "side", "front_side", "back_side", "unknown"]}
+
+    for json_file in tqdm(json_files):
+        try:
+            with open(os.path.join(FEATURES_DIR, json_file), 'r') as f:
+                data = json.load(f)
+            
+            label = get_view_label(data["keypoints_img"])
+            stats[label] += 1
+            
+            # Save label back to JSON
+            if "info" not in data: data["info"] = {}
+            data["info"]["view"] = label
+            with open(os.path.join(FEATURES_DIR, json_file), 'w') as f:
+                json.dump(data, f)
+            
+            # Move Video (Optional)
+            vid_name = json_file.replace(".json", ".mp4")
+            src = os.path.join(VIDEOS_DIR, vid_name)
+            # Add extension search logic if needed here
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(SORTED_DIR, label, os.path.basename(src)))
+
+        except Exception as e:
+            pass
+
+    print("\nResults:")
+    for k,v in stats.items(): print(f"{k}: {v}")
+
+if __name__ == "__main__":
+    # 1. Run Debug first to prove it works
+    run_separation(debug_mode=True)
+    
+    # 2. Then uncomment to run full batch
+    # run_separation(debug_mode=False)
