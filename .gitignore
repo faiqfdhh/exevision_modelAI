@@ -3,3 +3,10 @@
 .mp4
 .json
 venv
+.venv
+.png
+png
+*.png
+*.txt
+
+pipeline_ui_runs/
