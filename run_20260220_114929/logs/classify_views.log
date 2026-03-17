@@ -1,0 +1,19 @@
+======================================================================
+
+🎥 Classifying 3 videos by view...
+📁 Processing from: excellent, good, fair
+
+
+Classifying videos:   0%|          | 0/3 [00:00<?, ?it/s]
+Classifying videos:  67%|██████▋   | 2/3 [00:00<00:00, 16.63it/s]
+Classifying videos: 100%|██████████| 3/3 [00:00<00:00, 15.15it/s]
+
+======================================================================
+CLASSIFICATION SUMMARY
+======================================================================
+  back        : 1
+  side        : 1
+  back_side   : 1
+
+✅ All JSON files updated with 'view' field
+📁 Updated in: excellent, good, fair

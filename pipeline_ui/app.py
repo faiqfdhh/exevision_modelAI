@@ -33,6 +33,7 @@ class Stage:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNS_ROOT = PROJECT_ROOT / "pipeline_ui_runs"
 SHARED_MODEL_PATH = PROJECT_ROOT / "models" / "pose_landmarker_heavy.task"
+SHARED_FACE_MODEL_PATH = PROJECT_ROOT / "models" / "blaze_face_short_range.tflite"
 
 
 STAGES: tuple[Stage, ...] = (
@@ -606,6 +607,10 @@ class PipelineRunnerUI:
             raise RuntimeError(f"Shared model file not found: {SHARED_MODEL_PATH}")
         self._log(f"Using shared pose model: {SHARED_MODEL_PATH}")
 
+        if not SHARED_FACE_MODEL_PATH.exists():
+            raise RuntimeError(f"Shared face model file not found: {SHARED_FACE_MODEL_PATH}")
+        self._log(f"Using shared face model: {SHARED_FACE_MODEL_PATH}")
+
         # Ensure local copy of analyze_results.py exists inside workspace
         analyze_src = PROJECT_ROOT / "squat" / "aqa_analysis_simple" / "analyze_results.py"
         analyze_dst = workspace_root / "squat" / "aqa_analysis_simple" / "analyze_results.py"
@@ -666,6 +671,7 @@ class PipelineRunnerUI:
         log_file = logs_root / f"{stage.key}.log"
         env = os.environ.copy()
         env["EXEVISION_MODEL_PATH"] = str(SHARED_MODEL_PATH)
+        env["EXEVISION_FACE_MODEL_PATH"] = str(SHARED_FACE_MODEL_PATH)
 
         with open(log_file, "w", encoding="utf-8") as f:
             process = subprocess.Popen(
@@ -779,6 +785,8 @@ class PipelineRunnerUI:
             found.extend(sorted(root.rglob("*_annotated.mp4")))
             found.extend(sorted(root.rglob("*_segmented.mp4")))
             found.extend(sorted(root.rglob("*_phases.mp4")))
+            found.extend(sorted(root.rglob("*_segmented.avi")))
+            found.extend(sorted(root.rglob("*_phases.avi")))
 
         if selected_stem:
             # Match annotated, segmented, or phases video
@@ -966,12 +974,30 @@ class PipelineRunnerUI:
         diagnostics.sort(key=lambda item: item["metric_score"])
         return diagnostics
 
+    def _normalize_diagnostic_detail(self, detail: dict) -> dict:
+        normalized = dict(detail)
+        if "rule_text" not in normalized:
+            normalized["rule_text"] = normalized.get("threshold_text", "thresholds unavailable")
+        if "direction_text" not in normalized:
+            higher_is_better = normalized.get("higher_is_better")
+            if higher_is_better is True:
+                normalized["direction_text"] = "higher is better"
+            elif higher_is_better is False:
+                normalized["direction_text"] = "lower is better"
+            else:
+                normalized["direction_text"] = "rule direction unavailable"
+        if "weight" not in normalized:
+            normalized["weight"] = 0.0
+        if "severity" not in normalized:
+            normalized["severity"] = score_severity(float(normalized.get("metric_score", 0.0)))
+        return normalized
+
     def _format_rep_analysis(self, rep: dict, view: str, analysis_summary: dict | None = None) -> list[str]:
         rep_id = rep.get("rep_id", "?")
         if analysis_summary:
             for analyzed_rep in analysis_summary.get("repetitions", []):
                 if analyzed_rep.get("rep_id") == rep_id:
-                    diagnostics = analyzed_rep.get("diagnostics", [])
+                    diagnostics = [self._normalize_diagnostic_detail(item) for item in analyzed_rep.get("diagnostics", [])]
                     headline = analyzed_rep.get("headline")
                     break
             else:
@@ -1091,7 +1117,19 @@ class PipelineRunnerUI:
 
         self.current_analysis_summary_data = analysis_summary
         self.current_score_data = data
-        self._set_score_display(self._format_score_report(data, analysis_summary))
+        try:
+            report_text = self._format_score_report(data, analysis_summary)
+        except Exception as exc:
+            self.current_analysis_summary_data = analysis_summary
+            self.current_score_data = data
+            self._set_score_display(
+                "Failed to format scoring results.\n\n"
+                f"{exc}\n\n"
+                "The scoring JSON loaded successfully, but the UI report formatter hit an unexpected data shape."
+            )
+            return
+
+        self._set_score_display(report_text)
 
     def _find_original_video_for_overlay(self, overlay_path: Path) -> Path | None:
         try:
@@ -1532,9 +1570,1844 @@ class PipelineRunnerUI:
         text_widget.configure(state="disabled")  # Read-only
 
 
+# ---------------------------------------------------------------------------
+# Annotation Tool UI
+# ---------------------------------------------------------------------------
+
+ANNOTATIONS_DIR = PROJECT_ROOT / "dataset" / "annotations"
+ANNOTATIONS_VIDEOS_DIR = ANNOTATIONS_DIR / "videos"
+ANNOTATIONS_INDEX = ANNOTATIONS_DIR / "index.json"
+VIDEO_SCAN_BATCH_SIZE = 500
+
+
+class AnnotationToolUI:
+    """
+    Rep annotation tool for ExeVision neural training dataset.
+
+    Workflow:
+      1. User picks a folder of raw squat videos
+      2. Tool shows a browsable video list — user clicks one to annotate
+      3. Tool auto-detects existing pipeline output in pipeline_ui_runs/
+         - Found: loads segmentation + scoring results
+         - Not found: runs Stages 2.5→4→5→8 automatically
+      4. Presents each rep for human scoring (blind — heuristic revealed after)
+      5. Annotations saved per-video to dataset/annotations/videos/{video_id}.json
+
+    Keyboard-driven: type score + Enter, F1-F5 toggle flags.
+    """
+
+    def __init__(self, parent: ttk.Frame):
+        self.parent = parent
+        self.root = parent.winfo_toplevel()
+
+        # State ----------------------------------------------------------
+        self.videos_folder: Path | None = None
+        self._last_scanned_folder: Path | None = None
+        self.video_files: list[Path] = []
+        self.loaded_video_count: int = 0
+        self._scan_in_progress: bool = False
+        self._processed_vids_cache: set[str] = set()
+        self._initial_load_target: int = VIDEO_SCAN_BATCH_SIZE
+        self.current_video_path: Path | None = None
+        self.current_video_id: str = ""
+        self.current_annotation: dict | None = None  # loaded per-video annotation
+        self.current_rep_idx: int = 0                 # which rep we're annotating
+        self.current_video_idx: int | None = None     # index of current selected video
+        self.pipeline_run_used: str = ""              # which run folder was used
+        self.annotation_extraction_mode_var = tk.StringVar(value="Filtered")
+        self._annotation_extraction_mode_map = {
+            "Filtered": "filtered",
+            "Unfiltered (raw)": "unfiltered",
+        }
+
+        # Video playback
+        self.cap_raw: cv2.VideoCapture | None = None
+        self.cap_vis: cv2.VideoCapture | None = None
+        self.playing: bool = False
+        self.play_stop_event = threading.Event()
+        self.play_thread: threading.Thread | None = None
+        self.rep_start: int = 0
+        self.rep_end: int = 0
+        self.fps: float = 30.0
+        self._photo_raw = None
+        self._photo_vis = None
+
+        # Pipeline subprocess
+        self.pipeline_process: subprocess.Popen | None = None
+        self.pipeline_running = False
+        self.stage_timeouts_sec = {
+            "extract_selected_features": 180,
+            "classify_views": 120,
+            "temporal_segmentation": 300,
+            "scoring": 120,
+        }
+
+        self._build_ui()
+
+    # ================================================================== UI
+    def _build_ui(self) -> None:
+        self.parent.columnconfigure(0, weight=1)
+        self.parent.rowconfigure(0, weight=1)
+
+        # Use PanedWindow so the user can resize left vs. right by dragging
+        paned = tk.PanedWindow(self.parent, orient=tk.HORIZONTAL, sashwidth=5, sashrelief="raised")
+        paned.pack(fill=tk.BOTH, expand=True)
+
+        # ---- LEFT PANEL: folder + video list + scoring ----
+        left_outer = ttk.Frame(paned, padding=0)
+        paned.add(left_outer, width=320, minsize=280)
+
+        left = ttk.Frame(left_outer, padding=8)
+        left.pack(fill=tk.BOTH, expand=True)
+        left.columnconfigure(0, weight=1)
+        # Weight will be set later for the video list row (row 3)
+
+        # -- Folder picker
+        folder_frame = ttk.LabelFrame(left, text="Video Folder", padding=8)
+        folder_frame.grid(row=0, column=0, sticky="ew")
+        folder_frame.columnconfigure(0, weight=1)
+
+        self.folder_var = tk.StringVar(value="")
+        folder_entry = ttk.Entry(folder_frame, textvariable=self.folder_var)
+        folder_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Button(folder_frame, text="Browse…", width=8,
+                   command=self._pick_folder).grid(row=0, column=1, padx=(4, 0))
+
+        # -- Status
+        self.status_var = tk.StringVar(value="Pick a folder of squat videos to begin.")
+        ttk.Label(left, textvariable=self.status_var,
+                  wraplength=290, font=("TkDefaultFont", 9)).grid(
+            row=1, column=0, sticky="w", pady=(4, 4))
+
+        # -- Video list: collapsible section
+        list_header = ttk.Frame(left)
+        list_header.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        list_header.columnconfigure(1, weight=1)
+
+        self._list_expanded = True
+
+        def _toggle_list():
+            if self._list_expanded:
+                self._list_container.grid_remove()
+                list_btn_frame.grid_remove()
+                toggle_btn.configure(text="\u25b6 Videos (collapsed)")
+                left.rowconfigure(3, weight=0)
+                # Show bottom elements when collapsed
+                score_frame.grid()
+                flags_frame.grid()
+                metrics_frame.grid()
+                conf_frame.grid()
+                notes_frame.grid()
+                self.feedback_var_label.grid()
+                self.progress_var_label.grid()
+                btn_frame.grid()
+                # Remove weight from left to prevent empty space at bottom
+                left.rowconfigure(14, weight=0)
+            else:
+                self._list_container.grid()
+                list_btn_frame.grid()
+                toggle_btn.configure(text="\u25bc Videos")
+                left.rowconfigure(3, weight=1)
+                # Hide bottom elements when expanded
+                score_frame.grid_remove()
+                flags_frame.grid_remove()
+                metrics_frame.grid_remove()
+                conf_frame.grid_remove()
+                notes_frame.grid_remove()
+                self.feedback_var_label.grid_remove()
+                self.progress_var_label.grid_remove()
+                btn_frame.grid_remove()
+                # Add weight to bottom to allow listbox to expand
+                left.rowconfigure(14, weight=1)
+            self._list_expanded = not self._list_expanded
+
+        # Use a standard button style to avoid deformities
+        toggle_btn = ttk.Button(list_header, text="▼ Videos", command=_toggle_list, width=15)
+        toggle_btn.grid(row=0, column=0, sticky="w")
+
+        self._list_container = ttk.Frame(left)
+        self._list_container.grid(row=3, column=0, sticky="nsew", pady=(2, 0))
+        left.rowconfigure(3, weight=1)  # list expands
+        left.rowconfigure(2, weight=0)  # header row stays fixed
+        self._list_container.columnconfigure(0, weight=1)
+        self._list_container.rowconfigure(0, weight=1)
+
+        self.video_listbox = tk.Listbox(self._list_container, selectmode=tk.EXTENDED,
+                                         font=("TkDefaultFont", 9), height=10) # Reduced default height, relies on weight=1 to expand
+        self.video_listbox.grid(row=0, column=0, sticky="nsew")
+        self.video_listbox.bind("<Double-1>", self._on_video_double_click)
+
+        list_scroll = ttk.Scrollbar(self._list_container, orient=tk.VERTICAL,
+                                     command=self.video_listbox.yview)
+        list_scroll.grid(row=0, column=1, sticky="ns")
+        self.video_listbox.config(yscrollcommand=list_scroll.set)
+
+        list_btn_frame = ttk.Frame(left)
+        list_btn_frame.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        list_btn_frame.columnconfigure(0, weight=1)
+        list_btn_frame.columnconfigure(1, weight=1)
+        list_btn_frame.columnconfigure(2, weight=1)
+        list_btn_frame.columnconfigure(3, weight=1)
+        ttk.Button(list_btn_frame, text="Annotate Selected (Dbl-Click)", command=self._annotate_selected).grid(row=0, column=0, sticky="ew", padx=(0, 2))
+        ttk.Button(list_btn_frame, text="Process Selected", command=lambda: self._process_selected_videos(force_reprocess=False)).grid(row=0, column=1, sticky="ew", padx=2)
+        ttk.Button(list_btn_frame, text="Reprocess Selected (Overwrite)", command=self._reprocess_selected_videos).grid(row=0, column=2, sticky="ew", padx=(2, 0))
+        self.load_more_btn = ttk.Button(list_btn_frame, text="Load More", command=self._load_more_videos)
+        self.load_more_btn.grid(row=0, column=3, sticky="ew", padx=(2, 0))
+
+        mode_row = ttk.Frame(list_btn_frame)
+        mode_row.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        ttk.Label(mode_row, text="Extraction Mode:").pack(side=tk.LEFT)
+        self.annotation_mode_combo = ttk.Combobox(
+            mode_row,
+            textvariable=self.annotation_extraction_mode_var,
+            state="readonly",
+            width=18,
+            values=("Filtered", "Unfiltered (raw)"),
+        )
+        self.annotation_mode_combo.pack(side=tk.LEFT, padx=(6, 0))
+
+        # -- Loading Bar
+        self.loading_bar = ttk.Progressbar(left, orient=tk.HORIZONTAL, mode='indeterminate')
+        self.loading_bar.grid(row=5, column=0, sticky="ew", pady=(4, 0))
+        self.loading_bar.grid_remove() # Hidden by default
+
+        # -- View label and Scoring panel
+        score_frame = ttk.LabelFrame(left, text="Score This Rep (0-100)", padding=8)
+        score_frame.grid(row=6, column=0, sticky="ew", pady=(8, 0))
+        score_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(score_frame, text="Score:",
+                  font=("TkDefaultFont", 12, "bold")).grid(row=0, column=0, sticky="w")
+        self.score_entry = ttk.Entry(score_frame, width=8,
+                                      font=("TkDefaultFont", 14))
+        self.score_entry.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.score_entry.bind("<Return>", self._submit_score)
+
+        btn_row = ttk.Frame(score_frame)
+        btn_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(btn_row, text="Submit (Enter)",
+                   command=self._submit_score).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_row, text="Skip",
+                   command=self._skip_rep).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_row, text="← Prev Rep",
+                   command=self._prev_rep).pack(side=tk.LEFT)
+
+        view_row = ttk.Frame(score_frame)
+        view_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Label(view_row, text="View Label:").pack(side=tk.LEFT, padx=(0, 6))
+        self.view_var = tk.StringVar(value="")
+        self.view_combo = ttk.Combobox(view_row, textvariable=self.view_var, state="readonly", width=15)
+        self.view_combo["values"] = ("side", "front", "back", "front_side", "back_side", "unknown")
+        self.view_combo.pack(side=tk.LEFT)
+
+        # -- Errors (replaces old Flags)
+        flags_frame = ttk.LabelFrame(left, text="Form Errors", padding=8)
+        flags_frame.grid(row=8, column=0, sticky="ew", pady=(8, 0))
+
+        self.flag_vars: dict[str, tk.BooleanVar] = {}
+        self.flag_severity_vars: dict[str, tk.DoubleVar] = {}
+        flag_defs = [
+            ("insufficient_squat_depth",      "Insufficient Squat Depth"),
+            ("knee_valgus",                   "Knee Valgus"),
+            ("lumbar_flexion",                "Lumbar Flexion"),
+            ("heel_rise",                     "Heel Rise"),
+            ("asymmetric_descent",            "Asymmetric Descent"),
+            ("forward_lean",                  "Forward Lean"),
+        ]
+        for i, (key, label) in enumerate(flag_defs):
+            var = tk.BooleanVar(value=False)
+            self.flag_vars[key] = var
+            sev_var = tk.DoubleVar(value=0)
+            self.flag_severity_vars[key] = sev_var
+            
+            row = ttk.Frame(flags_frame)
+            row.grid(row=i, column=0, sticky="ew", pady=2)
+            row.columnconfigure(0, weight=1)
+            
+            cb = ttk.Checkbutton(row, text=label, variable=var, 
+                                 command=lambda k=key: self._on_checkbox_toggled(k))
+            cb.grid(row=0, column=0, sticky="w")
+            
+            slider = ttk.Scale(row, from_=0, to=5, variable=sev_var, orient=tk.HORIZONTAL, length=80,
+                               command=lambda v, k=key: self._on_scale_changed(v, k))
+            slider.grid(row=0, column=1, padx=(10, 0))
+            
+            val_lbl = ttk.Label(row, textvariable=sev_var, width=3)
+            val_lbl.grid(row=0, column=2, padx=(4, 0))
+
+        # Keybinds F1-F7 mapping to checkboxes (optional but helpful)
+        flag_keys_list = list(self.flag_vars.keys())
+        for idx in range(min(7, len(flag_keys_list))):
+            fkey = f"<F{idx + 1}>"
+            flag_key = flag_keys_list[idx]
+            self.root.bind(fkey, lambda e, k=flag_key: self._toggle_flag(k))
+
+        # -- Neural Metrics
+        metrics_frame = ttk.LabelFrame(left, text="Target Metrics (0-100, blank = null)", padding=8)
+        metrics_frame.grid(row=9, column=0, sticky="ew", pady=(8, 0))
+        
+        self.metric_vars: dict[str, tk.StringVar] = {}
+        metric_defs = [
+            ("depth", "Depth:"),
+            ("knee_tracking", "Knee Track:"),
+            ("forward_lean", "Fwd Lean:"),
+            ("smoothness", "Smoothness:"),
+            ("control_at_bottom", "Ctrl at Btm:"),
+        ]
+        for i, (key, label) in enumerate(metric_defs):
+            row = ttk.Frame(metrics_frame)
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=label, width=12).pack(side=tk.LEFT)
+            var = tk.StringVar(value="")
+            self.metric_vars[key] = var
+            ttk.Entry(row, textvariable=var, width=8).pack(side=tk.LEFT)
+
+        # -- Annotator Confidence
+        conf_frame = ttk.Frame(left)
+        conf_frame.grid(row=10, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(conf_frame, text="Confidence (1-5):").pack(side=tk.LEFT, padx=(0, 6))
+        self.confidence_var = tk.StringVar(value="4")
+        self.conf_combo = ttk.Combobox(conf_frame, textvariable=self.confidence_var, state="readonly", width=4)
+        self.conf_combo["values"] = ("1", "2", "3", "4", "5")
+        self.conf_combo.pack(side=tk.LEFT)
+
+        # -- Notes
+        notes_frame = ttk.Frame(left)
+        notes_frame.grid(row=11, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(notes_frame, text="Notes:").pack(side=tk.LEFT, anchor="n")
+        self.notes_var = tk.StringVar(value="")
+        ttk.Entry(notes_frame, textvariable=self.notes_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+
+        # -- Feedback
+        self.feedback_var = tk.StringVar(value="")
+        self.feedback_var_label = ttk.Label(left, textvariable=self.feedback_var,
+                  font=("TkDefaultFont", 10), foreground="gray",
+                  wraplength=285, padding=(0, 6))
+        self.feedback_var_label.grid(row=12, column=0, sticky="ew")
+
+        # -- Progress for current video
+        self.progress_var = tk.StringVar(value="")
+        self.progress_var_label = ttk.Label(left, textvariable=self.progress_var,
+                  font=("TkDefaultFont", 10, "bold"),
+                  padding=(0, 2))
+        self.progress_var_label.grid(row=13, column=0, sticky="ew") # bumped row to 13 because both were on 12 before
+
+        # -- Action Buttons
+        btn_frame = ttk.Frame(left)
+        btn_frame.grid(row=14, column=0, sticky="ew", pady=(4, 0)) # bumped row to 14
+        btn_frame.columnconfigure(0, weight=1)
+        btn_frame.columnconfigure(1, weight=1)
+        btn_frame.columnconfigure(2, weight=1)
+        btn_frame.columnconfigure(3, weight=1)
+        
+        ttk.Button(btn_frame, text="✅ Save",
+                   command=self._manual_save).grid(row=0, column=0, sticky="ew", padx=(0, 2))
+        ttk.Button(btn_frame, text="⏮ Prev",
+                   command=self._prev_video).grid(row=0, column=1, sticky="ew", padx=(2, 2))
+        ttk.Button(btn_frame, text="⏭ Next",
+                   command=self._next_video).grid(row=0, column=2, sticky="ew", padx=(2, 2))
+        ttk.Button(btn_frame, text="📊 Analyze All",
+                   command=self._run_analysis).grid(row=0, column=3, sticky="ew", padx=(2, 0))
+
+        # Initially start expanded (which means bottom is hidden according to new logic)
+        self._list_expanded = True
+        score_frame.grid_remove()
+        flags_frame.grid_remove()
+        metrics_frame.grid_remove()
+        conf_frame.grid_remove()
+        notes_frame.grid_remove()
+        self.feedback_var_label.grid_remove()
+        self.progress_var_label.grid_remove()
+        btn_frame.grid_remove()
+
+        # ---- RIGHT PANEL: dual side-by-side video + info ----
+        right = ttk.Frame(paned, padding=8)
+        paned.add(right)
+        right.columnconfigure(0, weight=1, uniform="equal")
+        right.columnconfigure(1, weight=1, uniform="equal")
+        right.rowconfigure(1, weight=1)
+
+        # Rep info bar (spans both columns)
+        info_frame = ttk.Frame(right)
+        info_frame.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.rep_info_var = tk.StringVar(value="Select a video from the list.")
+        ttk.Label(info_frame, textvariable=self.rep_info_var,
+                  font=("TkDefaultFont", 10)).pack(side=tk.LEFT)
+
+        # Left video: Raw
+        raw_panel = ttk.LabelFrame(right, text="Raw Video", padding=2)
+        raw_panel.grid(row=1, column=0, sticky="nsew", padx=(0, 4), pady=(6, 6))
+        raw_panel.columnconfigure(0, weight=1)
+        raw_panel.rowconfigure(0, weight=1)
+        self.raw_label = ttk.Label(raw_panel, text="No video loaded.", anchor="center", relief="sunken")
+        self.raw_label.grid(row=0, column=0, sticky="nsew")
+        self.video_label = self.raw_label # for compatibility
+
+        # Right video: Visualized
+        vis_panel = ttk.LabelFrame(right, text="Visualized Video", padding=2)
+        vis_panel.grid(row=1, column=1, sticky="nsew", padx=(4, 0), pady=(6, 6))
+        vis_panel.columnconfigure(0, weight=1)
+        vis_panel.rowconfigure(0, weight=1)
+        self.vis_label = ttk.Label(vis_panel, text="No visualized video.", anchor="center", relief="sunken")
+        self.vis_label.grid(row=0, column=0, sticky="nsew")
+
+        # Playback controls
+        ctrl = ttk.Frame(right)
+        ctrl.grid(row=2, column=0, columnspan=2, sticky="ew")
+        
+        ttk.Button(ctrl, text="▶ Play Both",
+                   command=self._toggle_play).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(ctrl, text="⟲ Replay",
+                   command=self._replay).pack(side=tk.LEFT)
+
+        # Scoring reference
+        ref = ttk.LabelFrame(right, text="Scoring Reference", padding=6)
+        ref.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(ref, text=(
+            "0-20: Terrible — safety concern  |  20-40: Poor — multiple obvious problems\n"
+            "40-60: Below avg — noticeable issues  |  60-75: Decent — minor imperfections\n"
+            "75-90: Good — clean movement  |  90-100: Excellent — textbook form"
+        ), font=("TkDefaultFont", 8), wraplength=600).pack(anchor="w")
+
+        # Heuristic Reference
+        heur_frame = ttk.LabelFrame(right, text="Heuristic Results (Reference)", padding=6)
+        heur_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        self.heuristic_var = tk.StringVar(value="Load a video to see heuristic results here.")
+        ttk.Label(heur_frame, textvariable=self.heuristic_var, font=("TkDefaultFont", 9), foreground="blue", wraplength=600).pack(anchor="w")
+
+        # Pipeline log (shown when auto-running pipeline)
+        self.log_frame = ttk.LabelFrame(right, text="Pipeline Log", padding=4)
+        self.log_frame.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        self.log_frame.grid_remove()  # hidden by default
+
+        self.log_text = tk.Text(self.log_frame, wrap=tk.WORD, height=5,
+                                 font=("Consolas", 8))
+        self.log_text.pack(fill=tk.X)
+
+    # ============================================================ Folder
+    def _pick_folder(self) -> None:
+        default = str(PROJECT_ROOT / "squat" / "dataset_videos_all")
+        selected = filedialog.askdirectory(
+            initialdir=default if Path(default).exists() else str(PROJECT_ROOT),
+            title="Select folder of squat videos",
+        )
+        if not selected:
+            return
+        self.videos_folder = Path(selected)
+        self.folder_var.set(str(self.videos_folder))
+        self._scan_folder()
+
+    def _scan_folder(self) -> None:
+        if self.videos_folder is None or not self.videos_folder.exists():
+            return
+        exts = {".mp4", ".mov", ".avi", ".mkv", ".flv"}
+        if self._last_scanned_folder != self.videos_folder:
+            previous_loaded = 0
+        else:
+            previous_loaded = self.loaded_video_count
+        self._last_scanned_folder = self.videos_folder
+        self.video_files = sorted(
+            [p for p in self.videos_folder.iterdir()
+             if p.is_file() and p.suffix.lower() in exts]
+        )
+        total_videos = len(self.video_files)
+        self._initial_load_target = min(max(previous_loaded, VIDEO_SCAN_BATCH_SIZE), total_videos)
+        self.loaded_video_count = 0
+        self._scan_in_progress = True
+        self._processed_vids_cache = set()
+        self.video_listbox.delete(0, tk.END)
+        self._update_load_more_button_state()
+        self.status_var.set(
+            f"Scanning first {self._initial_load_target} of {total_videos} videos in background..."
+        )
+        
+        # Run the UI-blocking scan in a background thread
+        thread = threading.Thread(target=self._scan_folder_thread, daemon=True)
+        thread.start()
+
+    def _scan_folder_thread(self) -> None:
+        # 1. Quickly find all processed videos by scanning RUNS_ROOT once
+        processed_vids = set()
+        if RUNS_ROOT.exists():
+            for run_dir in list(RUNS_ROOT.iterdir()):
+                if not run_dir.is_dir(): continue
+                seg_root = run_dir / "workspace" / "squat" / "segmented_reps"
+                if seg_root.exists():
+                    for f in seg_root.rglob("*_segmented.json"):
+                        processed_vids.add(f.stem.replace("_segmented", ""))
+
+        self._processed_vids_cache = processed_vids
+
+        # 2. Process only the first chunk and send back to UI thread
+        self._scan_video_chunk(0, self._initial_load_target)
+        
+    def _scan_video_chunk(self, start_idx: int, end_idx: int) -> None:
+        chunk = self.video_files[start_idx:end_idx]
+        for vf in chunk:
+            vid = vf.stem
+            ann_path = ANNOTATIONS_VIDEOS_DIR / f"{vid}.json"
+            marker = ""
+            is_processed = False
+
+            if ann_path.exists():
+                is_processed = True
+                try:
+                    with open(ann_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    reps = data.get("reps", [])
+                    scored = sum(1 for r in reps if r.get("human_score") is not None)
+                    total = len(reps)
+                    if scored == total and total > 0:
+                        marker = "  ✓"
+                    elif scored > 0:
+                        marker = f"  ({scored}/{total})"
+                except Exception:
+                    pass
+            else:
+                if vid in self._processed_vids_cache:
+                    is_processed = True
+
+            text = f"{vf.name}{marker}"
+            self.root.after(0, self._add_video_to_listbox, text, is_processed)
+
+        self.root.after(0, self._on_chunk_loaded, end_idx)
+
+    def _on_chunk_loaded(self, end_idx: int) -> None:
+        self.loaded_video_count = min(end_idx, len(self.video_files))
+        self._scan_in_progress = False
+        self._update_load_more_button_state()
+        self.status_var.set(
+            f"Loaded {self.loaded_video_count}/{len(self.video_files)} videos. "
+            f"Click one to annotate."
+        )
+
+    def _load_more_videos(self) -> None:
+        if self._scan_in_progress:
+            return
+        total = len(self.video_files)
+        if self.loaded_video_count >= total:
+            self._update_load_more_button_state()
+            return
+
+        start_idx = self.loaded_video_count
+        end_idx = min(start_idx + VIDEO_SCAN_BATCH_SIZE, total)
+        self._scan_in_progress = True
+        self._update_load_more_button_state()
+        self.status_var.set(f"Loading videos {start_idx + 1}-{end_idx} of {total}...")
+
+        thread = threading.Thread(
+            target=self._scan_video_chunk,
+            args=(start_idx, end_idx),
+            daemon=True,
+        )
+        thread.start()
+
+    def _update_load_more_button_state(self) -> None:
+        total = len(self.video_files)
+        remaining = max(0, total - self.loaded_video_count)
+
+        if self._scan_in_progress:
+            self.load_more_btn.configure(state="disabled", text="Loading...")
+            return
+
+        if remaining <= 0:
+            self.load_more_btn.configure(state="disabled", text="All Loaded")
+            return
+
+        next_count = min(VIDEO_SCAN_BATCH_SIZE, remaining)
+        self.load_more_btn.configure(state="normal", text=f"Load More ({next_count})")
+
+    def _add_video_to_listbox(self, text: str, is_processed: bool) -> None:
+        idx = self.video_listbox.size()
+        self.video_listbox.insert(tk.END, text)
+        if is_processed:
+            self.video_listbox.itemconfig(idx, bg="#e6ffe6", fg="#006600") # Green highlight
+        else:
+            self.video_listbox.itemconfig(idx, bg="#ffe6e6", fg="#990000") # Red highlight
+
+    # ============================================================ Video selection
+    def _on_video_double_click(self, event=None) -> None:
+        self._annotate_selected()
+
+    def _annotate_selected(self) -> None:
+        sel = self.video_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx >= len(self.video_files):
+            return
+        video_path = self.video_files[idx]
+        self._load_video_for_annotation(video_path)
+
+    def _next_video(self) -> None:
+        if self.current_video_idx is not None:
+            idx = self.current_video_idx
+        else:
+            sel = self.video_listbox.curselection()
+            if sel:
+                idx = sel[0]
+            else:
+                if self.video_files:
+                    self._load_with_selection(0)
+                return
+        
+        next_idx = idx + 1
+        if next_idx < len(self.video_files):
+            self._load_with_selection(next_idx)
+        else:
+            self.feedback_var.set("You have reached the end of the video list.")
+
+    def _prev_video(self) -> None:
+        if self.current_video_idx is not None:
+            idx = self.current_video_idx
+        else:
+            sel = self.video_listbox.curselection()
+            if sel:
+                idx = sel[0]
+            else:
+                if self.video_files:
+                    last_idx = len(self.video_files) - 1
+                    self._load_with_selection(last_idx)
+                return
+        
+        prev_idx = idx - 1
+        if prev_idx >= 0:
+            self._load_with_selection(prev_idx)
+        else:
+            self.feedback_var.set("You are at the beginning of the video list.")
+
+    def _load_with_selection(self, idx: int) -> None:
+        if idx >= self.loaded_video_count:
+            self._load_more_videos()
+            self.feedback_var.set("Loaded more videos. Press Next again to continue.")
+            return
+
+        self.video_listbox.selection_clear(0, tk.END)
+        self.video_listbox.selection_set(idx)
+        self.video_listbox.see(idx)
+        self.current_video_idx = idx
+        self._load_video_for_annotation(self.video_files[idx])
+
+    def _reprocess_selected_videos(self) -> None:
+        self._process_selected_videos(force_reprocess=True)
+
+    def _get_selected_annotation_extraction_mode(self) -> str:
+        selected_label = self.annotation_extraction_mode_var.get()
+        return self._annotation_extraction_mode_map.get(selected_label, "filtered")
+
+    def _clear_pipeline_references(self, video_id: str) -> None:
+        ann_path = ANNOTATIONS_VIDEOS_DIR / f"{video_id}.json"
+        if not ann_path.exists():
+            return
+
+        with open(ann_path, "r", encoding="utf-8") as f:
+            annotation = json.load(f)
+
+        if not isinstance(annotation, dict):
+            raise ValueError("Annotation file is not a JSON object")
+
+        annotation["pipeline_run"] = ""
+        annotation["pipeline_outputs"] = {}
+
+        with open(ann_path, "w", encoding="utf-8") as f:
+            json.dump(annotation, f, indent=2)
+
+        if self.current_video_id == video_id and isinstance(self.current_annotation, dict):
+            self.current_annotation["pipeline_run"] = ""
+            self.current_annotation["pipeline_outputs"] = {}
+
+    def _process_selected_videos(self, force_reprocess: bool = False) -> None:
+        if self.pipeline_running:
+            messagebox.showwarning("Busy", "Wait for the current pipeline run to finish.")
+            return
+
+        sel = self.video_listbox.curselection()
+        if not sel:
+            messagebox.showinfo("No Selection", "Please select one or more videos to process.")
+            return
+
+        selected_videos = [self.video_files[idx] for idx in sel]
+
+        if force_reprocess:
+            confirm = messagebox.askyesno(
+                "Reprocess Selected Videos",
+                "This will run a fresh pipeline for the selected video(s). Existing annotation files will be kept, and only pipeline reference fields will be reset. Continue?",
+            )
+            if not confirm:
+                return
+
+            videos_to_process = selected_videos
+            reset_failures: list[str] = []
+            for video_path in videos_to_process:
+                try:
+                    self._clear_pipeline_references(video_path.stem)
+                except Exception as exc:
+                    reset_failures.append(f"{video_path.name}: {exc}")
+
+            if reset_failures:
+                messagebox.showerror(
+                    "Cannot Reset Pipeline References",
+                    "Failed to reset pipeline references for:\n" + "\n".join(reset_failures),
+                )
+                return
+        else:
+            videos_to_process = []
+            for video_path in selected_videos:
+                run_path, _ = self._find_existing_pipeline_output(video_path.stem)
+                if not run_path:
+                    videos_to_process.append(video_path)
+
+        if not videos_to_process:
+            if force_reprocess:
+                self.status_var.set("No videos selected for reprocessing.")
+            else:
+                self.status_var.set("All selected videos already have pipeline outputs.")
+            return
+
+        mode_label = "reprocessing" if force_reprocess else "processing"
+        extraction_mode = self._get_selected_annotation_extraction_mode()
+        self.status_var.set(
+            f"Queueing {len(videos_to_process)} video(s) for {mode_label} [{extraction_mode}]..."
+        )
+        self.loading_bar.grid()
+        self.loading_bar.start(10)
+        self.log_frame.grid()  # show log
+        self.log_text.delete("1.0", tk.END)
+
+        self.pipeline_running = True
+        thread = threading.Thread(
+            target=self._batch_pipeline_thread, args=(videos_to_process,), daemon=True
+        )
+        thread.start()
+
+    def _load_video_for_annotation(self, video_path: Path) -> None:
+        self._stop_playback()
+        self.current_video_path = video_path
+        self.current_video_id = video_path.stem
+        self.current_rep_idx = 0
+        self.feedback_var.set("")
+        
+        # Ensure current_video_idx is set if loaded outside of _load_with_selection (e.g., annotate_selected)
+        try:
+            self.current_video_idx = self.video_files.index(video_path)
+        except ValueError:
+            pass
+
+        # Check for existing annotation file
+        ann_path = ANNOTATIONS_VIDEOS_DIR / f"{self.current_video_id}.json"
+        if ann_path.exists():
+            try:
+                with open(ann_path, "r", encoding="utf-8") as f:
+                    self.current_annotation = json.load(f)
+                self.pipeline_run_used = self.current_annotation.get("pipeline_run", "")
+                self._advance_to_next_unannotated()
+                self._show_current_rep()
+                return
+            except Exception:
+                pass
+
+        # No annotation file — need pipeline output
+        # Search for existing pipeline run
+        run_path, run_name = self._find_existing_pipeline_output(self.current_video_id)
+
+        if run_path is not None:
+            self.status_var.set(f"Found pipeline output in: {run_name}")
+            self.pipeline_run_used = run_name
+            self._build_annotation_from_run(run_path, run_name)
+            self._show_current_rep()
+        else:
+            # Need to run the pipeline
+            self.status_var.set(
+                f"No pipeline output found for {self.current_video_id}. "
+                f"Running pipeline (2.5→4→5→8)…"
+            )
+            self._run_pipeline_for_video(video_path)
+
+    def _find_existing_pipeline_output(
+        self, video_id: str
+    ) -> tuple[Path | None, str]:
+        """
+        Search pipeline_ui_runs/ for a completed run that has
+        segmented + scored output for this video_id.
+        Returns (run_workspace_path, run_name) or (None, "").
+        """
+        if not RUNS_ROOT.exists():
+            return None, ""
+
+        # Check runs in reverse chronological order (newest first)
+        run_dirs = sorted(
+            [d for d in RUNS_ROOT.iterdir() if d.is_dir()],
+            key=lambda d: d.name,
+            reverse=True,
+        )
+
+        for run_dir in run_dirs:
+            workspace = run_dir / "workspace"
+            if not workspace.exists():
+                continue
+
+            # Check for segmented JSON
+            seg_root = workspace / "squat" / "segmented_reps"
+            if not seg_root.exists():
+                continue
+
+            seg_matches = list(seg_root.rglob(f"{video_id}_segmented.json"))
+            if not seg_matches:
+                continue
+
+            # Check for scoring JSON
+            score_root = workspace / "squat" / "aqa_analysis_simple"
+            if score_root.exists():
+                score_matches = list(score_root.rglob(f"{video_id}_aqa_simple.json"))
+                if score_matches:
+                    return workspace, run_dir.name
+
+            # Has segmentation but no scoring — still usable (just no heuristic scores)
+            return workspace, run_dir.name
+
+        return None, ""
+
+    def _build_annotation_from_run(self, workspace: Path, run_name: str) -> None:
+        """
+        Build a per-video annotation dict from existing pipeline output.
+        """
+        video_id = self.current_video_id
+
+        # Find segmented JSON
+        seg_root = workspace / "squat" / "segmented_reps"
+        seg_matches = list(seg_root.rglob(f"{video_id}_segmented.json"))
+        if not seg_matches:
+            self.status_var.set(f"No segmentation found for {video_id}.")
+            return
+        seg_path = seg_matches[0]
+        quality = seg_path.parent.name
+
+        with open(seg_path, "r", encoding="utf-8") as f:
+            seg_data = json.load(f)
+
+        # Find scoring JSON (recursive into nested dirs)
+        score_root = workspace / "squat" / "aqa_analysis_simple"
+        score_data = None
+        if score_root.exists():
+            score_matches = list(score_root.rglob(f"{video_id}_aqa_simple.json"))
+            if score_matches:
+                with open(score_matches[0], "r", encoding="utf-8") as f:
+                    score_data = json.load(f)
+
+        # Find features JSON path
+        feat_root = workspace / "squat" / "extracted_features_clean"
+        features_path = ""
+        if feat_root.exists():
+            feat_matches = list(feat_root.rglob(f"{video_id}.json"))
+            if feat_matches:
+                features_path = str(feat_matches[0])
+
+        # Build rep-level score lookup
+        rep_scores: dict[int, dict] = {}
+        if score_data:
+            for rep_entry in score_data.get("repetitions", []):
+                rid = rep_entry.get("rep_id")
+                if rid is not None:
+                    rep_scores[rid] = rep_entry
+
+        view = seg_data.get("info", {}).get("view", "unknown")
+        fps = seg_data.get("info", {}).get("fps", 30.0)
+
+        # Find visualization video path
+        vis_root = workspace / "squat" / "visualized_segmentation"
+        vis_video = ""
+        for suffix in ("_phases.mp4", "_segmented.mp4", "_phases.avi", "_segmented.avi"):
+            candidate = vis_root / quality / f"{video_id}{suffix}"
+            if candidate.exists():
+                vis_video = str(candidate)
+                break
+        if not vis_video:
+            # Fallback to raw video
+            raw = workspace / "squat" / "dataset_videos_all" / f"{video_id}.mp4"
+            if raw.exists():
+                vis_video = str(raw)
+
+        # Make paths relative to PROJECT_ROOT for portability
+        def to_rel(p: str) -> str:
+            if not p: return ""
+            p_obj = Path(p)
+            if p_obj.is_relative_to(PROJECT_ROOT):
+                # Always format as forward-slash relative paths
+                return str(p_obj.relative_to(PROJECT_ROOT)).replace("\\", "/")
+            return str(p_obj).replace("\\", "/")
+
+        # Build reps list
+        reps = []
+        frame_phases = seg_data.get("frame_phases", [])
+        signals = seg_data.get("signals", {})
+        
+        for rep in seg_data.get("repetitions", []):
+            rep_id = rep.get("rep_id", 0)
+            rep_score_entry = rep_scores.get(rep_id, {})
+            score_obj = rep_score_entry.get("score", {})
+            metrics = rep_score_entry.get("metrics", {})
+            
+            start_f = rep.get("start_frame", 0)
+            end_f = rep.get("end_frame", 0)
+            duration_s = (end_f - start_f + 1) / fps if fps > 0 else 0.0
+            
+            # Slice temporal phases sequence
+            rep_phases = frame_phases[start_f : end_f + 1] if frame_phases else []
+            
+            # Slice the 4 continuous biomechanical signals 
+            rep_signals = {}
+            if signals:
+                for sig_key, sig_arr in signals.items():
+                    if isinstance(sig_arr, list):
+                        rep_signals[sig_key] = sig_arr[start_f : end_f + 1]
+
+            reps.append({
+                "rep_id": rep_id,
+                "start_frame": start_f,
+                "end_frame": end_f,
+                "bottom_frame": rep.get("bottom_frame", 0),
+                "duration_seconds": round(duration_s, 3),
+                "phases": rep_phases,
+                "signals": rep_signals,
+                "heuristic_score": score_obj.get("overall_score", 0.0),
+                "heuristic_metrics": {
+                    "knee_valgus": metrics.get("knee_valgus"),
+                    "forward_lean": metrics.get("forward_lean"),
+                    "min_knee_angle": metrics.get("min_knee_angle"),
+                    "squat_depth": metrics.get("squat_depth"),
+                },
+                "heuristic_metric_scores": score_obj.get("metric_scores", {}),
+                "human_score": None,
+                "flags": None,
+            })
+
+        self.current_annotation = {
+            "video_id": video_id,
+            "source_video_path": to_rel(str(self.current_video_path)) if self.current_video_path else "",
+            "pipeline_run": run_name,
+            "pipeline_outputs": {
+                "features_json": to_rel(features_path),
+                "segmented_json": to_rel(str(seg_path)),
+                "scoring_json": to_rel(str(score_matches[0])) if score_data and score_matches else "",
+                "visualization_video": to_rel(vis_video)
+            },
+            "view": view,
+            "quality_rating": quality,
+            "fps": fps,
+            "calibration": seg_data.get("info", {}).get("calibration", {}),
+            "graph_metadata": {
+                "active_joints": [0, 1, 2, 11, 12, 23, 24, 25, 26, 27, 28],
+                "zeroed_joints": [3, 4, 5, 6, 7, 8, 9, 10, 29, 30, 31, 32],
+                "foot_consolidated": True
+            },
+            "total_reps": len(reps),
+            "annotated_at": None,
+            "reps": reps,
+        }
+
+        self._save_current_annotation()
+
+    # ============================================================ Auto-pipeline
+    def _run_pipeline_for_video(self, video_path: Path) -> None:
+        """Run Stages 2.5→4→5→8 for a single video, then load results."""
+        self.log_frame.grid()  # show log
+        self.log_text.delete("1.0", tk.END)
+        self._pipeline_log(f"Running pipeline for: {video_path.name}")
+
+        self.pipeline_running = True
+        thread = threading.Thread(
+            target=self._pipeline_thread, args=(video_path,), daemon=True
+        )
+        thread.start()
+
+    def _terminate_subprocess_tree(
+        self,
+        process: subprocess.Popen | None,
+        reason: str = "",
+    ) -> None:
+        """Terminate a subprocess and all children to avoid orphaned stage workers."""
+        if process is None:
+            return
+
+        if process.poll() is not None:
+            return
+
+        if reason:
+            self._pipeline_log(f"  ⚠ {reason}")
+
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            else:
+                process.terminate()
+                process.wait(timeout=3)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+        try:
+            process.wait(timeout=2)
+        except Exception:
+            pass
+
+    def _run_pipeline_stage(self, stage: Stage, workspace: Path, video_stem: str) -> int:
+        """Run a single stage with timeout and robust cleanup for child processes."""
+        if self.pipeline_process is not None and self.pipeline_process.poll() is None:
+            self._terminate_subprocess_tree(
+                self.pipeline_process,
+                reason="Detected lingering stage process. Cleaning it before starting next stage.",
+            )
+        self.pipeline_process = None
+
+        stage_args = list(stage.args)
+        if stage.key == "extract_selected_features":
+            stage_args = [self._get_selected_annotation_extraction_mode()] + stage_args
+        elif stage.key == "scoring":
+            stage_args = [video_stem]
+
+        cmd = [sys.executable, str(stage.script_path), *stage_args]
+        env = os.environ.copy()
+        env["EXEVISION_MODEL_PATH"] = str(SHARED_MODEL_PATH)
+        env["EXEVISION_FACE_MODEL_PATH"] = str(SHARED_FACE_MODEL_PATH)
+
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(workspace),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.pipeline_process = process
+
+        timeout_sec = int(self.stage_timeouts_sec.get(stage.key, 180))
+        timed_out = threading.Event()
+
+        def _watchdog() -> None:
+            try:
+                process.wait(timeout=timeout_sec)
+            except subprocess.TimeoutExpired:
+                timed_out.set()
+                self._terminate_subprocess_tree(
+                    process,
+                    reason=f"{stage.label} timed out after {timeout_sec}s; terminating process tree.",
+                )
+
+        threading.Thread(target=_watchdog, daemon=True).start()
+
+        important_tokens = (
+            "error",
+            "failed",
+            "warning",
+            "completed",
+            "success",
+            "classified",
+            "score",
+            "summary",
+            "segmenting videos",
+            "processing summary",
+            "results",
+        )
+
+        try:
+            if process.stdout is not None:
+                for line in process.stdout:
+                    line = line.rstrip("\n")
+                    if not line:
+                        continue
+
+                    lowered = line.lower()
+                    if stage.key == "temporal_segmentation" or any(t in lowered for t in important_tokens):
+                        self._pipeline_log(f"  {line}")
+
+            rc = process.wait()
+            if timed_out.is_set():
+                return 124
+            return rc
+        finally:
+            if process.poll() is None:
+                self._terminate_subprocess_tree(
+                    process,
+                    reason=f"Cleaning up unfinished process for {stage.label}.",
+                )
+            self.pipeline_process = None
+
+    def _pipeline_thread(self, video_path: Path) -> None:
+        run_name = datetime.now().strftime("annotation_run_%Y%m%d_%H%M%S")
+        run_root = RUNS_ROOT / run_name
+        workspace = run_root / "workspace"
+        logs_root = run_root / "logs"
+
+        try:
+            # Prepare workspace
+            squat_dir = workspace / "squat"
+            dataset_target = squat_dir / "dataset_videos_all"
+            dataset_target.mkdir(parents=True, exist_ok=True)
+            logs_root.mkdir(parents=True, exist_ok=True)
+
+            # Copy single video
+            shutil.copy2(video_path, dataset_target / video_path.name)
+            self._pipeline_log(f"Workspace: {workspace}")
+
+            # Run stages in order
+            stages_to_run = [s for s in STAGES if s.key in (
+                "extract_selected_features", "classify_views",
+                "temporal_segmentation", "scoring"
+            )]
+
+            failed = False
+
+            for i, stage in enumerate(stages_to_run, 1):
+                self._pipeline_log(f"\n[{i}/{len(stages_to_run)}] {stage.label}")
+
+                rc = self._run_pipeline_stage(stage, workspace, video_path.stem)
+                if rc != 0:
+                    failed = True
+                    self._pipeline_log(f"\n  ❌ Stage {stage.key} FAILED with exit code {rc}")
+                    if rc == 124:
+                        self._pipeline_log(f"  ⚠ Reason: TIMEOUT (process took longer than allotted time)")
+                    self._pipeline_log(f"  Skipping remaining stages.")
+                    break
+
+            if not failed:
+                self._pipeline_log("\n✅ Pipeline complete.")
+                self.pipeline_run_used = run_name
+
+                # Load results
+                self.root.after(0, self._on_pipeline_complete, workspace, run_name)
+            else:
+                self.root.after(
+                    0, lambda: self.status_var.set(f"Pipeline failed for {video_path.name}. Check log output above.")
+                )
+
+        except Exception as exc:
+            self._pipeline_log(f"\n❌ Pipeline failed: {exc}")
+            self.root.after(
+                0, lambda: self.status_var.set(f"Pipeline failed: {exc}")
+            )
+        finally:
+            self._terminate_subprocess_tree(self.pipeline_process)
+            self.pipeline_running = False
+            self.pipeline_process = None
+
+    def _batch_pipeline_thread(self, video_paths: list[Path]) -> None:
+        """Run the pipeline sequentially for a list of videos."""
+        total = len(video_paths)
+        for i, video_path in enumerate(video_paths, 1):
+            if not self.pipeline_running:
+                break
+
+            self.root.after(0, lambda v=video_path, c=i, t=total: self.status_var.set(
+                f"Processing {v.name} ({c}/{t})..."
+            ))
+            
+            self._pipeline_log(f"\n\n{'='*50}")
+            self._pipeline_log(f"BATCH PROCESSING VIDEO {i}/{total}: {video_path.name}")
+            self._pipeline_log(f"{'='*50}")
+            
+            # Use the existing single-video logic (blocking execution)
+            run_name = datetime.now().strftime("annotation_run_%Y%m%d_%H%M%S")
+            run_root = RUNS_ROOT / run_name
+            workspace = run_root / "workspace"
+            logs_root = run_root / "logs"
+
+            try:
+                # Prepare workspace
+                squat_dir = workspace / "squat"
+                dataset_target = squat_dir / "dataset_videos_all"
+                dataset_target.mkdir(parents=True, exist_ok=True)
+                logs_root.mkdir(parents=True, exist_ok=True)
+
+                # Copy single video
+                shutil.copy2(video_path, dataset_target / video_path.name)
+                self._pipeline_log(f"Workspace: {workspace}")
+
+                stages_to_run = [s for s in STAGES if s.key in (
+                    "extract_selected_features", "classify_views",
+                    "temporal_segmentation", "scoring"
+                )]
+
+                failed = False
+
+                for j, stage in enumerate(stages_to_run, 1):
+                    self._pipeline_log(f"\n[{j}/{len(stages_to_run)}] {stage.label}")
+
+                    rc = self._run_pipeline_stage(stage, workspace, video_path.stem)
+                    if rc != 0:
+                        failed = True
+                        self._pipeline_log(f"  ⚠ Stage exited with code {rc}. Skipping remaining stages for this video.")
+                        break
+
+                if failed:
+                    self._pipeline_log(f"\n❌ Pipeline failed for {video_path.name}.")
+                    continue
+
+                self._pipeline_log(f"\n✅ Pipeline complete for {video_path.name}.")
+                
+                # Check if this was the currently viewed (but unprocessed) video
+                if self.current_video_path == video_path:
+                     self.pipeline_run_used = run_name
+                     self.root.after(0, self._on_pipeline_complete, workspace, run_name)
+
+            except Exception as exc:
+                self._pipeline_log(f"\n❌ Pipeline failed for {video_path.name}: {exc}")
+            finally:
+                self._terminate_subprocess_tree(self.pipeline_process)
+                self.pipeline_process = None
+                
+        self.pipeline_running = False
+        self.root.after(0, lambda: self.status_var.set("Batch processing complete."))
+        self.root.after(0, lambda: self.log_frame.grid_remove())
+        self.root.after(0, lambda: self.loading_bar.stop())
+        self.root.after(0, lambda: self.loading_bar.grid_remove())
+        self.root.after(0, self._scan_folder)
+        self.root.after(0, lambda: messagebox.showinfo("Processing Complete", f"Finished batch processing {total} video(s)."))
+
+    def _pipeline_log(self, text: str) -> None:
+        def _append():
+            self.log_text.insert(tk.END, text + "\n")
+            self.log_text.see(tk.END)
+        if threading.current_thread() is threading.main_thread():
+            _append()
+        else:
+            self.root.after(0, _append)
+
+    def _on_pipeline_complete(self, workspace: Path, run_name: str) -> None:
+        self._build_annotation_from_run(workspace, run_name)
+        self.log_frame.grid_remove()  # hide log
+        self.status_var.set(f"Pipeline complete. Annotating {self.current_video_id}.")
+        self._advance_to_next_unannotated()
+        self._show_current_rep()
+
+    # ============================================================ Rep navigation
+    def _advance_to_next_unannotated(self) -> None:
+        """Set current_rep_idx to the first unannotated rep."""
+        if not self.current_annotation:
+            return
+        reps = self.current_annotation.get("reps", [])
+        for i, rep in enumerate(reps):
+            if rep.get("human_score") is None:
+                self.current_rep_idx = i
+                return
+        # All annotated — show the last one
+        self.current_rep_idx = max(0, len(reps) - 1)
+
+    def _show_current_rep(self) -> None:
+        self._stop_playback()
+        if not self.current_annotation:
+            return
+
+        reps = self.current_annotation.get("reps", [])
+        if not reps:
+            self.rep_info_var.set("No reps found in segmentation.")
+            self.video_label.configure(image="", text="No reps detected.")
+            self._photo = None
+            return
+
+        idx = self.current_rep_idx
+        if idx >= len(reps):
+            idx = len(reps) - 1
+            self.current_rep_idx = idx
+
+        rep = reps[idx]
+        total = len(reps)
+        scored = sum(1 for r in reps if r.get("human_score") is not None)
+
+        self.rep_info_var.set(
+            f"Video: {self.current_video_id}  |  "
+            f"Rep {rep['rep_id']} of {total}  |  "
+            f"View: {self.current_annotation.get('view', '?')}  |  "
+            f"Frames {rep['start_frame']}→{rep['end_frame']}"
+        )
+
+        self.progress_var.set(f"Scored: {scored} / {total} reps in this video")
+
+        # View combobox
+        current_view = self.current_annotation.get("view", "unknown")
+        self.view_var.set(current_view)
+        
+        # Populate heuristic info
+        h_score = rep.get("heuristic_score", 0)
+        metrics = rep.get("heuristic_metrics") or {}
+        
+        heur_text = f"Overall Score: {h_score:.1f}\n"
+        metrics_strs = []
+        if metrics.get("knee_valgus") is not None:
+             metrics_strs.append(f"Knee Valgus: {metrics['knee_valgus']:.1f}°")
+        if metrics.get("forward_lean") is not None:
+             metrics_strs.append(f"Forward Lean: {metrics['forward_lean']:.1f}°")
+        if metrics.get("squat_depth") is not None:
+             metrics_strs.append(f"Depth Ratio: {metrics['squat_depth']:.2f}")
+        if metrics.get("min_knee_angle") is not None:
+             metrics_strs.append(f"Min Knee Angle: {metrics['min_knee_angle']:.1f}°")
+             
+        if metrics_strs:
+            heur_text += " | ".join(metrics_strs)
+        else:
+            heur_text += "Metrics not available."
+            
+        self.heuristic_var.set(heur_text)
+
+        # Show existing score or clear
+        if rep.get("human_score") is not None:
+            self.score_entry.configure(state="normal")
+            self.score_entry.delete(0, "end")
+            self.score_entry.insert(0, str(int(rep["human_score"])))
+            h = rep.get("heuristic_score", 0)
+            diff = rep["human_score"] - h
+            # Restore flags
+            rep_flags = rep.get("human_flags", rep.get("flags", {}))
+            for k, v in self.flag_vars.items():
+                v.set(rep_flags.get(k, False))
+            
+            # Restore Severities
+            rep_sevs = rep.get("human_flag_severities", rep.get("flag_severities", {}))
+            for k, v in self.flag_severity_vars.items():
+                # Round and set because it's a DoubleVar
+                val = rep_sevs.get(k, 1 if rep_flags.get(k) else 0)
+                v.set(float(val))
+                    
+            # Restore Confidence
+            if rep.get("annotator_confidence"):
+                self.confidence_var.set(str(rep["annotator_confidence"]))
+            else:
+                self.confidence_var.set("4")
+                
+            # Restore Notes
+            self.notes_var.set(rep.get("annotation_notes", ""))
+            
+            # Restore Metrics
+            if rep.get("human_metric_scores"):
+                hms = rep["human_metric_scores"]
+                for m_key, m_var in self.metric_vars.items():
+                    val = hms.get(m_key)
+                    if val is not None:
+                        # Assuming integers for simplicity but float works too
+                        m_var.set(str(int(val)) if val.is_integer() else str(val))
+                    else:
+                        m_var.set("")
+            else:
+                for m_var in self.metric_vars.values():
+                    m_var.set("")
+
+        else:
+            self.score_entry.configure(state="normal")
+            self.score_entry.delete(0, "end")
+            self.feedback_var.set("")
+            for v in self.flag_vars.values():
+                v.set(False)
+            for v in self.flag_severity_vars.values():
+                v.set(0)
+            self.confidence_var.set("4")
+            self.notes_var.set("")
+            for v in self.metric_vars.values():
+                v.set("")
+
+        self.score_entry.focus_set()
+
+        # Load both raw and visualized side-by-side
+        self._load_dual_videos()
+
+    def _prev_rep(self) -> None:
+        if self.current_rep_idx > 0:
+            self.current_rep_idx -= 1
+            self._show_current_rep()
+
+    def _next_rep(self) -> None:
+        if not self.current_annotation:
+            return
+        reps = self.current_annotation.get("reps", [])
+        if self.current_rep_idx < len(reps) - 1:
+            self.current_rep_idx += 1
+            self._show_current_rep()
+        else:
+            # All reps done for this video
+            scored = sum(1 for r in reps if r.get("human_score") is not None)
+            self.feedback_var.set(
+                f"All {len(reps)} reps viewed! {scored} scored. "
+                f"Select another video."
+            )
+            self._scan_folder()  # refresh list markers
+
+    # ============================================================ Video playback
+    def _load_dual_videos(self) -> None:
+        if not self.current_annotation:
+            return
+
+        def _resolve_existing_path(path_text: str) -> str:
+            if not path_text:
+                return ""
+            p = Path(path_text)
+            if not p.is_absolute():
+                p = PROJECT_ROOT / p
+            return str(p) if p.exists() else ""
+
+        def _find_overlay_from_pipeline_outputs(video_id: str, quality: str) -> str:
+            outputs = self.current_annotation.get("pipeline_outputs", {}) if self.current_annotation else {}
+            seg_path_text = outputs.get("segmented_json", "")
+            seg_path = Path(_resolve_existing_path(seg_path_text)) if seg_path_text else None
+
+            candidates = []
+            if seg_path and seg_path.exists():
+                # .../workspace/squat/segmented_reps/<quality>/<video>_segmented.json
+                squat_root = seg_path.parent.parent.parent
+                vis_dir = squat_root / "visualized_segmentation" / quality
+                candidates.extend([
+                    vis_dir / f"{video_id}_phases.mp4",
+                    vis_dir / f"{video_id}_segmented.mp4",
+                    vis_dir / f"{video_id}_phases.avi",
+                    vis_dir / f"{video_id}_segmented.avi",
+                ])
+
+            for candidate in candidates:
+                if candidate.exists():
+                    return str(candidate)
+            return ""
+
+        # 1. Load Raw
+        raw_path = str(self.current_video_path) if self.current_video_path and self.current_video_path.exists() else None
+        if self.cap_raw:
+            self.cap_raw.release()
+        self.cap_raw = cv2.VideoCapture(raw_path) if raw_path else None
+
+        # 2. Load Vis
+        vis_path = self.current_annotation.get("pipeline_outputs", {}).get("visualization_video", "")
+        resolved_vis_path = _resolve_existing_path(vis_path)
+
+        # If the saved path is stale (or points to raw fallback), recover from pipeline outputs.
+        if (not resolved_vis_path) or (raw_path and Path(resolved_vis_path) == Path(raw_path)):
+            resolved_vis_path = _find_overlay_from_pipeline_outputs(
+                self.current_annotation.get("video_id", ""),
+                self.current_annotation.get("quality_rating", "").lower(),
+            )
+
+        if self.cap_vis:
+            self.cap_vis.release()
+        self.cap_vis = cv2.VideoCapture(resolved_vis_path) if resolved_vis_path else None
+
+        # Reset labels if not opened
+        if not self.cap_raw or not self.cap_raw.isOpened():
+            self.raw_label.configure(image="", text="Raw video not found.")
+            self._photo_raw = None
+            self.cap_raw = None
+        if not self.cap_vis or not self.cap_vis.isOpened():
+            self.vis_label.configure(image="", text="Visualized video not found.")
+            self._photo_vis = None
+            self.cap_vis = None
+
+        # Set up rep boundaries
+        reps = self.current_annotation.get("reps", [])
+        if self.current_rep_idx < len(reps):
+            rep = reps[self.current_rep_idx]
+            self.rep_start = rep.get("start_frame", 0)
+            self.rep_end = rep.get("end_frame", 0)
+            self.fps = self.current_annotation.get("fps", 30.0) or 30.0
+
+            if self.cap_raw: self.cap_raw.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
+            if self.cap_vis: self.cap_vis.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
+            
+            self._display_current_frames()
+        
+        self._start_playback()
+
+    def _display_current_frames(self) -> None:
+        """Display one frame from whichever captures are open."""
+        if self.cap_raw:
+            ok, frame = self.cap_raw.read()
+            if ok:
+                self._display_single_frame(frame, self.raw_label, "raw")
+        if self.cap_vis:
+            ok, frame = self.cap_vis.read()
+            if ok:
+                self._display_single_frame(frame, self.vis_label, "vis")
+
+    def _display_single_frame(self, frame, label_widget, kind: str) -> None:
+        if Image is None or ImageTk is None:
+            label_widget.configure(image="", text="Pillow not installed.")
+            return
+        
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        # Smaller size for side-by-side
+        max_w, max_h = 480, 320
+        scale = min(max_w / max(w, 1), max_h / max(h, 1), 1.0)
+        if scale < 1.0:
+            rgb = cv2.resize(rgb, (int(w * scale), int(h * scale)),
+                             interpolation=cv2.INTER_AREA)
+        img = Image.fromarray(rgb)
+        photo = ImageTk.PhotoImage(image=img)
+        label_widget.configure(image=photo, text="")
+        if kind == "raw":
+            self._photo_raw = photo
+        else:
+            self._photo_vis = photo
+
+    def _toggle_play(self) -> None:
+        if self.playing:
+            self._stop_playback()
+        else:
+            if self.cap_raw or self.cap_vis:
+                # Check if we need to loop
+                cap = self.cap_raw or self.cap_vis
+                cur = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                if cur >= self.rep_end:
+                    if self.cap_raw: self.cap_raw.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
+                    if self.cap_vis: self.cap_vis.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
+                self._start_playback()
+
+    def _replay(self) -> None:
+        self._stop_playback()
+        time.sleep(0.05)
+        if self.cap_raw: self.cap_raw.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
+        if self.cap_vis: self.cap_vis.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
+        self._start_playback()
+
+    def _start_playback(self) -> None:
+        self.playing = True
+        self.play_stop_event.clear()
+        self.play_thread = threading.Thread(
+            target=self._playback_loop, daemon=True)
+        self.play_thread.start()
+
+    def _stop_playback(self) -> None:
+        self.playing = False
+        self.play_stop_event.set()
+        if self.play_thread is not None and self.play_thread.is_alive():
+            try:
+                self.play_thread.join(timeout=0.3)
+            except Exception:
+                pass
+            self.play_thread = None
+
+    def _playback_loop(self) -> None:
+        while self.playing and not self.play_stop_event.is_set():
+            if not self.cap_raw and not self.cap_vis:
+                return
+            
+            # Check for loop in master capture (Raw if available, else Vis)
+            master = self.cap_raw if self.cap_raw else self.cap_vis
+            cur = int(master.get(cv2.CAP_PROP_POS_FRAMES))
+            if cur >= self.rep_end:
+                if self.cap_raw: self.cap_raw.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
+                if self.cap_vis: self.cap_vis.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
+            
+            # Read and display (Tkinter calls must be on main thread)
+            self.root.after(0, self._display_current_frames)
+            
+            time.sleep(max(1.0 / self.fps, 0.01))
+
+
+    # ============================================================ Scoring
+    def _on_scale_changed(self, value: str, key: str) -> None:
+        """Handle manual slider dragging -> tick the box if > 0, snap to integer."""
+        v = float(value)
+        int_val = round(v)
+        
+        # Snap visually to integer to enforce discrete 0-5 steps
+        if abs(v - int_val) > 0.01:
+            self.flag_severity_vars[key].set(float(int_val))
+
+        if int_val > 0:
+            if self.flag_vars[key].get() == False:
+                self.flag_vars[key].set(True)
+                self._on_error_toggled(key)
+        else:
+            if self.flag_vars[key].get() == True:
+                self.flag_vars[key].set(False)
+                self._on_error_toggled(key)
+
+    def _on_checkbox_toggled(self, key: str) -> None:
+        """Handle manual checkbox toggle -> snap slider to 1 or 0."""
+        if self.flag_vars[key].get():
+            if self.flag_severity_vars[key].get() < 1:
+                self.flag_severity_vars[key].set(1.0)
+        else:
+            self.flag_severity_vars[key].set(0.0)
+
+    def _on_error_toggled(self, key: str) -> None:
+        pass
+
+    def _toggle_flag(self, key: str) -> None:
+        var = self.flag_vars.get(key)
+        if var is not None:
+            var.set(not var.get())
+            self._on_error_toggled(key)
+
+    def _submit_score(self, event=None) -> None:
+        if not self.current_annotation:
+            return
+
+        reps = self.current_annotation.get("reps", [])
+        if self.current_rep_idx >= len(reps):
+            return
+
+        text = self.score_entry.get().strip()
+        try:
+            score = float(text)
+            if not (0 <= score <= 100):
+                raise ValueError
+        except ValueError:
+            self.feedback_var.set("⚠ Enter a number between 0 and 100.")
+            return
+
+        # Save view label update globally for the video
+        new_view = getattr(self, "view_var", None)
+        if new_view:
+            val = new_view.get()
+            if val:
+                self.current_annotation["view"] = val
+
+        rep = reps[self.current_rep_idx]
+        
+        h = rep.get("heuristic_score", 0.0)
+        
+        rep["human_score"] = score
+        
+        # Human Flags and Severities
+        rep["human_flags"] = {k: v.get() for k, v in self.flag_vars.items()}
+        rep["human_flag_severities"] = {k: int(round(v.get())) for k, v in self.flag_severity_vars.items()}
+        
+        # Annotator Confidence
+        try:
+            rep["annotator_confidence"] = int(self.confidence_var.get())
+        except ValueError:
+            rep["annotator_confidence"] = 4
+            
+        # Annotation Notes
+        rep["annotation_notes"] = self.notes_var.get().strip()
+        
+        # Human Metric Scores (convert blanks to null)
+        hms = {}
+        for m_key, m_var in self.metric_vars.items():
+            val_str = m_var.get().strip()
+            if not val_str:
+                hms[m_key] = None
+            else:
+                try:
+                    hms[m_key] = float(val_str)
+                except ValueError:
+                    hms[m_key] = None
+        rep["human_metric_scores"] = hms
+        
+        # Keep old 'flags' and 'flag_severities' fields for backward compatibility, 
+        # or mirror human_flags to it to avoid breaking downstream scripts yet.
+        rep["flags"] = rep["human_flags"]
+        rep["flag_severities"] = rep["human_flag_severities"]
+
+        # Update timestamp
+        self.current_annotation["annotated_at"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%S")
+
+        self._save_current_annotation()
+        self._update_index()
+
+        # Reveal heuristic
+        h = rep.get("heuristic_score", 0.0)
+        diff = score - h
+        direction = "higher" if diff > 0 else "lower"
+        self.feedback_var.set(
+            f"Your score: {score:.0f}  |  "
+            f"Heuristic: {h:.0f}  |  "
+            f"Δ {diff:+.1f} pts ({direction})"
+        )
+
+        scored = sum(1 for r in reps if r.get("human_score") is not None)
+        self.progress_var.set(f"Scored: {scored} / {len(reps)} reps in this video")
+
+        # Auto-advance after delay
+        self.root.after(1500, self._next_rep)
+
+    def _skip_rep(self) -> None:
+        self._next_rep()
+
+    # ============================================================ Persistence
+    def _manual_save(self) -> None:
+        if self.current_annotation:
+            self._save_current_annotation()
+            self.feedback_var.set("✅ Saved annotation progress manually!")
+        else:
+            self.feedback_var.set("No video loaded to save.")
+
+    def _save_current_annotation(self) -> None:
+        if not self.current_annotation:
+            return
+        ANNOTATIONS_VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+        path = ANNOTATIONS_VIDEOS_DIR / f"{self.current_video_id}.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.current_annotation, f, indent=2)
+
+    def _update_index(self) -> None:
+        """Update the master index.json with summary stats."""
+        ANNOTATIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+        index: dict = {}
+        if ANNOTATIONS_INDEX.exists():
+            try:
+                with open(ANNOTATIONS_INDEX, "r", encoding="utf-8") as f:
+                    index = json.load(f)
+            except Exception:
+                index = {}
+
+        if "videos" not in index:
+            index["videos"] = {}
+
+        ann = self.current_annotation
+        if ann:
+            reps = ann.get("reps", [])
+            scored = sum(1 for r in reps if r.get("human_score") is not None)
+            scores = [r["human_score"] for r in reps if r.get("human_score") is not None]
+            index["videos"][self.current_video_id] = {
+                "total_reps": len(reps),
+                "scored_reps": scored,
+                "view": ann.get("view", "unknown"),
+                "pipeline_run": ann.get("pipeline_run", ""),
+                "avg_human_score": round(sum(scores) / len(scores), 1) if scores else None,
+                "last_updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+
+        # Global stats
+        total_vids = len(index["videos"])
+        total_scored = sum(v.get("scored_reps", 0) for v in index["videos"].values())
+        total_reps = sum(v.get("total_reps", 0) for v in index["videos"].values())
+        index["summary"] = {
+            "total_videos": total_vids,
+            "total_reps": total_reps,
+            "total_scored": total_scored,
+            "last_updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+
+        with open(ANNOTATIONS_INDEX, "w", encoding="utf-8") as f:
+            json.dump(index, f, indent=2)
+
+    # ============================================================ Analysis
+    def _run_analysis(self) -> None:
+        if not ANNOTATIONS_VIDEOS_DIR.exists():
+            messagebox.showinfo("No Data", "No annotations saved yet.")
+            return
+
+        all_human = []
+        all_heuristic = []
+        for ann_file in ANNOTATIONS_VIDEOS_DIR.glob("*.json"):
+            try:
+                with open(ann_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for rep in data.get("reps", []):
+                    if rep.get("human_score") is not None:
+                        all_human.append(rep["human_score"])
+                        all_heuristic.append(rep.get("heuristic_score", 0))
+            except Exception:
+                continue
+
+        if not all_human:
+            messagebox.showinfo("No Data", "No scored reps found.")
+            return
+
+        import numpy as np
+        human = np.array(all_human)
+        heuristic = np.array(all_heuristic)
+        disagreement = human - heuristic
+        corr = np.corrcoef(human, heuristic)[0, 1] if len(human) > 1 else 0
+
+        lines = [
+            "═" * 45,
+            "  Annotation Quality Report",
+            "═" * 45,
+            f"  Total scored reps: {len(human)}",
+            f"  Videos:            {len(list(ANNOTATIONS_VIDEOS_DIR.glob('*.json')))}",
+            "",
+            f"  Human score range: {human.min():.0f} – {human.max():.0f}",
+            f"  Human score mean:  {human.mean():.1f} ± {human.std():.1f}",
+            f"  Heuristic mean:    {heuristic.mean():.1f} ± {heuristic.std():.1f}",
+            "",
+            f"  Mean disagreement: {disagreement.mean():+.1f} pts",
+            f"  Disagreement std:  {disagreement.std():.1f} pts",
+            f"  Correlation (r):   {corr:.3f}",
+            "",
+        ]
+
+        if disagreement.std() < 3.0:
+            lines.append("  ⚠ Low disagreement — scores match heuristic closely.")
+        if human.std() < 10.0:
+            lines.append("  ⚠ Low score variance — use full 0-100 range.")
+        if corr > 0.95:
+            lines.append("  ⚠ Very high correlation — focus on temporal quality.")
+        if len(human) < 50:
+            lines.append(f"  ⚠ Only {len(human)} scored — consider annotating more.")
+        if not any("⚠" in l for l in lines):
+            lines.append("  ✅ Annotations look good for training!")
+        lines.append("═" * 45)
+
+        top = tk.Toplevel(self.root)
+        top.title("Annotation Quality Analysis")
+        top.geometry("460x420")
+        tw = tk.Text(top, wrap=tk.WORD, padx=10, pady=10,
+                     font=("Consolas", 10))
+        tw.pack(fill=tk.BOTH, expand=True)
+        tw.insert(tk.END, "\n".join(lines))
+        tw.configure(state="disabled")
+
+    # ============================================================ Cleanup
+    def cleanup(self) -> None:
+        self._stop_playback()
+        if self.cap_raw is not None:
+            self.cap_raw.release()
+            self.cap_raw = None
+        if self.cap_vis is not None:
+            self.cap_vis.release()
+            self.cap_vis = None
+
+
+# ---------------------------------------------------------------------------
+# Main entry point — Notebook with Inference + Annotation tabs
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     root = tk.Tk()
-    app = PipelineRunnerUI(root)
+    root.title("ExeVision Pipeline")
+    root.geometry("1400x900")
+    root.resizable(True, True)
+
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+    # Tab 1: Inference (existing pipeline runner)
+    inference_frame = ttk.Frame(notebook)
+    notebook.add(inference_frame, text="  Inference  ")
+
+    # Tab 2: Annotation
+    annotation_frame = ttk.Frame(notebook)
+    notebook.add(annotation_frame, text="  Annotation  ")
+
+    # Build Inference UI — PipelineRunnerUI expects to own root,
+    # so we pass root but transplant its children into the inference_frame.
+    pipeline_ui = PipelineRunnerUI(root)
+
+    # Move all PipelineRunnerUI widgets into the inference tab
+    for child in list(root.winfo_children()):
+        if child is not notebook:
+            child.pack_forget()
+            child.grid_forget()
+            child.place_forget()
+            child.pack(in_=inference_frame, fill=tk.BOTH, expand=True)
+
+    # Build Annotation UI
+    annotation_ui = AnnotationToolUI(annotation_frame)
+
+
+    def _on_close() -> None:
+        annotation_ui.cleanup()
+        pipeline_ui._on_close()
+
+    root.protocol("WM_DELETE_WINDOW", _on_close)
     root.mainloop()
 
 

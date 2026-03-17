@@ -1,4 +1,4 @@
-﻿
+
 import os
 import json
 import math
@@ -12,8 +12,9 @@ from tqdm import tqdm
 FEATURES_EXCELLENT = "./squat/extracted_features_clean/excellent"
 FEATURES_GOOD = "./squat/extracted_features_clean/good"
 FEATURES_FAIR = "./squat/extracted_features_clean/fair"
+FEATURES_RAW_UNFILTERED = "./squat/extracted_features_clean/raw_unfiltered"
 
-FEATURES_DIRS = [FEATURES_EXCELLENT, FEATURES_GOOD, FEATURES_FAIR]
+FEATURES_DIRS = [FEATURES_EXCELLENT, FEATURES_GOOD, FEATURES_FAIR, FEATURES_RAW_UNFILTERED]
 
 # BlazePose landmark indices
 NOSE = 0
@@ -48,14 +49,29 @@ def _face_score(frame, has_vis: bool) -> float:
     return frame[NOSE][3] + frame[L_EYE][3] + frame[R_EYE][3]
 
 
-def _facing_camera(frame) -> bool:
-    """Use nose-vs-hip depth to determine whether the torso faces the camera."""
+def _facing_camera(frame, has_vis: bool) -> bool | None:
+    """Use nose-vs-hip Z-depth to determine whether the torso faces the camera.
+
+    Returns True (facing), False (back), or None when the nose is too unreliable
+    to produce a meaningful depth comparison (zeroed by filter, low visibility, or
+    the depth difference is within noise range).
+    """
+    # Reject zeroed nose (stability filter set all coords to 0.0)
+    nx, ny = frame[NOSE][0], frame[NOSE][1]
+    if abs(nx) < 1e-5 and abs(ny) < 1e-5:
+        return None
+    # Reject low-visibility nose
+    if has_vis and frame[NOSE][3] < 0.25:
+        return None
     nose_z = frame[NOSE][2]
     hip_z = (frame[L_HIP][2] + frame[R_HIP][2]) / 2.0
-    return nose_z < hip_z
+    # Require a meaningful depth gap (anything smaller is noise in image-coord z)
+    if abs(nose_z - hip_z) < 0.002:
+        return None
+    return nose_z < hip_z  # nose closer to camera → person faces camera
 
 
-def _classify_frame(frame) -> str | None:
+def _classify_frame(frame, face_detected: bool = False) -> str | None:
     """Classify a single frame. Returns a view label or None if unusable."""
     if not frame or len(frame) < 25:
         return None
@@ -63,6 +79,8 @@ def _classify_frame(frame) -> str | None:
     has_vis = len(frame[0]) > 3
 
     # --- Signal 1: Face visibility ---
+    # With Face Detector Integration, we prioritize the independent face detector signal.
+    # The heuristic landmark checks are kept as fallback if face detector is disabled.
     nose_vis = _is_visible(frame[NOSE], has_vis)
     l_eye_vis = _is_visible(frame[L_EYE], has_vis)
     r_eye_vis = _is_visible(frame[R_EYE], has_vis)
@@ -83,36 +101,53 @@ def _classify_frame(frame) -> str | None:
     if shoulder_width < SIDE_WIDTH:
         return "side"
 
-    # Back or diagonal front: can't see any face landmarks
-    if not any_face:
-        if shoulder_width < DIAGONAL_WIDTH:
-            return "front_side" if _facing_camera(frame) else "back_side"
-        return "back"
+    # Depth signal: True=facing camera, False=back to camera, None=unreliable
+    depth_forward = _facing_camera(frame, has_vis)
 
-    # Front: both eyes clearly visible + wide shoulders
-    if both_eyes:
-        if shoulder_width < DIAGONAL_WIDTH:
-            return "front_side" if _facing_camera(frame) else "back_side"
+    if shoulder_width < DIAGONAL_WIDTH:
+        # Priority 1: reliable nose depth
+        if depth_forward is True:
+            return "front_side"
+        if depth_forward is False:
+            return "back_side"
+        # Priority 2 (depth ambiguous): external face detector
+        if face_detected:
+            return "front_side"
+        # Priority 3: MediaPipe face landmark visibility (nose/eyes still visible
+        # even when their position is unreliable)
+        if any_face:
+            return "front_side"
+        # Default: no facing signal available
+        return "back_side"
+
+    # Pure front vs back (wide-shoulder zone)
+    if depth_forward is True:
         return "front"
+    if depth_forward is False:
+        return "back"
+    if face_detected:
+        return "front"
+    if any_face:
+        return "front"
+    return "back"
 
-    # Remaining non-side, non-pure-front frames are diagonal.
-    return "front_side" if _facing_camera(frame) else "back_side"
 
-
-def get_view_label(keypoints_img: list) -> str:
+def get_view_label(keypoints_img: list, face_detected_list: list = None) -> str:
     """Classify camera view. Returns the view with the most frame votes."""
-    label, _ = get_view_label_with_probs(keypoints_img)
+    label, _ = get_view_label_with_probs(keypoints_img, face_detected_list)
     return label
 
 
-def get_view_label_with_probs(keypoints_img: list) -> tuple[str, dict]:
+def get_view_label_with_probs(keypoints_img: list, face_detected_list: list = None) -> tuple[str, dict]:
     """Classify with full vote distribution."""
     votes = []
 
-    for frame in (keypoints_img or []):
+    for idx, frame in enumerate(keypoints_img or []):
         if len(votes) >= MAX_FRAMES:
             break
-        label = _classify_frame(frame)
+        
+        is_face_detected = face_detected_list[idx] if (face_detected_list and idx < len(face_detected_list)) else False
+        label = _classify_frame(frame, face_detected=is_face_detected)
         if label:
             votes.append(label)
 
@@ -138,11 +173,12 @@ def process_video_classification(json_path: str) -> tuple:
         with open(json_path, 'r') as f:
             data = json.load(f)
         
-        # Get keypoints
+        # Get keypoints and features
         keypoints_img = data.get('keypoints_img', [])
+        face_detected_list = data.get('face_detected', [])
         
         # Classify view
-        view = get_view_label(keypoints_img)
+        view = get_view_label(keypoints_img, face_detected_list)
         
         # Update JSON with view classification
         if 'info' not in data:

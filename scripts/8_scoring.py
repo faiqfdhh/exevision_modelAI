@@ -45,11 +45,13 @@ FEATURES_DIRS = [
         "./squat/extracted_features_clean/excellent",
         "./squat/extracted_features_clean/good",
         "./squat/extracted_features_clean/fair",
+    "./squat/extracted_features_clean/raw_unfiltered",
 ]
 SEGMENTED_DIRS = [
         "./squat/segmented_reps/excellent",
         "./squat/segmented_reps/good",
         "./squat/segmented_reps/fair",
+    "./squat/segmented_reps/raw_unfiltered",
 ]
 OUTPUT_DIR = "./squat/aqa_analysis_simple"
 
@@ -160,32 +162,37 @@ def hip_y(frame: Any, min_conf: float = 0.4) -> Optional[float]:
 
 def calculate_vertical_depth(frame: Any, min_conf: float = 0.4) -> Optional[float]:
         """
-        Calculates depth based on vertical hip vs knee position.
+        Calculates depth based on vertical hip vs knee position, per-leg.
+        Returns the BEST (most positive) depth reading across both valid legs.
+        Only one leg needs to show depth — avoids being penalised by a
+        poorly-tracked contralateral knee (common in diagonal/front-side views).
+
         Returns: Positive value if hip is BELOW knee (Good), Negative if ABOVE (Bad).
         Normalized by femur length for scale invariance.
         """
-        if not _valid(frame, [L_HIP, R_HIP, L_KNEE, R_KNEE], min_conf):
+        candidates = []
+
+        # Left leg
+        if _valid(frame, [L_HIP, L_KNEE], min_conf):
+                lh = _lm(frame, L_HIP)
+                lk = _lm(frame, L_KNEE)
+                femur = abs(lh[1] - lk[1])
+                if femur >= 1e-3:
+                        candidates.append((lh[1] - lk[1]) / femur)
+
+        # Right leg
+        if _valid(frame, [R_HIP, R_KNEE], min_conf):
+                rh = _lm(frame, R_HIP)
+                rk = _lm(frame, R_KNEE)
+                femur = abs(rh[1] - rk[1])
+                if femur >= 1e-3:
+                        candidates.append((rh[1] - rk[1]) / femur)
+
+        if not candidates:
                 return None
-    
-        lh = _lm(frame, L_HIP)
-        rh = _lm(frame, R_HIP)
-        lk = _lm(frame, L_KNEE)
-        rk = _lm(frame, R_KNEE)
-    
-        hip_y = (lh[1] + rh[1]) / 2
-        knee_y = (lk[1] + rk[1]) / 2
-    
-        # Image coords: Y increases downwards, so hip_y > knee_y means hip is lower (good)
-        displacement = hip_y - knee_y
-    
-        # Normalize by femur length (hip-knee distance in standing position)
-        femur_length = abs(lh[1] - lk[1]) + abs(rh[1] - rk[1])
-        femur_length = femur_length / 2.0
-    
-        if femur_length < 1e-3:
-                return None
-    
-        return float(displacement / femur_length)
+
+        # Use the best (deepest) reading: one good leg is sufficient
+        return float(max(candidates))
 
 
 def calculate_torso_tibia_offset(frame: Any, min_conf: float = 0.4) -> Optional[float]:

@@ -22,6 +22,7 @@ OUTPUT_ROOT = "./squat/extracted_features_clean"
 VISUALIZATION_OUTPUT_ROOT = "./squat/visualized_poses_clean"
 ANALYSIS_OUTPUT_ROOT = "./squat/analysis_reports"
 MODEL_PATH = os.environ.get("EXEVISION_MODEL_PATH", os.path.join('models', 'pose_landmarker_heavy.task'))
+FACE_MODEL_PATH = os.environ.get("EXEVISION_FACE_MODEL_PATH", os.path.join('models', 'blaze_face_short_range.tflite'))
 CREATE_VISUALIZATION = True
 CREATE_ANALYSIS_REPORT = True  # Generate detailed analysis report
 
@@ -693,13 +694,20 @@ def filter_unstable_landmarks(
 
     # Per-landmark filtering (no chain-level discard).
     # Each landmark passes/fails individually based on stability metrics.
+    #
+    # Face landmarks (0-10) are intentionally excluded from zeroing.
+    # They are only used for camera-view classification (stage 4), and head movement
+    # during a squat naturally triggers the motion instability filter — that should
+    # not erase face visibility information which the classifier depends on.
+    FACE_LANDMARK_INDICES = set(range(11))  # MediaPipe 0-10: nose, eyes, ears, mouth, neck
 
     filtered_img = img_np.copy()
     filtered_world = world_np.copy()
     unstable_idx = np.where(~stable_mask)[0]
-    if unstable_idx.size > 0:
-        filtered_img[:, unstable_idx, :] = 0.0
-        filtered_world[:, unstable_idx, :] = 0.0
+    body_unstable_idx = np.array([i for i in unstable_idx if i not in FACE_LANDMARK_INDICES])
+    if body_unstable_idx.size > 0:
+        filtered_img[:, body_unstable_idx, :] = 0.0
+        filtered_world[:, body_unstable_idx, :] = 0.0
 
     stable_indices = np.where(stable_mask)[0].tolist()
     unstable_indices = unstable_idx.tolist()
@@ -786,6 +794,13 @@ def get_mediapipe_options():
         min_pose_presence_confidence=0.5,
         min_tracking_confidence=0.5,
         output_segmentation_masks=False
+    )
+
+def get_face_detector_options():
+    base_options = python.BaseOptions(model_asset_path=FACE_MODEL_PATH)
+    return vision.FaceDetectorOptions(
+        base_options=base_options,
+        min_detection_confidence=0.5
     )
 
 def find_video_path(video_id):
@@ -921,9 +936,11 @@ def process_single_video(vid_path, mode="filtered"):
         frames_for_viz = []
         frame_metrics = []
         mandatory_chain_flags = []
+        face_detected_per_frame = []
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        with vision.PoseLandmarker.create_from_options(get_mediapipe_options()) as landmarker:
+        with vision.PoseLandmarker.create_from_options(get_mediapipe_options()) as landmarker, \
+             vision.FaceDetector.create_from_options(get_face_detector_options()) as face_detector:
             for frame_idx in range(frame_count):
                 ret, frame = cap.read()
                 if not ret:
@@ -936,6 +953,11 @@ def process_single_video(vid_path, mode="filtered"):
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
                 frame_timestamp_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
                 
+                # Face Detection
+                face_detection_result = face_detector.detect(mp_image)
+                face_detected_per_frame.append(len(face_detection_result.detections) > 0)
+                
+                # Pose Landmarking
                 detection_result = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
                 
                 if detection_result.pose_landmarks:
@@ -1117,6 +1139,7 @@ def process_single_video(vid_path, mode="filtered"):
                 "landmark_stability": stability_summary,
                 "problem_frames": analysis['problem_frames'],
                 "continuous_problems": analysis['continuous_problems'],
+                "face_detected": face_detected_per_frame,
                 "keypoints_img": data_img_space,
                 "keypoints_world": data_world_space
             }, f, indent=2)
@@ -1309,8 +1332,14 @@ def run_extraction(mode="filtered"):
     print('='*60)
 
 if __name__ == "__main__":
-    import sys
-    mode = "filtered"
-    if len(sys.argv) > 1 and sys.argv[1] in ["filtered", "unfiltered"]:
-        mode = sys.argv[1]
-    run_extraction(mode=mode)
+    import argparse
+    parser = argparse.ArgumentParser(description="Extract features from squat videos.")
+    parser.add_argument("mode", nargs="?", default="filtered", choices=["filtered", "unfiltered"], help="Processing mode")
+    parser.add_argument("--no-viz", action="store_true", help="Disable video visualization")
+    args = parser.parse_args()
+
+    if args.no_viz:
+        CREATE_VISUALIZATION = False
+        print("ℹ️  Visualization disabled via CLI")
+
+    run_extraction(mode=args.mode)
