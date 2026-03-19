@@ -38,8 +38,16 @@ QUALITY_FOLDERS = {
 # Use ["*"] to process ALL videos, or specific IDs like ["25713_3", "46315_6"]
 VIDEO_IDS = ["*"]
 
-# Processing mode: "filtered" (default, with all filters/smoothing) or "unfiltered" (raw MediaPipe)
+# Processing mode: "filtered" (default, with full processing) or
+# "unfiltered" (One Euro smoothing only, no stability filtering)
 PROCESSING_MODE = "filtered"
+
+# One Euro Filter settings for lightly smoothed unfiltered mode.
+ONE_EURO_SETTINGS = {
+    'min_cutoff': 1.0,
+    'beta': 0.5,
+    'd_cutoff': 1.0,
+}
 
 # MediaPipe 33 landmarks connections
 POSE_CONNECTIONS = [
@@ -332,6 +340,84 @@ def apply_savgol_filter(pose_data, window_length=11, polyorder=3):
     smoothed_data = np.concatenate((smoothed_xyz, data_np[:, :, 3:]), axis=2)
 
     return smoothed_data.tolist()
+
+
+class OneEuroFilter:
+    """
+    One Euro Filter (Casiez et al., 2012) for adaptive low-pass smoothing.
+
+    Slow-moving signals receive stronger smoothing to suppress jitter,
+    while fast-moving signals receive lighter smoothing to preserve motion.
+    """
+
+    def __init__(self, min_cutoff=1.0, beta=0.007, d_cutoff=1.0):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.x_prev = None
+        self.dx_prev = None
+        self.t_prev = None
+
+    def _smoothing_factor(self, t_e, cutoff):
+        r = 2 * np.pi * cutoff * t_e
+        return r / (r + 1)
+
+    def __call__(self, t, x):
+        if self.t_prev is None:
+            self.x_prev = x
+            self.dx_prev = np.zeros_like(x)
+            self.t_prev = t
+            return x
+
+        t_e = t - self.t_prev
+        if t_e <= 0:
+            t_e = 1e-6
+
+        a_d = self._smoothing_factor(t_e, self.d_cutoff)
+        dx = (x - self.x_prev) / t_e
+        dx_hat = a_d * dx + (1 - a_d) * self.dx_prev
+
+        speed = np.abs(dx_hat)
+        cutoff = self.min_cutoff + self.beta * speed
+
+        a = self._smoothing_factor(t_e, cutoff)
+        x_hat = a * x + (1 - a) * self.x_prev
+
+        self.x_prev = x_hat
+        self.dx_prev = dx_hat
+        self.t_prev = t
+
+        return x_hat
+
+
+def apply_one_euro_filter(pose_data, fps, min_cutoff=1.0, beta=0.007, d_cutoff=1.0):
+    """
+    Apply One Euro smoothing to pose landmark XYZ coordinates.
+    Visibility values are preserved unchanged.
+    """
+    if not pose_data or len(pose_data) < 2:
+        return pose_data
+
+    data_np = np.array(pose_data, dtype=np.float64)
+    if data_np.ndim != 3 or data_np.shape[2] < 4:
+        return pose_data
+
+    frame_count, joint_count, _ = data_np.shape
+    dt = 1.0 / fps if fps and fps > 0 else 1.0 / 30.0
+
+    for joint_idx in range(joint_count):
+        for coord_idx in range(3):
+            filt = OneEuroFilter(
+                min_cutoff=min_cutoff,
+                beta=beta,
+                d_cutoff=d_cutoff,
+            )
+            for frame_idx in range(frame_count):
+                timestamp = frame_idx * dt
+                value = data_np[frame_idx, joint_idx, coord_idx]
+                data_np[frame_idx, joint_idx, coord_idx] = filt(timestamp, value)
+
+    return data_np.tolist()
 
 def recover_planted_foot_ankles(
     pose_img_data,
@@ -1017,14 +1103,34 @@ def process_single_video(vid_path, mode="filtered"):
 
         cap.release()
 
-        # In unfiltered mode, skip all processing and use raw MediaPipe output
+        # In unfiltered mode, apply only One Euro smoothing and skip the
+        # heavier recovery/filtering pipeline used by filtered mode.
         if mode == "unfiltered":
-            print(f"[{vid_id}] Unfiltered mode: using raw MediaPipe output (no smoothing, no filtering)")
+            data_img_space = apply_one_euro_filter(
+                data_img_space,
+                fps,
+                min_cutoff=ONE_EURO_SETTINGS['min_cutoff'],
+                beta=ONE_EURO_SETTINGS['beta'],
+                d_cutoff=ONE_EURO_SETTINGS['d_cutoff'],
+            )
+            data_world_space = apply_one_euro_filter(
+                data_world_space,
+                fps,
+                min_cutoff=ONE_EURO_SETTINGS['min_cutoff'],
+                beta=ONE_EURO_SETTINGS['beta'],
+                d_cutoff=ONE_EURO_SETTINGS['d_cutoff'],
+            )
+            print(f"[{vid_id}] Lightly smoothed mode: One Euro Filter applied (no stability filtering)")
             stability_summary = {}
             planted_foot_summary = {}
             mandatory_chain_summary = {}
             mandatory_chain_warning = None
-            analysis = {'quality_rating': 'Raw', 'problem_frames': [], 'continuous_problems': [], 'recommendations': ['Raw unfiltered MediaPipe output']}
+            analysis = {
+                'quality_rating': 'Raw',
+                'problem_frames': [],
+                'continuous_problems': [],
+                'recommendations': ['One Euro smoothed MediaPipe output without stability filtering'],
+            }
             avg_overall = np.mean(visibility_scores) if visibility_scores else 0.0
             avg_key = np.mean(key_joint_scores) if key_joint_scores else 0.0
         else:
@@ -1120,7 +1226,9 @@ def process_single_video(vid_path, mode="filtered"):
                     "model": "PoseLandmarker_Heavy",
                     "processed_on": "CPU",
                     "timestamp": datetime.now().isoformat(),
-                    "quality_rating": analysis['quality_rating']
+                    "quality_rating": analysis['quality_rating'],
+                    "smoothing_method": "one_euro_filter" if mode == "unfiltered" else "savgol_plus_stability",
+                    "one_euro_params": ONE_EURO_SETTINGS if mode == "unfiltered" else None,
                 },
                 "visibility_metrics": {
                     "overall_avg": float(avg_overall),
@@ -1336,10 +1444,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract features from squat videos.")
     parser.add_argument("mode", nargs="?", default="filtered", choices=["filtered", "unfiltered"], help="Processing mode")
     parser.add_argument("--no-viz", action="store_true", help="Disable video visualization")
+    parser.add_argument("--no-report", action="store_true", help="Disable analysis reports (PNG plots + text files)")
     args = parser.parse_args()
 
     if args.no_viz:
         CREATE_VISUALIZATION = False
         print("ℹ️  Visualization disabled via CLI")
+
+    if args.no_report:
+        CREATE_ANALYSIS_REPORT = False
+        print("ℹ️  Analysis reports disabled via CLI")
 
     run_extraction(mode=args.mode)

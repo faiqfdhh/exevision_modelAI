@@ -89,7 +89,8 @@ HALF_WINDOW = ANALYSIS_WINDOW_SIZE // 2
 # =============================================================================
 # PHASE DURATION & HYSTERESIS
 # =============================================================================
-MIN_PHASE_DURATION_FRAMES = 12        # Minimum frames to confirm phase (400ms @ 30fps)
+MIN_PHASE_DURATION_FRAMES = 12        # Kept for reporting/backward compatibility
+GLITCH_MERGE_FRAMES = 3               # Only merge ultra-short phase flickers
 MIN_CONCENTRIC_DURATION = 20          # Concentric must last at least 20 frames before IDLE
 HYSTERESIS_FRAMES = 8                 # Must exceed threshold for this many frames to transition
 PHASE_LOCKOUT_FRAMES = 6              # Frames to wait before allowing another transition
@@ -100,6 +101,15 @@ PHASE_LOCKOUT_FRAMES = 6              # Frames to wait before allowing another t
 VELOCITY_IDLE_THRESHOLD = 0.005       # Reduced from 0.008 (was too strict)
 VELOCITY_MOVING_THRESHOLD = 0.010     # Reduced from 0.015
 VELOCITY_ISOMETRIC_BAND = 0.1       # Reduced from 0.012
+
+# Motion confirmation for anti-jitter transitions.
+DOWNWARD_VELOCITY_THRESHOLD = 0.0015
+UPWARD_VELOCITY_THRESHOLD = -0.0015
+POSITION_JITTER_THRESHOLD = 0.0003
+MOTION_CONFIRM_FRAMES = 2
+KNEE_BEND_DELTA_DEG = 2.0
+KNEE_EXTENDED_TOLERANCE_DEG = 3.0
+IDLE_HEIGHT_MARGIN = 0.02
 
 # Require hips to return near start-of-video baseline before allowing IDLE.
 IDLE_RETURN_MARGIN = 0.03
@@ -604,7 +614,8 @@ class SquatStateMachine:
         # State tracking
         self.current_state = SquatPhase.IDLE
         self.phase_labels = np.full(self.frame_count, SquatPhase.IDLE)
-        self.transition_log = [] 
+        self.transition_log = []
+        self.illegal_transition_repairs = 0
 
     def _can_return_to_idle(self, frame_idx: int, pos: float) -> bool:
         """Only allow IDLE once hips return near beginning-of-video standing position."""
@@ -620,43 +631,152 @@ class SquatStateMachine:
             return True
 
         return knee_angle >= IDLE_KNEE_EXTENSION_THRESHOLD
+
+    def _knee_extended(self, frame_idx: int) -> bool:
+        if self.knee_angles is None or frame_idx >= len(self.knee_angles):
+            return False
+        knee_angle = self.knee_angles[frame_idx]
+        if np.isnan(knee_angle):
+            return False
+        return knee_angle >= (STANDING_KNEE_ANGLE_THRESHOLD - KNEE_EXTENDED_TOLERANCE_DEG)
+
+    def _knee_bending(self, frame_idx: int) -> bool:
+        if self.knee_angles is None or frame_idx >= len(self.knee_angles):
+            return False
+        knee_angle = self.knee_angles[frame_idx]
+        if np.isnan(knee_angle):
+            return False
+        return knee_angle <= (STANDING_KNEE_ANGLE_THRESHOLD - KNEE_BEND_DELTA_DEG)
+
+    def _at_top_height(self, pos: float) -> bool:
+        return pos <= (self.start_hip_position + IDLE_HEIGHT_MARGIN)
+
+    def _is_transition_allowed(self, from_phase: SquatPhase, to_phase: SquatPhase) -> bool:
+        return to_phase in VALID_TRANSITIONS.get(from_phase, [from_phase])
+
+    def _sanitize_phase_sequence(self):
+        """
+        Enforce strict legal adjacency globally.
+
+        Allowed high-level cycle:
+        IDLE -> ECCENTRIC -> [ISOMETRIC] -> CONCENTRIC -> IDLE
+
+        This pass repairs any illegal adjacency introduced by raw detection noise
+        or post-processing by replacing illegal targets with previous legal phase.
+        """
+        if self.frame_count <= 1:
+            return
+
+        # Safety: first frame must start from IDLE in strict sequencing.
+        if self.phase_labels[0] != SquatPhase.IDLE:
+            self.transition_log.append({
+                "frame": 0,
+                "from": self.phase_labels[0].name.lower(),
+                "to": SquatPhase.IDLE.name.lower(),
+                "reason": "Sanitizer repair: force first frame to idle for strict cycle"
+            })
+            self.phase_labels[0] = SquatPhase.IDLE
+            self.illegal_transition_repairs += 1
+
+        for i in range(1, self.frame_count):
+            prev_phase = self.phase_labels[i - 1]
+            curr_phase = self.phase_labels[i]
+
+            if self._is_transition_allowed(prev_phase, curr_phase):
+                continue
+
+            self.transition_log.append({
+                "frame": i,
+                "from": curr_phase.name.lower(),
+                "to": prev_phase.name.lower(),
+                "reason": (
+                    f"Sanitizer repair: illegal adjacency {prev_phase.name.lower()} -> "
+                    f"{curr_phase.name.lower()} replaced with {prev_phase.name.lower()}"
+                )
+            })
+            self.phase_labels[i] = prev_phase
+            self.illegal_transition_repairs += 1
     
     def detect_phases(self) -> np.ndarray:
         """
         Simplified phase detection looping over all frames.
         Returns array of phase labels for each frame.
         """
+        downward_count = 0
+        upward_count = 0
+        still_count = 0
+
         for i in range(self.frame_count):
             vel = self.velocity[i]
             pos = self.position[i]
+            raw_vel = self.raw_velocity[i] if self.raw_velocity is not None else vel
+            eff_vel = 0.6 * float(vel) + 0.4 * float(raw_vel)
+            bent = self._knee_bending(i)
+            extended = self._knee_extended(i)
+            at_top = self._at_top_height(pos)
             
             suggested_phase = self.current_state
-            
-            # --- SIMPLIFIED LOGIC ---
-            
-            # 1. Hips going downwards = ECCENTRIC
-            if vel > ECCENTRIC_VELOCITY_MIN:
-                suggested_phase = SquatPhase.ECCENTRIC
-                
-            # 2. Hips going upwards = CONCENTRIC
-            elif vel < -CONCENTRIC_VELOCITY_MIN:
-                suggested_phase = SquatPhase.CONCENTRIC
-                
-            # 3. Not moving much
+
+            # Motion counters to reject slight jitter.
+            if eff_vel > DOWNWARD_VELOCITY_THRESHOLD and abs(pos - self.start_hip_position) > POSITION_JITTER_THRESHOLD:
+                downward_count += 1
             else:
-                # Idle after eccentric/isometric/concentric only when fully returned to start posture.
-                if self.current_state in [SquatPhase.ECCENTRIC, SquatPhase.ISOMETRIC]:
-                    if self._can_return_to_idle(i, pos):
-                        suggested_phase = SquatPhase.IDLE
-                    else:
-                        suggested_phase = SquatPhase.ISOMETRIC
-                elif self.current_state == SquatPhase.CONCENTRIC:
-                    if self._can_return_to_idle(i, pos):
-                        suggested_phase = SquatPhase.IDLE
-                    else:
-                        # Keep ascending phase active until true top position is reached.
-                        suggested_phase = SquatPhase.CONCENTRIC
-                # Idle before eccentric -> IDLE
+                downward_count = 0
+
+            if eff_vel < UPWARD_VELOCITY_THRESHOLD:
+                upward_count += 1
+            else:
+                upward_count = 0
+
+            if abs(eff_vel) <= VELOCITY_IDLE_THRESHOLD:
+                still_count += 1
+            else:
+                still_count = 0
+
+            # 1) Any confirmed downward movement + at least slight bend => ECCENTRIC.
+            if downward_count >= MOTION_CONFIRM_FRAMES and bent:
+                suggested_phase = SquatPhase.ECCENTRIC
+
+            # 2) Upward movement from ECCENTRIC/ISOMETRIC => CONCENTRIC.
+            elif (
+                upward_count >= MOTION_CONFIRM_FRAMES
+                and self.current_state in [SquatPhase.ECCENTRIC, SquatPhase.ISOMETRIC]
+            ):
+                suggested_phase = SquatPhase.CONCENTRIC
+
+            # 3) ISOMETRIC entry is only valid as ECCENTRIC -> ISOMETRIC after >1s hold.
+            elif (
+                self.current_state == SquatPhase.ECCENTRIC
+                and bent
+                and still_count >= int(self.fps)
+            ):
+                suggested_phase = SquatPhase.ISOMETRIC
+
+            # 4) When ascending, return to IDLE only at top + extended knees.
+            elif self.current_state == SquatPhase.CONCENTRIC:
+                if at_top and extended and self._can_return_to_idle(i, pos):
+                    suggested_phase = SquatPhase.IDLE
+                else:
+                    suggested_phase = SquatPhase.CONCENTRIC
+
+            # 5) True IDLE posture detection only from IDLE context.
+            elif self.current_state == SquatPhase.IDLE and at_top and extended:
+                suggested_phase = SquatPhase.IDLE
+
+            else:
+                # Default behavior per state, without creating new isometric entries.
+                if self.current_state == SquatPhase.ISOMETRIC:
+                    # Stay in isometric until an upward transition promotes to concentric.
+                    suggested_phase = SquatPhase.ISOMETRIC
+                elif bent and self.current_state == SquatPhase.ECCENTRIC:
+                    # Keep eccentric active unless explicit >1s hold promotes isometric.
+                    suggested_phase = SquatPhase.ECCENTRIC
+                elif bent and self.current_state == SquatPhase.IDLE:
+                    # From idle, bent posture alone is not enough for isometric.
+                    suggested_phase = SquatPhase.ECCENTRIC if downward_count > 0 else SquatPhase.IDLE
+                elif self.current_state == SquatPhase.ECCENTRIC:
+                    # Do not allow direct ECCENTRIC -> IDLE; wait for upward transition first.
+                    suggested_phase = SquatPhase.ECCENTRIC
                 else:
                     suggested_phase = SquatPhase.IDLE
 
@@ -666,15 +786,23 @@ class SquatStateMachine:
                     "frame": i,
                     "from": self.current_state.name.lower(),
                     "to": suggested_phase.name.lower(),
-                    "reason": f"Simple threshold logic: vel={vel:.4f}, pos={pos:.4f}"
+                    "reason": (
+                        f"Rule-based logic: eff_vel={eff_vel:.4f}, raw_vel={raw_vel:.4f}, "
+                        f"pos={pos:.4f}, bent={int(bent)}, extended={int(extended)}, "
+                        f"down_cnt={downward_count}, up_cnt={upward_count}, still_cnt={still_count}"
+                    )
                 })
                 self.current_state = suggested_phase
             
             # Assign current state to this frame
             self.phase_labels[i] = self.current_state
+
+        # Strict pass before and after cleanup to remove any illegal adjacency.
+        self._sanitize_phase_sequence()
         
         # Post-processing: ensure minimum phase durations to avoid 1-frame flickering
         self._enforce_minimum_durations()
+        self._sanitize_phase_sequence()
         
         # Convert enum to int for compatibility
         return np.array([p.value for p in self.phase_labels])
@@ -697,8 +825,9 @@ class SquatStateMachine:
             end = changes[i + 1]
             duration = end - start
             
-            if duration < MIN_PHASE_DURATION_FRAMES:
-                # Merge with previous segment (prefer continuity)
+            if duration < GLITCH_MERGE_FRAMES:
+                # Merge only ultra-short flickers.
+                # Using a small threshold preserves valid shallow-squat phases.
                 if i > 0:
                     prev_phase = self.phase_labels[changes[i-1]]
                     self.phase_labels[start:end] = prev_phase
@@ -812,7 +941,9 @@ class TemporalSegmenter:
                         "min_phase_duration": MIN_PHASE_DURATION_FRAMES,
                         "hysteresis_frames": HYSTERESIS_FRAMES,
                         "velocity_idle_threshold": VELOCITY_IDLE_THRESHOLD,
-                        "velocity_moving_threshold": VELOCITY_MOVING_THRESHOLD
+                        "velocity_moving_threshold": VELOCITY_MOVING_THRESHOLD,
+                        "strict_phase_sequence": "idle->eccentric->[isometric]->concentric->idle",
+                        "illegal_transition_repairs": int(self.state_machine.illegal_transition_repairs)
                     }
                 },
                 "frame_phases": phase_names_list,
@@ -1087,8 +1218,12 @@ class TemporalSegmenter:
                     continue
 
             elif state == IN_CONC:
-                if p == SquatPhase.CONCENTRIC.value or p == SquatPhase.ISOMETRIC.value:
-                    # allow some wobble at the top/bottom
+                if p == SquatPhase.CONCENTRIC.value:
+                    continue
+
+                if p == SquatPhase.ISOMETRIC.value:
+                    # Strict sequence does not allow concentric -> isometric.
+                    # Keep state as concentric; sanitizer should already prevent this upstream.
                     continue
 
                 if p == SquatPhase.IDLE.value:

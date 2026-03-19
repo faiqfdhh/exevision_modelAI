@@ -70,6 +70,25 @@ def analyze_annotations(annotations_path: Path) -> None:
         print(f"    {lo:3d}-{hi:3d}: {count:3d}  {bar}")
     print()
 
+    # Training Balance Metric (Additive)
+    training_bins = [(0, 20), (20, 40), (40, 60), (60, 80), (80, 100)]
+    target_per_bucket = 15
+    print(f"  Training Balance Metric (Target: {target_per_bucket}/bucket):")
+    total_deficit = 0
+    for lo, hi in training_bins:
+        count = np.sum((human >= lo) & (human < hi + (1 if hi == 100 else 0)))
+        deficit = max(0, target_per_bucket - count)
+        total_deficit += deficit
+        bar = "█" * int(count)
+        deficit_str = f" (Deficit: {deficit:2d})" if deficit > 0 else " (OK)"
+        print(f"    {lo:3d}-{hi:3d}: {count:3d}  {bar:<20} {deficit_str}")
+    
+    if total_deficit > 0:
+        print(f"\n  ⚠ Total deficit: {total_deficit} more annotations needed for balanced training.")
+    else:
+        print("\n  ✅ All buckets meet the minimum target of 15.")
+    print()
+
     # View distribution
     view_counts: dict[str, int] = defaultdict(int)
     for a in data:

@@ -177,6 +177,7 @@ class PipelineRunnerUI:
         self.preview_video_map: dict[str, tuple[Path, Path | None]] = {}
         self.preview_overlay_cap: cv2.VideoCapture | None = None
         self.preview_original_cap: cv2.VideoCapture | None = None
+        self._preview_cap_lock = threading.Lock()
         self.preview_thread: threading.Thread | None = None
         self.preview_stop_event = threading.Event()
         self.preview_is_playing = False
@@ -1346,26 +1347,27 @@ class PipelineRunnerUI:
 
     def _playback_loop(self) -> None:
         while self.preview_is_playing and not self.preview_stop_event.is_set():
-            if self.preview_overlay_cap is None:
-                return
-
-            ok_overlay, overlay_frame = self.preview_overlay_cap.read()
-            if not ok_overlay:
-                self.preview_overlay_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ok_overlay, overlay_frame = self.preview_overlay_cap.read()
-                if not ok_overlay:
+            with self._preview_cap_lock:
+                if self.preview_overlay_cap is None:
                     return
 
-            original_frame = None
-            if self.preview_original_cap is not None:
-                ok_original, original_frame = self.preview_original_cap.read()
-                if not ok_original:
-                    self.preview_original_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok_overlay, overlay_frame = self.preview_overlay_cap.read()
+                if not ok_overlay:
+                    self.preview_overlay_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ok_overlay, overlay_frame = self.preview_overlay_cap.read()
+                    if not ok_overlay:
+                        return
+
+                original_frame = None
+                if self.preview_original_cap is not None:
                     ok_original, original_frame = self.preview_original_cap.read()
                     if not ok_original:
-                        original_frame = None
+                        self.preview_original_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ok_original, original_frame = self.preview_original_cap.read()
+                        if not ok_original:
+                            original_frame = None
 
-            frame_idx = int(self.preview_overlay_cap.get(cv2.CAP_PROP_POS_FRAMES))
+                frame_idx = int(self.preview_overlay_cap.get(cv2.CAP_PROP_POS_FRAMES))
             self.root.after(0, self._render_frame, overlay_frame, original_frame, frame_idx)
             time.sleep(max(1.0 / self.preview_fps, 0.01))
 
@@ -1428,35 +1430,36 @@ class PipelineRunnerUI:
         self.preview_is_playing = False
         self.preview_stop_event.set()
 
-        if self.preview_overlay_cap is not None:
-            if release_only:
-                self.preview_overlay_cap.release()
-                self.preview_overlay_cap = None
-                if self.preview_original_cap is not None:
-                    self.preview_original_cap.release()
-                    self.preview_original_cap = None
-            else:
-                self.preview_overlay_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ok_overlay, overlay_frame = self.preview_overlay_cap.read()
-                original_frame = None
-                if self.preview_original_cap is not None:
-                    self.preview_original_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    ok_original, original_frame = self.preview_original_cap.read()
-                    if not ok_original:
-                        original_frame = None
-                if ok_overlay:
-                    self._render_frame(overlay_frame, original_frame)
-                    self.preview_overlay_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    if self.preview_original_cap is not None:
-                        self.preview_original_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
-        # Wait for playback thread to actually stop to avoid race conditions
+        # Wait for playback thread to stop before touching capture handles.
         if self.preview_thread is not None and self.preview_thread.is_alive():
             try:
-                self.preview_thread.join(timeout=0.2)
+                self.preview_thread.join(timeout=1.0)
             except Exception:
                 pass
-            self.preview_thread = None
+        self.preview_thread = None
+
+        with self._preview_cap_lock:
+            if self.preview_overlay_cap is not None:
+                if release_only:
+                    self.preview_overlay_cap.release()
+                    self.preview_overlay_cap = None
+                    if self.preview_original_cap is not None:
+                        self.preview_original_cap.release()
+                        self.preview_original_cap = None
+                else:
+                    self.preview_overlay_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ok_overlay, overlay_frame = self.preview_overlay_cap.read()
+                    original_frame = None
+                    if self.preview_original_cap is not None:
+                        self.preview_original_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ok_original, original_frame = self.preview_original_cap.read()
+                        if not ok_original:
+                            original_frame = None
+                    if ok_overlay:
+                        self._render_frame(overlay_frame, original_frame)
+                        self.preview_overlay_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        if self.preview_original_cap is not None:
+                            self.preview_original_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
         if not release_only:
             self.preview_status_var.set("Playback stopped.")
@@ -1607,6 +1610,7 @@ class AnnotationToolUI:
         self.loaded_video_count: int = 0
         self._scan_in_progress: bool = False
         self._processed_vids_cache: set[str] = set()
+        self.video_scores: dict[str, float] = {}
         self._initial_load_target: int = VIDEO_SCAN_BATCH_SIZE
         self.current_video_path: Path | None = None
         self.current_video_id: str = ""
@@ -1623,6 +1627,7 @@ class AnnotationToolUI:
         # Video playback
         self.cap_raw: cv2.VideoCapture | None = None
         self.cap_vis: cv2.VideoCapture | None = None
+        self._annotation_cap_lock = threading.Lock()
         self.playing: bool = False
         self.play_stop_event = threading.Event()
         self.play_thread: threading.Thread | None = None
@@ -1765,6 +1770,9 @@ class AnnotationToolUI:
             values=("Filtered", "Unfiltered (raw)"),
         )
         self.annotation_mode_combo.pack(side=tk.LEFT, padx=(6, 0))
+        
+        ttk.Button(mode_row, text="Sort by Heuristic", 
+                   command=self._sort_list_by_score).pack(side=tk.RIGHT)
 
         # -- Loading Bar
         self.loading_bar = ttk.Progressbar(left, orient=tk.HORIZONTAL, mode='indeterminate')
@@ -1997,7 +2005,7 @@ class AnnotationToolUI:
         self.folder_var.set(str(self.videos_folder))
         self._scan_folder()
 
-    def _scan_folder(self) -> None:
+    def _scan_folder(self, preserve_order: bool = False) -> None:
         if self.videos_folder is None or not self.videos_folder.exists():
             return
         exts = {".mp4", ".mov", ".avi", ".mkv", ".flv"}
@@ -2006,10 +2014,12 @@ class AnnotationToolUI:
         else:
             previous_loaded = self.loaded_video_count
         self._last_scanned_folder = self.videos_folder
-        self.video_files = sorted(
-            [p for p in self.videos_folder.iterdir()
-             if p.is_file() and p.suffix.lower() in exts]
-        )
+        
+        if not preserve_order:
+            self.video_files = sorted(
+                [p for p in self.videos_folder.iterdir()
+                if p.is_file() and p.suffix.lower() in exts]
+            )
         total_videos = len(self.video_files)
         self._initial_load_target = min(max(previous_loaded, VIDEO_SCAN_BATCH_SIZE), total_videos)
         self.loaded_video_count = 0
@@ -2028,13 +2038,28 @@ class AnnotationToolUI:
     def _scan_folder_thread(self) -> None:
         # 1. Quickly find all processed videos by scanning RUNS_ROOT once
         processed_vids = set()
+        self.video_scores = {}
         if RUNS_ROOT.exists():
             for run_dir in list(RUNS_ROOT.iterdir()):
                 if not run_dir.is_dir(): continue
+                # Fix: Check for both segmentation and scores
                 seg_root = run_dir / "workspace" / "squat" / "segmented_reps"
                 if seg_root.exists():
                     for f in seg_root.rglob("*_segmented.json"):
-                        processed_vids.add(f.stem.replace("_segmented", ""))
+                        vid_id = f.stem.replace("_segmented", "")
+                        processed_vids.add(vid_id)
+                
+                score_root = run_dir / "workspace" / "squat" / "aqa_analysis_simple"
+                if score_root.exists():
+                    for f in score_root.rglob("*_aqa_simple.json"):
+                        vid_id = f.stem.replace("_aqa_simple", "")
+                        try:
+                            with open(f, "r") as json_f:
+                                score_data = json.load(json_f)
+                                if "overall_score" in score_data:
+                                    self.video_scores[vid_id] = float(score_data["overall_score"])
+                        except Exception:
+                            pass
 
         self._processed_vids_cache = processed_vids
 
@@ -2118,12 +2143,43 @@ class AnnotationToolUI:
         self.load_more_btn.configure(state="normal", text=f"Load More ({next_count})")
 
     def _add_video_to_listbox(self, text: str, is_processed: bool) -> None:
+        # Determine marker and score suffix more reliably
+        # The text coming in from _scan_video_chunk already has markers if they were found in index
+        # But for new scans, we want to show heuristic score if available
+        vid_id = ""
+        for ext in [".mp4", ".mov", ".avi", ".mkv", ".flv"]:
+             if ext in text:
+                 vid_id = text.split(ext)[0]
+                 break
+        if not vid_id: vid_id = text.split("  ")[0] # fallback
+
+        if vid_id in self.video_scores:
+            score = self.video_scores[vid_id]
+            if "  " in text: # has existing marker
+                 parts = text.split("  ")
+                 text = f"{parts[0]} | Heur: {score:.1f}  {parts[1]}"
+            else:
+                 text = f"{text} | Heur: {score:.1f}"
+
         idx = self.video_listbox.size()
         self.video_listbox.insert(tk.END, text)
         if is_processed:
             self.video_listbox.itemconfig(idx, bg="#e6ffe6", fg="#006600") # Green highlight
         else:
             self.video_listbox.itemconfig(idx, bg="#ffe6e6", fg="#990000") # Red highlight
+
+    def _sort_list_by_score(self) -> None:
+        """Sorts the current video_files list by heuristic score (descending)."""
+        if not self.video_files:
+            return
+        
+        # Sort video_files based on score in video_scores
+        # Videos without scores go to the bottom
+        self.video_files.sort(key=lambda f: self.video_scores.get(f.stem, -1.0), reverse=True)
+        
+        # Refresh the listbox while preserving the sort order
+        self._scan_folder(preserve_order=True)
+        self.status_var.set(f"Sorted {len(self.video_files)} videos by heuristic score.")
 
     # ============================================================ Video selection
     def _on_video_double_click(self, event=None) -> None:
@@ -2298,11 +2354,16 @@ class AnnotationToolUI:
         if ann_path.exists():
             try:
                 with open(ann_path, "r", encoding="utf-8") as f:
-                    self.current_annotation = json.load(f)
-                self.pipeline_run_used = self.current_annotation.get("pipeline_run", "")
-                self._advance_to_next_unannotated()
-                self._show_current_rep()
-                return
+                    loaded_annotation = json.load(f)
+
+                if isinstance(loaded_annotation, dict) and not self._annotation_pipeline_refs_stale(loaded_annotation):
+                    self.current_annotation = loaded_annotation
+                    self.pipeline_run_used = self.current_annotation.get("pipeline_run", "")
+                    self._advance_to_next_unannotated()
+                    self._show_current_rep()
+                    return
+
+                self.current_annotation = loaded_annotation if isinstance(loaded_annotation, dict) else None
             except Exception:
                 pass
 
@@ -2313,8 +2374,10 @@ class AnnotationToolUI:
         if run_path is not None:
             self.status_var.set(f"Found pipeline output in: {run_name}")
             self.pipeline_run_used = run_name
-            self._build_annotation_from_run(run_path, run_name)
-            self._show_current_rep()
+            if self._build_annotation_from_run(run_path, run_name):
+                self._show_current_rep()
+            else:
+                self.status_var.set(f"No segmentation found for {self.current_video_id}.")
         else:
             # Need to run the pipeline
             self.status_var.set(
@@ -2367,18 +2430,41 @@ class AnnotationToolUI:
 
         return None, ""
 
-    def _build_annotation_from_run(self, workspace: Path, run_name: str) -> None:
-        """
-        Build a per-video annotation dict from existing pipeline output.
-        """
-        video_id = self.current_video_id
+    def _annotation_pipeline_refs_stale(self, annotation: dict) -> bool:
+        pipeline_run = annotation.get("pipeline_run")
+        pipeline_outputs = annotation.get("pipeline_outputs")
+        if not isinstance(pipeline_outputs, dict):
+            return True
+        segmented_json = pipeline_outputs.get("segmented_json")
+        return not pipeline_run or not segmented_json
+
+    def _load_existing_annotation(self, video_id: str) -> dict | None:
+        ann_path = ANNOTATIONS_VIDEOS_DIR / f"{video_id}.json"
+        if not ann_path.exists():
+            return None
+
+        try:
+            with open(ann_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _build_annotation_payload_from_run(
+        self,
+        workspace: Path,
+        run_name: str,
+        video_id: str,
+        source_video_path: Path | None,
+    ) -> dict | None:
+        """Build annotation payload from a pipeline run for any target video."""
+        existing_annotation = self._load_existing_annotation(video_id) or {}
 
         # Find segmented JSON
         seg_root = workspace / "squat" / "segmented_reps"
         seg_matches = list(seg_root.rglob(f"{video_id}_segmented.json"))
         if not seg_matches:
-            self.status_var.set(f"No segmentation found for {video_id}.")
-            return
+            return None
         seg_path = seg_matches[0]
         quality = seg_path.parent.name
 
@@ -2388,6 +2474,7 @@ class AnnotationToolUI:
         # Find scoring JSON (recursive into nested dirs)
         score_root = workspace / "squat" / "aqa_analysis_simple"
         score_data = None
+        score_matches = []
         if score_root.exists():
             score_matches = list(score_root.rglob(f"{video_id}_aqa_simple.json"))
             if score_matches:
@@ -2436,6 +2523,25 @@ class AnnotationToolUI:
                 return str(p_obj.relative_to(PROJECT_ROOT)).replace("\\", "/")
             return str(p_obj).replace("\\", "/")
 
+        # Keep human annotation fields across reprocess by rep_id.
+        preserved_reps: dict[int, dict] = {}
+        for old_rep in existing_annotation.get("reps", []):
+            if not isinstance(old_rep, dict):
+                continue
+            old_rep_id = old_rep.get("rep_id")
+            if old_rep_id is None:
+                continue
+            preserved_reps[old_rep_id] = {
+                "human_score": old_rep.get("human_score"),
+                "human_flags": old_rep.get("human_flags", old_rep.get("flags")),
+                "human_flag_severities": old_rep.get("human_flag_severities", old_rep.get("flag_severities")),
+                "annotator_confidence": old_rep.get("annotator_confidence"),
+                "annotation_notes": old_rep.get("annotation_notes"),
+                "human_metric_scores": old_rep.get("human_metric_scores"),
+                "flags": old_rep.get("flags", old_rep.get("human_flags")),
+                "flag_severities": old_rep.get("flag_severities", old_rep.get("human_flag_severities")),
+            }
+
         # Build reps list
         reps = []
         frame_phases = seg_data.get("frame_phases", [])
@@ -2461,7 +2567,7 @@ class AnnotationToolUI:
                     if isinstance(sig_arr, list):
                         rep_signals[sig_key] = sig_arr[start_f : end_f + 1]
 
-            reps.append({
+            rep_payload = {
                 "rep_id": rep_id,
                 "start_frame": start_f,
                 "end_frame": end_f,
@@ -2479,11 +2585,25 @@ class AnnotationToolUI:
                 "heuristic_metric_scores": score_obj.get("metric_scores", {}),
                 "human_score": None,
                 "flags": None,
-            })
+            }
 
-        self.current_annotation = {
+            preserved = preserved_reps.get(rep_id)
+            if preserved:
+                for key, value in preserved.items():
+                    if value is not None:
+                        rep_payload[key] = value
+
+            reps.append(rep_payload)
+
+        source_path_str = ""
+        if source_video_path is not None:
+            source_path_str = to_rel(str(source_video_path))
+        elif isinstance(existing_annotation, dict):
+            source_path_str = existing_annotation.get("source_video_path", "")
+
+        return {
             "video_id": video_id,
-            "source_video_path": to_rel(str(self.current_video_path)) if self.current_video_path else "",
+            "source_video_path": source_path_str,
             "pipeline_run": run_name,
             "pipeline_outputs": {
                 "features_json": to_rel(features_path),
@@ -2501,11 +2621,41 @@ class AnnotationToolUI:
                 "foot_consolidated": True
             },
             "total_reps": len(reps),
-            "annotated_at": None,
+            "annotated_at": existing_annotation.get("annotated_at"),
             "reps": reps,
         }
 
+    def _build_annotation_from_run(self, workspace: Path, run_name: str) -> bool:
+        """Build and save annotation for the currently loaded video from pipeline output."""
+        if not self.current_video_id:
+            return False
+
+        payload = self._build_annotation_payload_from_run(
+            workspace=workspace,
+            run_name=run_name,
+            video_id=self.current_video_id,
+            source_video_path=self.current_video_path,
+        )
+        if payload is None:
+            return False
+
+        self.current_annotation = payload
         self._save_current_annotation()
+        return True
+
+    def _refresh_annotation_for_video_from_run(self, workspace: Path, run_name: str, video_path: Path) -> bool:
+        """Build and save annotation metadata for any processed video during batch runs."""
+        payload = self._build_annotation_payload_from_run(
+            workspace=workspace,
+            run_name=run_name,
+            video_id=video_path.stem,
+            source_video_path=video_path,
+        )
+        if payload is None:
+            return False
+
+        self._save_annotation(video_path.stem, payload)
+        return True
 
     # ============================================================ Auto-pipeline
     def _run_pipeline_for_video(self, video_path: Path) -> None:
@@ -2752,8 +2902,14 @@ class AnnotationToolUI:
                     continue
 
                 self._pipeline_log(f"\n✅ Pipeline complete for {video_path.name}.")
-                
-                # Check if this was the currently viewed (but unprocessed) video
+
+                refreshed = self._refresh_annotation_for_video_from_run(workspace, run_name, video_path)
+                if refreshed:
+                    self._pipeline_log(f"  ✅ Annotation refreshed for {video_path.name}.")
+                else:
+                    self._pipeline_log(f"  ⚠ Pipeline completed, but annotation refresh failed for {video_path.name}.")
+
+                # Keep live UI behavior only for the currently viewed video.
                 if self.current_video_path == video_path:
                      self.pipeline_run_used = run_name
                      self.root.after(0, self._on_pipeline_complete, workspace, run_name)
@@ -2782,7 +2938,9 @@ class AnnotationToolUI:
             self.root.after(0, _append)
 
     def _on_pipeline_complete(self, workspace: Path, run_name: str) -> None:
-        self._build_annotation_from_run(workspace, run_name)
+        if not self._build_annotation_from_run(workspace, run_name):
+            self.status_var.set(f"No segmentation found for {self.current_video_id}.")
+            return
         self.log_frame.grid_remove()  # hide log
         self.status_var.set(f"Pipeline complete. Annotating {self.current_video_id}.")
         self._advance_to_next_unannotated()
@@ -2943,6 +3101,9 @@ class AnnotationToolUI:
         if not self.current_annotation:
             return
 
+        # Ensure playback loop is fully stopped before mutating capture objects.
+        self._stop_playback()
+
         def _resolve_existing_path(path_text: str) -> str:
             if not path_text:
                 return ""
@@ -2975,9 +3136,10 @@ class AnnotationToolUI:
 
         # 1. Load Raw
         raw_path = str(self.current_video_path) if self.current_video_path and self.current_video_path.exists() else None
-        if self.cap_raw:
-            self.cap_raw.release()
-        self.cap_raw = cv2.VideoCapture(raw_path) if raw_path else None
+        with self._annotation_cap_lock:
+            if self.cap_raw:
+                self.cap_raw.release()
+            self.cap_raw = cv2.VideoCapture(raw_path) if raw_path else None
 
         # 2. Load Vis
         vis_path = self.current_annotation.get("pipeline_outputs", {}).get("visualization_video", "")
@@ -2990,9 +3152,10 @@ class AnnotationToolUI:
                 self.current_annotation.get("quality_rating", "").lower(),
             )
 
-        if self.cap_vis:
-            self.cap_vis.release()
-        self.cap_vis = cv2.VideoCapture(resolved_vis_path) if resolved_vis_path else None
+        with self._annotation_cap_lock:
+            if self.cap_vis:
+                self.cap_vis.release()
+            self.cap_vis = cv2.VideoCapture(resolved_vis_path) if resolved_vis_path else None
 
         # Reset labels if not opened
         if not self.cap_raw or not self.cap_raw.isOpened():
@@ -3021,14 +3184,15 @@ class AnnotationToolUI:
 
     def _display_current_frames(self) -> None:
         """Display one frame from whichever captures are open."""
-        if self.cap_raw:
-            ok, frame = self.cap_raw.read()
-            if ok:
-                self._display_single_frame(frame, self.raw_label, "raw")
-        if self.cap_vis:
-            ok, frame = self.cap_vis.read()
-            if ok:
-                self._display_single_frame(frame, self.vis_label, "vis")
+        with self._annotation_cap_lock:
+            if self.cap_raw:
+                ok, frame = self.cap_raw.read()
+                if ok:
+                    self._display_single_frame(frame, self.raw_label, "raw")
+            if self.cap_vis:
+                ok, frame = self.cap_vis.read()
+                if ok:
+                    self._display_single_frame(frame, self.vis_label, "vis")
 
     def _display_single_frame(self, frame, label_widget, kind: str) -> None:
         if Image is None or ImageTk is None:
@@ -3057,18 +3221,20 @@ class AnnotationToolUI:
         else:
             if self.cap_raw or self.cap_vis:
                 # Check if we need to loop
-                cap = self.cap_raw or self.cap_vis
-                cur = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                if cur >= self.rep_end:
-                    if self.cap_raw: self.cap_raw.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
-                    if self.cap_vis: self.cap_vis.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
+                with self._annotation_cap_lock:
+                    cap = self.cap_raw or self.cap_vis
+                    cur = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                    if cur >= self.rep_end:
+                        if self.cap_raw: self.cap_raw.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
+                        if self.cap_vis: self.cap_vis.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
                 self._start_playback()
 
     def _replay(self) -> None:
         self._stop_playback()
         time.sleep(0.05)
-        if self.cap_raw: self.cap_raw.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
-        if self.cap_vis: self.cap_vis.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
+        with self._annotation_cap_lock:
+            if self.cap_raw: self.cap_raw.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
+            if self.cap_vis: self.cap_vis.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
         self._start_playback()
 
     def _start_playback(self) -> None:
@@ -3090,15 +3256,16 @@ class AnnotationToolUI:
 
     def _playback_loop(self) -> None:
         while self.playing and not self.play_stop_event.is_set():
-            if not self.cap_raw and not self.cap_vis:
-                return
-            
-            # Check for loop in master capture (Raw if available, else Vis)
-            master = self.cap_raw if self.cap_raw else self.cap_vis
-            cur = int(master.get(cv2.CAP_PROP_POS_FRAMES))
-            if cur >= self.rep_end:
-                if self.cap_raw: self.cap_raw.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
-                if self.cap_vis: self.cap_vis.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
+            with self._annotation_cap_lock:
+                if not self.cap_raw and not self.cap_vis:
+                    return
+
+                # Check for loop in master capture (Raw if available, else Vis)
+                master = self.cap_raw if self.cap_raw else self.cap_vis
+                cur = int(master.get(cv2.CAP_PROP_POS_FRAMES))
+                if cur >= self.rep_end:
+                    if self.cap_raw: self.cap_raw.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
+                    if self.cap_vis: self.cap_vis.set(cv2.CAP_PROP_POS_FRAMES, self.rep_start)
             
             # Read and display (Tkinter calls must be on main thread)
             self.root.after(0, self._display_current_frames)
@@ -3240,10 +3407,13 @@ class AnnotationToolUI:
     def _save_current_annotation(self) -> None:
         if not self.current_annotation:
             return
+        self._save_annotation(self.current_video_id, self.current_annotation)
+
+    def _save_annotation(self, video_id: str, annotation: dict) -> None:
         ANNOTATIONS_VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
-        path = ANNOTATIONS_VIDEOS_DIR / f"{self.current_video_id}.json"
+        path = ANNOTATIONS_VIDEOS_DIR / f"{video_id}.json"
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.current_annotation, f, indent=2)
+            json.dump(annotation, f, indent=2)
 
     def _update_index(self) -> None:
         """Update the master index.json with summary stats."""
@@ -3332,7 +3502,26 @@ class AnnotationToolUI:
             f"  Disagreement std:  {disagreement.std():.1f} pts",
             f"  Correlation (r):   {corr:.3f}",
             "",
+            "  Training Balance Metric (Target: 15/bucket):",
         ]
+
+        training_bins = [(0, 20), (20, 40), (40, 60), (60, 80), (80, 100)]
+        target_per_bucket = 15
+        total_deficit = 0
+        for lo, hi in training_bins:
+            count = np.sum((human >= lo) & (human < hi + (1 if hi == 100 else 0)))
+            deficit = max(0, target_per_bucket - count)
+            total_deficit += deficit
+            bar_len = int(min(20, count))
+            bar = "█" * bar_len + "░" * (20 - bar_len)
+            deficit_str = f" (Deficit: {deficit:2d})" if deficit > 0 else " (OK)"
+            lines.append(f"    {lo:3d}-{hi:3d}: {count:3d}  {bar} {deficit_str}")
+        
+        if total_deficit > 0:
+            lines.append(f"\n  ⚠ Total deficit: {total_deficit} more needed.")
+        else:
+            lines.append("\n  ✅ All buckets meet target of 15.")
+        lines.append("")
 
         if disagreement.std() < 3.0:
             lines.append("  ⚠ Low disagreement — scores match heuristic closely.")
