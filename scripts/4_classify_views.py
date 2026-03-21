@@ -12,7 +12,7 @@ from tqdm import tqdm
 FEATURES_EXCELLENT = "./squat/extracted_features_clean/excellent"
 FEATURES_GOOD = "./squat/extracted_features_clean/good"
 FEATURES_FAIR = "./squat/extracted_features_clean/fair"
-FEATURES_RAW_UNFILTERED = "./squat/extracted_features_clean/raw_unfiltered"
+FEATURES_RAW_UNFILTERED = r"D:\squat\unlabeled_features\raw_unfiltered"
 
 FEATURES_DIRS = [FEATURES_EXCELLENT, FEATURES_GOOD, FEATURES_FAIR, FEATURES_RAW_UNFILTERED]
 

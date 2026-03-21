@@ -151,6 +151,7 @@ class PipelineRunnerUI:
         self.input_mode_var = tk.StringVar(value="video")
         self.mode_var = tk.StringVar(value="full")
         self.processing_mode_var = tk.StringVar(value="filtered")
+        self.use_gpu_var = tk.BooleanVar(value=True)
         self.dataset_var = tk.StringVar(value=str(PROJECT_ROOT / "squat" / "dataset_videos_all"))
         self.video_var = tk.StringVar(value="")
         self.run_name_var = tk.StringVar(value=datetime.now().strftime("run_%Y%m%d_%H%M%S"))
@@ -291,6 +292,11 @@ class PipelineRunnerUI:
         processing_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Radiobutton(processing_frame, text="Filtered (default)", variable=self.processing_mode_var, value="filtered").grid(row=0, column=0, sticky="w")
         ttk.Radiobutton(processing_frame, text="Unfiltered (raw)", variable=self.processing_mode_var, value="unfiltered").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(
+            processing_frame,
+            text="Use GPU when available",
+            variable=self.use_gpu_var,
+        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
 
         # Start/Stop Buttons
         button_frame = ttk.Frame(left_panel)
@@ -665,6 +671,8 @@ class PipelineRunnerUI:
         if stage.key == "extract_selected_features":
             processing_mode = self.processing_mode_var.get()
             stage_args = [processing_mode] + stage_args
+            if self.use_gpu_var.get():
+                stage_args.append("--gpu")
         elif stage.key == "scoring" and video_path is not None:
             stage_args = [video_path.stem]
 

@@ -1,4 +1,11 @@
 import os
+
+# --- Suppress ALL MediaPipe/TensorFlow verbose output (must be before imports) ---
+os.environ['GLOG_minloglevel'] = '4'  # FATAL only
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Hide TF INFO/WARNING/ERROR
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+os.environ['OPENCV_FFMPEG_LOGLEVEL'] = 'quiet'
+
 import json
 import cv2
 import mediapipe as mp
@@ -10,21 +17,41 @@ from multiprocessing import Pool, cpu_count
 from datetime import datetime
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
+import warnings
+warnings.filterwarnings('ignore')
 import signal
 import sys
+import logging
+from contextlib import contextmanager
 
-# --- Suppress MediaPipe CPU Warnings ---
-os.environ['GLOG_minloglevel'] = '2'
+# Suppress MediaPipe logger
+logging.getLogger('mediapipe').setLevel(logging.ERROR)
+logging.getLogger('tensorflow').setLevel(logging.ERROR)
+
+
+@contextmanager
+def suppress_native_stderr():
+    """Suppress noisy C/C++ stderr logs (e.g., MediaPipe/TFLite warnings)."""
+    stderr_fd = sys.stderr.fileno()
+    saved_stderr_fd = os.dup(stderr_fd)
+    try:
+        with open(os.devnull, 'w') as devnull:
+            os.dup2(devnull.fileno(), stderr_fd)
+            yield
+    finally:
+        os.dup2(saved_stderr_fd, stderr_fd)
+        os.close(saved_stderr_fd)
 
 # --- Configuration ---
 DATASET_ROOT = "./squat/dataset_videos_all"
-OUTPUT_ROOT = "./squat/extracted_features_clean"
+OUTPUT_ROOT = r"D:\squat\unlabeled_features"
 VISUALIZATION_OUTPUT_ROOT = "./squat/visualized_poses_clean"
 ANALYSIS_OUTPUT_ROOT = "./squat/analysis_reports"
 MODEL_PATH = os.environ.get("EXEVISION_MODEL_PATH", os.path.join('models', 'pose_landmarker_heavy.task'))
 FACE_MODEL_PATH = os.environ.get("EXEVISION_FACE_MODEL_PATH", os.path.join('models', 'blaze_face_short_range.tflite'))
 CREATE_VISUALIZATION = True
 CREATE_ANALYSIS_REPORT = True  # Generate detailed analysis report
+USE_GPU = False
 
 # Quality-based output organization
 QUALITY_FOLDERS = {
@@ -77,6 +104,9 @@ SQUAT_KEY_JOINTS = {
     'left_toe': 31,
     'right_toe': 32
 }
+KEY_JOINT_INDICES = tuple(SQUAT_KEY_JOINTS.values())
+KEY_JOINT_NAMES = tuple(SQUAT_KEY_JOINTS.keys())
+EMPTY_LANDMARK_FRAME = [[0.0, 0.0, 0.0, 0.0] for _ in range(33)]
 
 ANKLE_INDICES = (27, 28)
 ANKLE_INFERENCE_VISIBILITY_THRESHOLD = 0.20
@@ -402,20 +432,31 @@ def apply_one_euro_filter(pose_data, fps, min_cutoff=1.0, beta=0.007, d_cutoff=1
     if data_np.ndim != 3 or data_np.shape[2] < 4:
         return pose_data
 
-    frame_count, joint_count, _ = data_np.shape
+    frame_count, _, _ = data_np.shape
     dt = 1.0 / fps if fps and fps > 0 else 1.0 / 30.0
 
-    for joint_idx in range(joint_count):
-        for coord_idx in range(3):
-            filt = OneEuroFilter(
-                min_cutoff=min_cutoff,
-                beta=beta,
-                d_cutoff=d_cutoff,
-            )
-            for frame_idx in range(frame_count):
-                timestamp = frame_idx * dt
-                value = data_np[frame_idx, joint_idx, coord_idx]
-                data_np[frame_idx, joint_idx, coord_idx] = filt(timestamp, value)
+    xyz = data_np[:, :, :3]
+    smoothed_xyz = np.empty_like(xyz)
+    smoothed_xyz[0] = xyz[0]
+
+    x_prev = xyz[0].copy()
+    dx_prev = np.zeros_like(x_prev)
+    derivative_alpha = (2 * np.pi * d_cutoff * dt) / (2 * np.pi * d_cutoff * dt + 1)
+
+    for frame_idx in range(1, frame_count):
+        x = xyz[frame_idx]
+        dx = (x - x_prev) / dt
+        dx_hat = derivative_alpha * dx + (1 - derivative_alpha) * dx_prev
+
+        cutoff = min_cutoff + beta * np.abs(dx_hat)
+        smoothing_alpha = (2 * np.pi * cutoff * dt) / (2 * np.pi * cutoff * dt + 1)
+        x_hat = smoothing_alpha * x + (1 - smoothing_alpha) * x_prev
+
+        smoothed_xyz[frame_idx] = x_hat
+        x_prev = x_hat
+        dx_prev = dx_hat
+
+    data_np[:, :, :3] = smoothed_xyz
 
     return data_np.tolist()
 
@@ -870,8 +911,14 @@ def evaluate_mandatory_chain_gate(
         'passes_gate': bool(passes),
     }
 
-def get_mediapipe_options():
-    base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+def get_mediapipe_options(use_gpu=True):
+    if use_gpu:
+        base_options = python.BaseOptions(
+            model_asset_path=MODEL_PATH,
+            delegate=python.BaseOptions.Delegate.GPU
+        )
+    else:
+        base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
     return vision.PoseLandmarkerOptions(
         base_options=base_options,
         running_mode=vision.RunningMode.VIDEO,
@@ -882,8 +929,14 @@ def get_mediapipe_options():
         output_segmentation_masks=False
     )
 
-def get_face_detector_options():
-    base_options = python.BaseOptions(model_asset_path=FACE_MODEL_PATH)
+def get_face_detector_options(use_gpu=True):
+    if use_gpu:
+        base_options = python.BaseOptions(
+            model_asset_path=FACE_MODEL_PATH,
+            delegate=python.BaseOptions.Delegate.GPU,
+        )
+    else:
+        base_options = python.BaseOptions(model_asset_path=FACE_MODEL_PATH)
     return vision.FaceDetectorOptions(
         base_options=base_options,
         min_detection_confidence=0.5
@@ -896,6 +949,22 @@ def find_video_path(video_id):
             if filename in files:
                 return os.path.join(root, filename)
     return None
+
+
+def _already_processed_json_exists(vid_path, mode="filtered"):
+    """Return True when output JSON for this video already exists."""
+    vid_id = os.path.splitext(os.path.basename(vid_path))[0]
+
+    if mode == "unfiltered":
+        out_path = os.path.join(OUTPUT_ROOT, "raw_unfiltered", f"{vid_id}.json")
+        return os.path.exists(out_path)
+
+    candidate_paths = [
+        os.path.join(QUALITY_FOLDERS['Excellent'], f"{vid_id}.json"),
+        os.path.join(QUALITY_FOLDERS['Good'], f"{vid_id}.json"),
+        os.path.join(QUALITY_FOLDERS['Fair'], f"{vid_id}.json"),
+    ]
+    return any(os.path.exists(p) for p in candidate_paths)
 
 def create_visualization_report(video_id, analysis, visibility_scores, key_joint_scores):
     """Create a comprehensive visualization report"""
@@ -1003,6 +1072,9 @@ def create_visualization_report(video_id, analysis, visibility_scores, key_joint
 def process_single_video(vid_path, mode="filtered"):
     try:
         vid_id = os.path.splitext(os.path.basename(vid_path))[0]
+        delegate_used = "CPU"
+        key_joint_indices = KEY_JOINT_INDICES
+        key_joint_names = KEY_JOINT_NAMES
 
         cap = cv2.VideoCapture(vid_path)
         if not cap.isOpened():
@@ -1024,82 +1096,124 @@ def process_single_video(vid_path, mode="filtered"):
         mandatory_chain_flags = []
         face_detected_per_frame = []
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        with vision.PoseLandmarker.create_from_options(get_mediapipe_options()) as landmarker, \
-             vision.FaceDetector.create_from_options(get_face_detector_options()) as face_detector:
-            for frame_idx in range(frame_count):
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                
-                if CREATE_VISUALIZATION:
-                    frames_for_viz.append(frame.copy())
-                
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-                frame_timestamp_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
-                
-                # Face Detection
-                face_detection_result = face_detector.detect(mp_image)
-                face_detected_per_frame.append(len(face_detection_result.detections) > 0)
-                
-                # Pose Landmarking
-                detection_result = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
-                
-                if detection_result.pose_landmarks:
-                    frame_img = [[lm.x, lm.y, lm.z, lm.visibility] 
-                                for lm in detection_result.pose_landmarks[0]]
-                    frame_world = [[lm.x, lm.y, lm.z, lm.visibility] 
-                                  for lm in detection_result.pose_world_landmarks[0]]
-                    
-                    # Calculate detailed visibility metrics
-                    visibilities = [lm.visibility for lm in detection_result.pose_landmarks[0]]
-                    overall_visibility = np.mean(visibilities)
-                    
-                    # Key joints visibility (squat-specific)
-                    key_indices = list(SQUAT_KEY_JOINTS.values())
-                    key_visibilities = [visibilities[i] for i in key_indices]
-                    key_visibility = np.mean(key_visibilities)
-                    
-                    # Find worst joint in this frame
-                    worst_joint_idx = np.argmin(key_visibilities)
-                    worst_joint_name = list(SQUAT_KEY_JOINTS.keys())[worst_joint_idx]
-                    worst_visibility = key_visibilities[worst_joint_idx]
-                    
-                    visibility_scores.append(overall_visibility)
-                    key_joint_scores.append(key_visibility)
-                    
-                    frame_metrics.append({
-                        'overall': overall_visibility,
-                        'key_joints': key_visibility,
-                        'worst_joint': worst_joint_name,
-                        'worst_visibility': worst_visibility
-                    })
+        frame_timestamp_step_ms = 1000.0 / fps if fps > 0 else 1000.0 / 30.0
 
-                    right_core_ok = all(
-                        visibilities[idx] >= MANDATORY_VISIBILITY_THRESHOLD
-                        for idx in MANDATORY_CORE_CHAINS['right_core']
-                    )
-                    left_core_ok = all(
-                        visibilities[idx] >= MANDATORY_VISIBILITY_THRESHOLD
-                        for idx in MANDATORY_CORE_CHAINS['left_core']
-                    )
-                    mandatory_chain_flags.append((right_core_ok, left_core_ok))
+        with suppress_native_stderr():
+            landmarker = None
+            face_detector = None
+            try:
+                if USE_GPU:
+                    try:
+                        landmarker = vision.PoseLandmarker.create_from_options(
+                            get_mediapipe_options(use_gpu=True)
+                        )
+                        face_detector = vision.FaceDetector.create_from_options(
+                            get_face_detector_options(use_gpu=True)
+                        )
+                        delegate_used = "GPU"
+                    except Exception as gpu_error:
+                        gpu_error_line = str(gpu_error).splitlines()[0] if str(gpu_error) else "unknown error"
+                        print(f"[{vid_id}] GPU init failed, falling back to CPU: {gpu_error_line}")
+                        if landmarker is not None:
+                            landmarker.close()
+                            landmarker = None
+                        if face_detector is not None:
+                            face_detector.close()
+                            face_detector = None
+
+                        landmarker = vision.PoseLandmarker.create_from_options(
+                            get_mediapipe_options(use_gpu=False)
+                        )
+                        face_detector = vision.FaceDetector.create_from_options(
+                            get_face_detector_options(use_gpu=False)
+                        )
+                        delegate_used = "CPU"
                 else:
-                    frame_img = [[0.0, 0.0, 0.0, 0.0] for _ in range(33)]
-                    frame_world = [[0.0, 0.0, 0.0, 0.0] for _ in range(33)]
-                    visibility_scores.append(0.0)
-                    key_joint_scores.append(0.0)
-                    frame_metrics.append({
-                        'overall': 0.0,
-                        'key_joints': 0.0,
-                        'worst_joint': 'None',
-                        'worst_visibility': 0.0
-                    })
-                    mandatory_chain_flags.append((False, False))
-                
-                data_img_space.append(frame_img)
-                data_world_space.append(frame_world)
+                    landmarker = vision.PoseLandmarker.create_from_options(
+                        get_mediapipe_options(use_gpu=False)
+                    )
+                    face_detector = vision.FaceDetector.create_from_options(
+                        get_face_detector_options(use_gpu=False)
+                    )
+                    delegate_used = "CPU"
+
+                for frame_idx in range(frame_count):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+
+                    if CREATE_VISUALIZATION:
+                        frames_for_viz.append(frame.copy())
+
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+                    frame_timestamp_ms = int(round(frame_idx * frame_timestamp_step_ms))
+
+                    # Face Detection
+                    face_detection_result = face_detector.detect(mp_image)
+                    face_detected_per_frame.append(len(face_detection_result.detections) > 0)
+
+                    # Pose Landmarking
+                    detection_result = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
+
+                    if detection_result.pose_landmarks:
+                        frame_img = [[lm.x, lm.y, lm.z, lm.visibility]
+                                    for lm in detection_result.pose_landmarks[0]]
+                        frame_world = [[lm.x, lm.y, lm.z, lm.visibility]
+                                      for lm in detection_result.pose_world_landmarks[0]]
+
+                        # Calculate detailed visibility metrics
+                        visibilities = [lm.visibility for lm in detection_result.pose_landmarks[0]]
+                        overall_visibility = np.mean(visibilities)
+
+                        # Key joints visibility (squat-specific)
+                        key_visibilities = [visibilities[i] for i in key_joint_indices]
+                        key_visibility = np.mean(key_visibilities)
+
+                        # Find worst joint in this frame
+                        worst_joint_idx = np.argmin(key_visibilities)
+                        worst_joint_name = key_joint_names[worst_joint_idx]
+                        worst_visibility = key_visibilities[worst_joint_idx]
+
+                        visibility_scores.append(overall_visibility)
+                        key_joint_scores.append(key_visibility)
+
+                        frame_metrics.append({
+                            'overall': overall_visibility,
+                            'key_joints': key_visibility,
+                            'worst_joint': worst_joint_name,
+                            'worst_visibility': worst_visibility
+                        })
+
+                        right_core_ok = all(
+                            visibilities[idx] >= MANDATORY_VISIBILITY_THRESHOLD
+                            for idx in MANDATORY_CORE_CHAINS['right_core']
+                        )
+                        left_core_ok = all(
+                            visibilities[idx] >= MANDATORY_VISIBILITY_THRESHOLD
+                            for idx in MANDATORY_CORE_CHAINS['left_core']
+                        )
+                        mandatory_chain_flags.append((right_core_ok, left_core_ok))
+                    else:
+                        frame_img = [landmark[:] for landmark in EMPTY_LANDMARK_FRAME]
+                        frame_world = [landmark[:] for landmark in EMPTY_LANDMARK_FRAME]
+                        visibility_scores.append(0.0)
+                        key_joint_scores.append(0.0)
+                        frame_metrics.append({
+                            'overall': 0.0,
+                            'key_joints': 0.0,
+                            'worst_joint': 'None',
+                            'worst_visibility': 0.0
+                        })
+                        mandatory_chain_flags.append((False, False))
+
+                    data_img_space.append(frame_img)
+                    data_world_space.append(frame_world)
+            finally:
+                if landmarker is not None:
+                    landmarker.close()
+                if face_detector is not None:
+                    face_detector.close()
 
         cap.release()
 
@@ -1216,7 +1330,7 @@ def process_single_video(vid_path, mode="filtered"):
         
         # Save JSON data with enhanced metrics to quality-specific folder
         save_path = os.path.join(quality_output_root, f"{vid_id}.json")
-        
+
         with open(save_path, 'w') as f:
             json.dump({
                 "info": {
@@ -1224,7 +1338,7 @@ def process_single_video(vid_path, mode="filtered"):
                     "frame_count": len(data_img_space),
                     "resolution": f"{w}x{h}",
                     "model": "PoseLandmarker_Heavy",
-                    "processed_on": "CPU",
+                    "processed_on": delegate_used,
                     "timestamp": datetime.now().isoformat(),
                     "quality_rating": analysis['quality_rating'],
                     "smoothing_method": "one_euro_filter" if mode == "unfiltered" else "savgol_plus_stability",
@@ -1250,7 +1364,7 @@ def process_single_video(vid_path, mode="filtered"):
                 "face_detected": face_detected_per_frame,
                 "keypoints_img": data_img_space,
                 "keypoints_world": data_world_space
-            }, f, indent=2)
+            }, f, indent=None if mode == "unfiltered" else 2, separators=(',', ':'))
         
         # Create visualization in quality-specific folder
         if CREATE_VISUALIZATION and frames_for_viz:
@@ -1259,11 +1373,12 @@ def process_single_video(vid_path, mode="filtered"):
                 os.makedirs(viz_quality_root, exist_ok=True)
                 viz_output_path = os.path.join(viz_quality_root, f"{vid_id}_annotated.mp4")
                 
-                fourcc = cv2.VideoWriter_fourcc(*'avc1')
+                # Prefer mp4v first to avoid openh264 runtime warnings on Windows.
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 out = cv2.VideoWriter(viz_output_path, fourcc, fps, (w, h))
                 
                 if not out.isOpened():
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
                     out = cv2.VideoWriter(viz_output_path, fourcc, fps, (w, h))
                 
                 if out.isOpened():
@@ -1319,7 +1434,7 @@ def signal_handler(sig, frame):
     print("\n\n⚠️  Received interrupt signal. Shutting down gracefully...")
     sys.exit(0)
 
-def run_extraction(mode="filtered"):
+def run_extraction(mode="filtered", workers=None):
     # Register signal handler for Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
     
@@ -1355,29 +1470,71 @@ def run_extraction(mode="filtered"):
     if not video_paths:
         print("No videos found to process.")
         return
-    
+
+    # Skip videos that already have output JSON files.
+    pending_video_paths = []
+    already_processed = []
+    for vid_path in video_paths:
+        if _already_processed_json_exists(vid_path, mode=mode):
+            already_processed.append(vid_path)
+        else:
+            pending_video_paths.append(vid_path)
+
+    if already_processed:
+        print(f"ℹ️  Skipping already processed videos: {len(already_processed)}")
+
+    video_paths = pending_video_paths
+
+    if not video_paths:
+        print("All discovered videos are already processed. Nothing to do.")
+        return
+
+    if USE_GPU:
+        if workers != 1:
+            print("ℹ️  GPU mode enabled, forcing workers=1 to avoid GPU contention")
+        workers = 1
+    elif workers is None or int(workers) <= 0:
+        workers = min(cpu_count(), len(video_paths))
+    else:
+        workers = max(1, min(int(workers), cpu_count(), len(video_paths)))
     print(f"\nProcessing {len(video_paths)} videos in '{mode}' mode...")
-    print(f"Using {cpu_count()} CPU cores...")
+    print(f"Using {workers} worker(s)...")
     print("Press Ctrl+C to stop gracefully\n")
     
     # Process videos
+    pool = None
     try:
-        if len(video_paths) == 1:
-            results = [process_single_video(video_paths[0], mode=mode)]
+        if workers == 1:
+            results = []
+            for vid_path in tqdm(video_paths, total=len(video_paths), desc="Processing videos", unit="video"):
+                results.append(process_single_video(vid_path, mode=mode))
         else:
             from functools import partial
             worker = partial(process_single_video, mode=mode)
-            with Pool(min(cpu_count(), len(video_paths))) as pool:
+            # Create pool explicitly (not with context manager) for better Ctrl+C handling
+            pool = Pool(workers, maxtasksperchild=1)
+            try:
                 results = list(tqdm(
-                    pool.imap(worker, video_paths),
+                    pool.imap_unordered(worker, video_paths),
                     total=len(video_paths),
-                    desc="Processing videos"
+                    desc="Processing videos",
+                    unit="video"
                 ))
+            finally:
+                pool.close()
+                pool.join()
     except KeyboardInterrupt:
-        print("\n\n⚠️  Processing interrupted by user.")
-        sys.exit(1)
+        print("\n\n⚠️  Interrupt received. Terminating workers...")
+        if pool is not None:
+            pool.terminate()
+            pool.join()
+        print("✓ Cleanup complete.")
+        sys.exit(0)
     
-    # Process results
+    # Process results (may be partial if interrupted)
+    if not results:
+        print("No results to process.")
+        return
     successes = [r for r in results if r[1] == "Success"]
     errors = [r for r in results if r[1] == "Error"]
     skipped = [r for r in results if r[1] == "Skipped"]
@@ -1386,22 +1543,18 @@ def run_extraction(mode="filtered"):
     print(f"\n{'='*60}")
     print("PROCESSING SUMMARY")
     print('='*60)
+    print(f"⏭ Already processed (pre-skip): {len(already_processed)}")
     print(f"✓ Successfully processed: {len(successes)}")
     print(f"⊘ Skipped (Poor quality): {len(skipped)}")
     print(f"✗ Failed: {len(errors)}")
     
     if successes:
-        print(f"\n{'='*60}")
-        print("QUALITY ASSESSMENT")
-        print('='*60)
-        for vid, status, warning, analysis, avg_vis in successes:
-            print(f"\n{vid}:")
-            print(f"  - Quality Rating: {analysis['quality_rating'] if analysis else 'N/A'}")
-            avg_vis_str = f"{avg_vis:.3f}" if avg_vis and avg_vis > 0 else 'N/A'
-            print(f"  - Avg Visibility: {avg_vis_str}")
-            print(f"  - Problem Frames: {len(analysis['problem_frames']) if analysis else 'N/A'}")
-            if analysis and 'recommendations' in analysis:
-                print(f"  - Recommendations: {len(analysis['recommendations'])}")
+        avg_visibilities = [avg_vis for _, _, _, _, avg_vis in successes if avg_vis is not None]
+        if avg_visibilities:
+            print(f"\n📊 Quality Statistics:")
+            print(f"   - Avg visibility across all: {np.mean(avg_visibilities):.3f}")
+            print(f"   - Min visibility: {np.min(avg_visibilities):.3f}")
+            print(f"   - Max visibility: {np.max(avg_visibilities):.3f}")
     
     if warnings:
         print(f"\n{'='*60}")
@@ -1445,6 +1598,8 @@ if __name__ == "__main__":
     parser.add_argument("mode", nargs="?", default="filtered", choices=["filtered", "unfiltered"], help="Processing mode")
     parser.add_argument("--no-viz", action="store_true", help="Disable video visualization")
     parser.add_argument("--no-report", action="store_true", help="Disable analysis reports (PNG plots + text files)")
+    parser.add_argument("--gpu", action="store_true", help="Try GPU delegate first, then fallback to CPU on failure")
+    parser.add_argument("--workers", type=int, default=0, help="Number of workers (default: max available; use 1 for sequential)")
     args = parser.parse_args()
 
     if args.no_viz:
@@ -1455,4 +1610,10 @@ if __name__ == "__main__":
         CREATE_ANALYSIS_REPORT = False
         print("ℹ️  Analysis reports disabled via CLI")
 
-    run_extraction(mode=args.mode)
+    if args.gpu:
+        USE_GPU = True
+        if args.workers != 1:
+            print("ℹ️  GPU mode requested, forcing workers=1 to avoid multi-process GPU contention")
+            args.workers = 1
+
+    run_extraction(mode=args.mode, workers=args.workers)

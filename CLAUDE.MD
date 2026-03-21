@@ -1,16 +1,29 @@
 # CLAUDE.MD — ExeVision AI Project Knowledge Base
 
-_Last updated: 2026-03-19 (reorganized for current workflow clarity; all historical detail preserved in appendix)_
+_Last updated: 2026-03-21 (Step 2 fusion architecture overhauled; correction collapse diagnosed and fixed; new best evaluation snapshot recorded)_
 
 ---
 
-## 0) Latest Status (2026-03-17 — Current)
+## 0) Latest Status (2026-03-21 — Current)
 
 ExeVision AI is in **late prototyping / early pre-production** state for squat analysis. The production pipeline is operational and actively used (50+ runs documented in `pipeline_ui_runs/`). Core workflow is UI-driven via `pipeline_ui/app.py` with two active tabs: **Inference** (traditional pipeline orchestration) and **Annotation** (human scoring tool for dataset collection).
 
 **Key components:** `scripts/2.5` (pose extraction) → `scripts/4` (view classification) → `scripts/5` (temporal segmentation with strict phase sequencing as of 2026-03-17) → `scripts/8` (rule-based AQA scoring). All stages are routed through `pipeline_ui/app.py`, which manages isolated workspaces, logging, and preview rendering.
 
-**Annotation ecosystem** reached maturity on 2026-03-15 with async batch processing, continuous severity scales (0–5), per-video JSON storage, and heuristic bias-hiding. Data collection is now the immediate next milestone (target 100+ human-scored reps to support BiLSTM training).
+**Annotation ecosystem** reached maturity on 2026-03-15 with async batch processing, continuous severity scales (0–5), per-video JSON storage, and heuristic bias-hiding.
+
+**Step 2 (Neural Fusion) — major improvement recorded 2026-03-21.** A correction collapse bug in `HeuristicGuidedFusion` was diagnosed and fixed: the prior model was applying a near-constant −0.4 point offset regardless of input (residual std ≈ 0.05). After architecture and training changes (see §12 and Appendix A), the model now learns genuine per-rep corrections (residual std ≈ 14–15) and achieves:
+
+| Metric | Before fix | After fix | Δ |
+|---|---|---|---|
+| Post-clamp Pearson | 0.8352 | **0.8737** | +0.038 |
+| Post-clamp MAE | 10.68 | **9.04** | −1.64 pts |
+| Pre-clamp Pearson | 0.7795 | **0.8552** | +0.076 |
+| Pre-clamp MAE | 11.98 | **9.28** | −2.70 pts |
+| Failure cases (>\|20\|) | 4 | **0** | −4 |
+| vs linear baseline MAE | 10.39 (neural was worse) | **9.28 beats linear** | ✅ |
+
+Integration into `pipeline_ui/app.py` inference flow remains pending.
 
 ---
 
@@ -383,6 +396,10 @@ Master Index JSON (dataset/annotations/index.json)
 - ✅ Annotation tool with async batch processing, bias-blind UI, and per-video JSON storage
 - ✅ 50+ documented production runs
 - ✅ Annotation data ecosystem (`select_annotation_samples.py`, `analyze_annotations.py`, `dataset/annotations/`)
+- ✅ Step 2 neural infrastructure scripts implemented (`nn_models.py`, `finetune_models.py`, `evaluate_model.py`, `nn_utils.py`, `pretrain_bilstm.py`, `pretrain_stgcn.py`)
+- ✅ Step 2 phased fine-tuning executed and checkpoints saved (`bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt`)
+- ✅ Step 2 evaluation pipeline executed with report artifact (`results/evaluation_report.json`)
+- ✅ Step 2 correction collapse diagnosed and fixed (2026-03-21): fusion now learns per-rep residuals (std ≈ 14–15 vs prior 0.05), beating linear baseline on MAE for the first time (9.28 vs 10.39)
 
 ### Partially Complete / Fragmented
 
@@ -392,10 +409,10 @@ Master Index JSON (dataset/annotations/index.json)
 
 ### Not Yet Realized (vs Stated Ambition)
 
-- ❌ BiLSTM temporal scorer integrated in pipeline
-- ❌ Fusion of symbolic + neural scores into production orchestrator
+- ❌ BiLSTM/ST-GCN/fusion inference integrated into production UI orchestration path
+- ❌ Symbolic + neural fused scoring exposed as first-class runtime mode in `pipeline_ui/app.py`
 - ❌ Fully reproducible environment manifest (requirements.txt/pyproject.toml)
-- ⏳ Human annotation dataset — Tool exists; data collection in progress (target 100+ reps)
+- ⏳ Human annotation dataset scale-up — tooling exists; current Step 2 run used 147 reps (train=121, test=26), still sparse for robust extreme-score generalization
 
 ---
 
@@ -406,8 +423,10 @@ Master Index JSON (dataset/annotations/index.json)
 1. **Pipeline divergence:** `src/` and `scripts/` may drift; plan mid-term unification
 2. **Missing dependency manifest:** Onboarding and reproducibility risk
 3. **File-path coupling:** Scripts assume fixed relative paths
-4. **Annotation dataset:** Not yet started; blocks BiLSTM training milestone
-5. **Stage 5 sensitivity tuning:** Shallow-rep detection threshold balance remains iterative across dataset
+4. **Step 2 integration gap:** Neural scorer exists as standalone scripts but is not yet wired into production inference tab
+5. **Dataset scale and distribution risk:** Current test set is 26 reps with no 0–20 bucket coverage; generalization to poor-form squats remains unvalidated
+6. **Per-metric prediction weakness:** Smoothness/control are reasonable (MAE ~10), but depth/lean/knee-tracking MAE remains high (~24) — ST-GCN Phase 2 converges but the spatial signal is inherently noisy on diagonal views
+7. **Stage 5 sensitivity tuning:** Shallow-rep detection threshold balance remains iterative across dataset
 
 ### Recently Resolved (✓ Fixed)
 
@@ -417,17 +436,21 @@ Master Index JSON (dataset/annotations/index.json)
 | Depth false-negative on diagonal views | 2026-03-11 | Per-leg independent `max()` computation (replaced bilateral averaging) |
 | Unfiltered pipeline breakage | 2026-03-11 | Added `raw_unfiltered` discovery/routing to stages 4/5/8 |
 | Shallow-squat detection | 2026-03-17 | Low-motion thresholds + strict phase sequencing + transition auto-repair |
+| **Step 2 correction collapse** | **2026-03-21** | **Removed L1 reg + orphaned confidence head; unfroze encoders with diff LR; tanh×40 bounded residual. Pre-clamp MAE dropped from 11.98 → 9.28; beats linear baseline; 0 failure cases.** |
+| **Linear baseline parity** | **2026-03-21** | **Pre-clamp MAE 9.28 now beats linear (10.39); neural is earning its complexity.** |
 
-### Maturity by Layer (as of 2026-03-17)
+### Maturity by Layer (as of 2026-03-21)
 
 - **Data processing pipeline:** Strongly progressed (end-to-end stages fully integrated)
 - **Stage 4 (view classification):** Robust (visibility-based + nose-vs-hip Z-depth)
 - **Stage 5 (temporal segmentation):** Improved (strict sequencing + transition repair)
 - **Stage 8 (scoring/AQA):** Improved (per-leg depth, Z-drift false-negative fixed)
 - **Annotation tooling:** High maturity (async batch, bias-blind, continuous severity scales)
+- **Step 2 training/evaluation tooling:** Improved — fusion architecture fixed, per-rep corrections working, beats linear baseline
+- **Step 2 production integration:** Pending (not yet part of UI runtime path)
 - **Modular package (`src`):** Medium (clean stages 1–3; later placeholders)
 - **Ops/productization:** Medium (good UI; missing lock file)
-- **Roadmap completion:** Partial (symbolic active; dataset collection in progress; BiLSTM/fusion pending)
+- **Roadmap completion:** Partial (symbolic active; dataset collection in progress; neural inference integration pending)
 
 ### Run History Evidence
 
@@ -444,20 +467,23 @@ From `pipeline_ui_runs/` (50 runs documented):
 ## 10) Next Milestones
 
 ### Immediate (Ongoing)
-1. Port scoring/analysis stages into `src/` and extend `src/main.py` to full end-to-end parity
+1. **Integrate Step 2 neural inference into `pipeline_ui/app.py`** — expose explicit mode switch (heuristic-only vs neural-fused) in the Inference tab; use saved checkpoints (`bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt`) for live prediction
+2. **Expand annotations in 20–60 score range** — currently 51 reps in this range (out of 173 total); annotate 30+ more to cover poor-form squats and improve generalization of residual learning
+3. Port scoring/analysis stages into `src/` and extend `src/main.py` to full end-to-end parity
 
 ### Short-Term (Stabilization)
 1. Add `requirements.txt` or `pyproject.toml` with exact package versions
 2. Promote `analyze_results.py` to first-class source file (not just workspace snapshots)
 3. Standardize stage interfaces and JSON schemas across `src/` and `scripts/`
 4. Add failure reason logging in segmentation/scoring summaries
-5. **Start annotating** — target 100+ human-scored reps as first dataset milestone
+5. Re-run Step 2 with broader annotation coverage (especially 0–20 bucket) and compare against baselines under the same post-clamp policy
+6. Validate Phase 4 joint fine-tuning — now that Phase 3 is working correctly, Phase 4 may provide additional gains
 
 ### Mid-Term (Consolidation)
 1. Unify `src/` and `scripts/` code paths (eliminate divergence)
 2. Create regression test fixtures with representative videos + expected outputs
 3. Add config profiles (strict/lenient quality gates) for real-world variability
-4. **Neural training** — once 150+ reps annotated, train BiLSTM on heuristic metrics → predict human scores
+4. Investigate ST-GCN spatial metric MAE (depth=24, knee_tracking=24) — possibly improve with more training data or view-conditioned normalization
 
 ### Long-Term (Roadmap Alignment)
 1. Integrate learned temporal scorer as secondary alongside heuristic rules
@@ -489,6 +515,30 @@ From `pipeline_ui_runs/` (50 runs documented):
 - `scripts/select_annotation_samples.py` — Strategic rep selection for annotation
 - `scripts/analyze_annotations.py` — Annotation quality check
 
+**Step 2 Neural Infrastructure (`scripts/`):**
+- `scripts/nn_models.py` — Shared PyTorch modules for fine-tuning and inference
+  - `BiLSTMScorer`: temporal encoder + smoothness/control heads
+  - `STGCNScorer`: 5-block ST-GCN encoder + 3 spatial heads + 4 auxiliary heuristic-raw heads
+  - `HeuristicGuidedFusion`: heuristic-anchored gated residual model (`final = clamp(heuristic + tanh(residual_head) × 40, 0, 100)`); confidence head removed 2026-03-21
+  - `build_heuristic_vector()`: 15D vector contract
+  - `apply_safety_clamps()`: post-prediction rule caps
+- `scripts/finetune_models.py` — End-to-end supervised fine-tuning orchestrator
+  - Index-gated annotation loading from `dataset/annotations/index.json`
+  - Video-level stratified split by score bucket (seed 42)
+  - Sample weighting: confidence × inverse-bucket
+  - Training phases: BiLSTM → ST-GCN → Fusion (+ optional joint phase 4)
+- `scripts/evaluate_model.py` — Test evaluation and report generation
+  - Primary metrics on post-clamp predictions
+  - Pre-clamp diagnostics
+  - Baselines: heuristic-only and linear regression on heuristic vector
+  - Output report: `results/evaluation_report.json`
+- `scripts/nn_utils.py` — Shared sequence and skeleton utilities
+  - Active-joint graph (11 joints), adjacency matrix construction
+  - ST-GCN rep extraction and normalization contract
+  - Fixed length pad/truncate
+- `scripts/pretrain_bilstm.py` — BiLSTM encoder pretraining (masked reconstruction)
+- `scripts/pretrain_stgcn.py` — ST-GCN encoder pretraining (masked reconstruction)
+
 **Squat AQA Module:**
 - `squat_analysis/aqa_metaProgram_squat.py` — Orchestrator
 - `squat_analysis/scoring_functions.py` — Rule-based scoring logic
@@ -503,11 +553,263 @@ From `pipeline_ui_runs/` (50 runs documented):
 - `progress.md` — Roadmap & milestone tracking
 - `CLAUDE.MD` — This file
 
+**Current Step 2 Artifacts:**
+- `dataset/splits.json` — Persisted train/val/test video split
+- `models/bilstm_pretrained.pt` — BiLSTM pretraining checkpoint
+- `models/stgcn_pretrained.pt` — ST-GCN pretraining checkpoint
+- `models/stgcn_pretrained_encoder.pt` — ST-GCN encoder-only checkpoint
+- `models/bilstm_finetuned.pt` — Phase 1 fine-tuned temporal model
+- `models/stgcn_finetuned.pt` — Phase 2 fine-tuned spatial model
+- `models/fusion_layer.pt` — Phase 3 fine-tuned fusion model
+- `results/evaluation_report.json` — Latest evaluation snapshot
+
+---
+
+## 12) Step 2: Supervised Fine-Tuning + Neural Fusion (Current State)
+
+### 12.1 What Is Implemented
+
+Step 2 is implemented as a standalone training/evaluation stack under `scripts/` and is runnable in the current workspace. The flow is:
+
+1. Load indexed annotations from `dataset/annotations/index.json`.
+2. Resolve per-video annotation JSON and features JSON.
+3. Build rep-level multimodal records (temporal signals + skeleton sequence + heuristic vector).
+4. Split by `video_id` using stratified score buckets.
+5. Train in phases (BiLSTM, then ST-GCN, then fusion).
+6. Evaluate on test split and write `results/evaluation_report.json`.
+
+Production wiring into `pipeline_ui/app.py` is not yet implemented.
+
+### 12.2 Data Contract Used by Step 2
+
+#### Source-of-truth loading policy
+- Only videos listed in `dataset/annotations/index.json` are considered.
+- Per-video annotations are read from `dataset/annotations/videos/{video_id}.json`.
+
+#### Per-rep fields consumed
+- `human_score` (required)
+- `heuristic_score`
+- `signals.normalized_hip_displacement[]`
+- `signals.window_velocity[]`
+- `signals.knee_angles[]`
+- `signals.landmark_confidence[]`
+- `human_metric_scores` (nullable)
+- `heuristic_metrics` (nullable)
+- `flags` / `heuristic_flags`
+- `human_flags`
+- `flag_severities`
+- `annotator_confidence`
+
+#### Canonical tensor contracts
+- BiLSTM input: `(128, 4)`
+- ST-GCN input (pre-permute): `(128, 11, 7)`
+- Heuristic vector: `(15,)`
+- Temporal target/mask: `(2,)`
+- Spatial target/mask: `(3,)`
+- Auxiliary target/mask: `(4,)`
+
+### 12.3 Training Flow (Current Script Behavior)
+
+#### Phase 1: BiLSTM fine-tuning
+- Loads pretrained temporal encoder
+- Optimizes masked weighted MSE for smoothness/control
+- Output: `models/bilstm_finetuned.pt`
+
+#### Phase 2: ST-GCN fine-tuning
+- Loads pretrained ST-GCN encoder blocks
+- Optimizes spatial loss + 0.3 × auxiliary loss
+- Output: `models/stgcn_finetuned.pt`
+
+#### Phase 3: Fusion fine-tuning (revised 2026-03-21)
+- **Encoders unfrozen** with differential LR (enc_lr = fusion_lr × 0.05) so they adapt slowly toward residual prediction task
+- Trains heuristic-guided bounded residual model
+- Formula: `final = clamp(heuristic + tanh(residual_head(fused)) × 40, 0, 100)`
+- Loss: pure weighted MSE — no L1 correction regularisation (removed; was causing collapse)
+- Regularisation from: weight_decay=1e-4 on fusion params + Dropout(0.1) in residual_head + gradient clipping (max_norm=1.0)
+- Early stopping patience = 25 epochs
+- Default epochs = 60, lr = 5e-4
+- Monitoring: `res_std` in per-epoch log — healthy value is std > 2.0 by epoch 10
+- Output: `models/fusion_layer.pt`
+
+#### Optional Phase 4
+- Joint end-to-end fine-tuning behind CLI flag
+- Not enabled by default in current runs
+
+### 12.4 Evaluation Snapshots
+
+#### Snapshot A — Pre-fix (old architecture, ~2026-03-21 morning)
+> `heuristic + confidence * correction` formula; frozen encoders; L1 correction reg = 0.1; 40 epochs
+
+- Counts: train = 121, test = 26
+- Post-clamp: Pearson = 0.8352, MAE = 10.68
+- Pre-clamp: Pearson = 0.7795, MAE = 11.98
+- Heuristic baseline: Pearson = 0.7796, MAE = 12.08
+- Linear baseline: Pearson = 0.7948, MAE = 10.39
+- **Neural was WORSE than linear on MAE (10.68 vs 10.39)**
+- Failure cases: **4 reps**
+- Correction stats: mean = −0.77, std = 0.05 — **near-constant (collapsed)**
+
+#### Snapshot B — Post-fix (current architecture, 2026-03-21)
+> `heuristic + tanh(residual_head)×40` formula; unfrozen encoders + diff LR; no L1 reg; 60 epochs
+
+- Counts: train = 121, test = 26
+- Post-clamp: Pearson = **0.8737**, MAE = **9.04**
+- Pre-clamp: Pearson = **0.8552**, MAE = **9.28**
+- Heuristic baseline: Pearson = 0.7796, MAE = 12.08
+- Linear baseline: Pearson = 0.7948, MAE = 10.39
+- **Neural beats linear on MAE (9.28 vs 10.39)** ✅
+- Failure cases: **0 reps** ✅
+- Residual stats: `res_std` grew from 1.4 (epoch 1) to ~14–15 (epoch 60) — genuine per-rep corrections
+- Phase 3 val loss: 483 (epoch 1) → 164 (epoch 60, best) — consistent decrease confirming learning
+
+### 12.5 Safety Clamp Policy (Post-Fusion)
+
+Clamp rules currently applied in `scripts/nn_models.py`:
+
+- If `knee_valgus` severity ≥ 2: score cap 60
+- If `forward_lean` severity ≥ 2: score cap 65
+- If `insufficient_squat_depth` severity ≥ 3: score cap 50
+
+Primary metrics are computed on post-clamp scores, with pre-clamp metrics preserved for diagnostics.
+
+### 12.6 Known Step 2 Limitations (Current Snapshot — Post-fix)
+
+1. **Test-set size is small (26 reps), with no 0–20 bucket coverage.** Generalization to poor-form squats is unvalidated; 0 failure cases is promising but inconclusive with this distribution.
+2. **Per-metric spatial MAE remains high** — depth (≈24) and knee_tracking (≈24) vs smoothness/control (≈10). ST-GCN learns sub-metric embeddings from Phase 2, but spatial quality on diagonal views is inherently noisy. Increasing training data or view-conditional normalization would help.
+3. **Runtime integration into production UI/pipeline flow is still pending.** The neural scorer runs as a standalone training+eval stack only.
+4. **Phase 3 train/val gap is wide** (e.g., train=111 vs val=164 at epoch 60) — some overfitting is occurring. With only 121 training reps, this is expected; more data would help.
+5. **Phase 4 joint fine-tuning not yet validated** — now that Phase 3 is working, Phase 4 may provide additional gains but also carries overfitting risk.
+
+### 12.7 Agent Fast-Path (Onboarding Shortcut)
+
+For rapid agent onboarding, inspect in this order:
+
+1. `CLAUDE.MD` §0, §12, §9, §10 (status, contracts, risks, next actions)
+2. `scripts/finetune_models.py` (training flow and split/weight policy)
+3. `scripts/nn_models.py` (model formulas and clamp policy)
+4. `scripts/evaluate_model.py` + `results/evaluation_report.json` (actual performance)
+5. `pipeline_ui/app.py` and §4 (what is production-wired vs standalone)
+
 ---
 
 ## Appendix A: Chronological Session Changelog (Historical Development)
 
-_All day-to-day development notes preserved for reference. Latest session (2026-03-17) summarized in §0. See §5 for full production feature details._
+_All day-to-day development notes preserved for reference. Latest session (2026-03-21, fusion fix) summarized in §0. See §5 for full production feature details._
+
+---
+
+### Session 2026-03-21 — Step 2 Fusion Architecture Fix (Correction Collapse Resolved)
+
+**Focus:** Diagnose why the fusion layer was not learning, cross-validate three external reviews against the actual code, and implement the consolidated fix.
+
+#### Root-Cause Diagnosis
+
+Three external reviews were collected and cross-validated against the actual code. Key finding: the code had **already been partially modified** between the training run that produced the reviewed results and the current source. The mismatch was confirmed mathematically:
+- Training log showed `reg=0.100` (constant) at all 40 epochs → old code had `correction_reg = 0.1` constant, not the scheduled 0.05 in current code
+- Per-rep table: `48.4 + 0.501 × (−0.654) = 48.07` ✓ → training ran with old `heuristic + confidence × correction` formula, not the current `heuristic + residual`
+
+**Root causes confirmed:**
+
+1. **Correction collapse (primary):** L1 regularization (`0.1 × |correction|`) penalised every deviation from zero. With heuristic already at Pearson=0.78, the global minimum was "apply a near-zero constant offset." Result: correction std = 0.05 (every rep got the same −0.4 adjustment).
+
+2. **Orphaned confidence head:** The formula was changed from `heuristic + confidence × correction` to `heuristic + residual`, but the `confidence_head` was kept in the model and computed `confidence = self.confidence_head(fused)` with no use in the final score. It received gradient only from a tiny `0.001 × |conf − 0.5|` penalty and contributed nothing.
+
+3. **Frozen encoders:** BiLSTM and ST-GCN were frozen during Phase 3. Phase 1-2 trained them on sub-metric prediction targets (smoothness, depth, etc.), not on "where does the heuristic get it wrong." The fusion layer received fixed embeddings that weren't aligned to the residual prediction task.
+
+4. **Dropout too aggressive:** `Dropout(0.3)` in the correction head killed 30% of neurons per forward pass in batches of 16 from 121 training samples — too much noise for stable residual learning.
+
+5. **Phase 3 training instability:** Val loss started at 406 at epoch 1 and immediately rose; the best checkpoint was saved at epoch 1 (near-zero correction magnitude). By epoch 40, corrections had grown to |corr|=15 but the checkpoint was already locked at the collapsed state.
+
+#### What the Reviews Got Right vs Wrong
+
+| Claim | Source | Verdict |
+|---|---|---|
+| Correction regularization too strong | All 3 | ✅ Correct — primary cause |
+| Frozen encoders in Phase 3 | All 3 | ✅ Correct |
+| Dataset imbalance (61% 80-100) | All 3 | ✅ Correct |
+| Linear baseline beating neural is diagnostic | All 3 | ✅ Correct |
+| "Early stopping triggered at epoch 11" | Reviews 2 & 3 | ❌ Phase 3 ran all 40 epochs (no early stopping in code at that time) |
+| "Confidence not used in score" | Review 1 | ❌ During training it WAS used; only became true after partial code edit |
+| "Just use linear regression" | Review 3 | ⚠️ Valid fallback but ignores architecture; neural now beats linear after fix |
+| "Add explicit residual MSE auxiliary" | Reviews 1 & 2 | ❌ Algebraically identical to existing loss — real issue was L1 reg |
+
+#### Changes Implemented (2026-03-21)
+
+**`scripts/nn_models.py` — `HeuristicGuidedFusion`:**
+- Removed `confidence_head` entirely (orphaned — output never used in final score)
+- Renamed `correction_head` → `residual_head` with `nn.Tanh()` as final layer; scaled by `× 40` after the Sequential → bounds corrections to ±40 pts (covers any realistic heuristic error gap while preventing gradient explosion)
+- Reduced dropout `0.3` → `0.1` in `residual_head`
+- Return signature changed from `(final_score, correction, confidence)` to `(final_score, residual)` — 2-tuple throughout
+
+**`scripts/finetune_models.py` — Phase 3 (`train_phase_fusion`):**
+- **Unfroze both encoders** — BiLSTM and ST-GCN participate in Phase 3 gradient updates
+- **Differential LR**: encoders at `lr × 0.05` (= 2.5e-5), fusion at full `lr` (= 5e-4) with `weight_decay=1e-4`
+- **Removed all correction regularisation** (`reg_residual`, `reg_confidence` terms)
+- **Simplified loss** to pure weighted MSE
+- **Increased early_stop_patience** 10 → 25 epochs
+- **Removed correction-collapse auto-adjustment logic** (no longer needed)
+- Updated per-epoch log: prints `res_std` instead of `conf` — `std > 2.0` by epoch 10 is the health indicator
+
+**`scripts/finetune_models.py` — CLI defaults:**
+- `--epochs-fusion` 40 → 60
+- `--lr-fusion` 2e-4 → 5e-4
+
+**`scripts/evaluate_model.py`:**
+- Updated fusion call to 2-tuple unpack (`pred, corr = fusion(...)`)
+- Renamed `correction_statistics` → `residual_statistics`, removed `mean_confidence`
+- Per-rep table: renamed `correction` → `residual`, removed `confidence` field
+- Failure case entries: renamed `correction` → `residual`, removed `confidence`
+
+#### Before vs After (2026-03-21)
+
+| | Before (old arch) | After (new arch) |
+|---|---|---|
+| Phase 3 residual std at epoch 1 | ~0.05 (collapsed) | 1.4 |
+| Phase 3 residual std at final epoch | ~0.05 (flat) | **14–15** |
+| Phase 3 val loss trajectory | 406 → 450+ (diverged) | 483 → **164** (converged) |
+| Post-clamp Pearson | 0.8352 | **0.8737** |
+| Post-clamp MAE | 10.68 | **9.04** |
+| Pre-clamp Pearson | 0.7795 | **0.8552** |
+| Pre-clamp MAE | 11.98 | **9.28** |
+| vs linear baseline MAE | 10.68 > 10.39 (worse) | **9.28 < 10.39 (better)** ✅ |
+| Failure cases (>\|20\|) | 4 | **0** ✅ |
+
+---
+
+### Session 2026-03-21 — Step 2 Documentation Consolidation (Agent Onboarding Focus)
+
+**Focus:** Reduce future coding-agent startup effort by making `CLAUDE.MD` a complete single-stop reference for current implementation state.
+
+**What was documented:**
+1. Added a dedicated Step 2 section with script-level responsibilities and end-to-end flow.
+2. Added strict data contract summary for indexed loading, rep fields, tensor shapes, and phase behavior.
+3. Synced latest evaluation snapshot directly from `results/evaluation_report.json` (post-clamp primary and pre-clamp diagnostics).
+4. Added current artifacts map (splits/checkpoints/report) and explicit pending integration status.
+5. Updated risks and milestones to reflect the real current bottlenecks (dataset coverage, extreme-score reliability, integration gap, reproducibility).
+
+**Why this reduces onboarding effort:**
+- New agents can now identify implementation state, active scripts, contracts, artifacts, and immediate next actions from one document, avoiding repeated full-code rediscovery.
+
+---
+
+### Session 2026-03-21 — Step 2 Implementation Kickoff (Document-First)
+
+**Focus:** Enforce document-first development workflow and start Step 2 implementation for supervised fine-tuning + fusion.
+
+**What was built/planned before coding:**
+1. Added a hard process gate: update `CLAUDE.MD` before any source-code edits for Step 2 work.
+2. Confirmed implementation scope for new scripts: `scripts/nn_models.py`, `scripts/finetune_models.py`, and `scripts/evaluate_model.py`.
+3. Locked data loading policy to `dataset/annotations/index.json` registry only (ignore non-index partial annotation JSONs).
+4. Locked evaluation policy to deployment-faithful post-safety-clamp metrics with additional pre-clamp diagnostics.
+5. Locked training policy to phased protocol: BiLSTM fine-tuning, ST-GCN fine-tuning, then heuristic-guided gated fusion training.
+
+**Implementation constraints adopted:**
+- Split by `video_id` with stratified score buckets and seed 42.
+- Use confidence × inverse-bucket sample weighting.
+- Apply gradient clipping in every training phase.
+- Auto-reduce fusion correction regularization if correction collapse is detected.
+
+---
 
 ### Session 2026-03-17 — Stage 5 Strict Sequencing + Annotation Controls
 

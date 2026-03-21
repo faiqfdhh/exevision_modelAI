@@ -32,7 +32,7 @@ def _env_flag(name: str, default: bool = True) -> bool:
 FEATURES_EXCELLENT = "./squat/extracted_features_clean/excellent"
 FEATURES_GOOD = "./squat/extracted_features_clean/good"
 FEATURES_FAIR = "./squat/extracted_features_clean/fair"
-FEATURES_RAW_UNFILTERED = "./squat/extracted_features_clean/raw_unfiltered"
+FEATURES_RAW_UNFILTERED = r"D:\squat\unlabeled_features\raw_unfiltered"
 
 FEATURES_DIRS = [FEATURES_EXCELLENT, FEATURES_GOOD, FEATURES_FAIR, FEATURES_RAW_UNFILTERED]
 VIDEO_IDS_TO_PROCESS = ["*"] 
@@ -40,7 +40,7 @@ VIDEO_IDS_TO_PROCESS = ["*"]
 OUTPUT_DIR_EXCELLENT = "./squat/segmented_reps/excellent"
 OUTPUT_DIR_GOOD = "./squat/segmented_reps/good"
 OUTPUT_DIR_FAIR = "./squat/segmented_reps/fair"
-OUTPUT_DIR_RAW_UNFILTERED = "./squat/segmented_reps/raw_unfiltered"
+OUTPUT_DIR_RAW_UNFILTERED = r"D:\squat\unlabeled_features\raw_unfiltered\segmented_reps"
 
 OUTPUT_DIRS = {
     "excellent": OUTPUT_DIR_EXCELLENT,
@@ -1570,7 +1570,10 @@ def run_segmentation(quality_filter=None, create_visualization=True):
             
             # Determine quality (from metadata or folder)
             quality_from_metadata = info.get("quality_rating", "unknown").lower()
-            quality_to_use = quality_from_metadata if quality_from_metadata != "unknown" else quality
+            if quality == "raw_unfiltered":
+                quality_to_use = "raw_unfiltered"
+            else:
+                quality_to_use = quality_from_metadata if quality_from_metadata != "unknown" else quality
             
             if quality_to_use in stats["by_quality"]:
                 stats["by_quality"][quality_to_use] += 1
