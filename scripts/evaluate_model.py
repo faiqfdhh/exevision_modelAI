@@ -17,6 +17,7 @@ from finetune_models import (
     score_bucket,
     set_seed,
     split_records,
+    stratified_video_split,
     to_device,
 )
 from nn_models import BiLSTMScorer, HeuristicGuidedFusion, STGCNScorer, apply_safety_clamps
@@ -67,6 +68,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="results/evaluation_report.json")
+    parser.add_argument(
+        "--n-splits", type=int, default=1,
+        help="Repeat evaluation with N different random stratified splits and report mean±std. "
+             "Default 1 = single split (original seed, writes JSON report as usual)."
+    )
     return parser.parse_args()
 
 
@@ -122,7 +128,7 @@ def main() -> None:
             batch = to_device(batch, device)
 
             bo = bilstm(batch["bilstm"])
-            so = stgcn(batch["stgcn"])
+            so = stgcn(batch["stgcn"], batch["heuristic"][:, 10:15])
             pred, corr = fusion(batch["heuristic"], so["embedding"], bo["embedding"])
 
             pred_np = pred.detach().cpu().numpy()
@@ -327,6 +333,56 @@ def main() -> None:
     print(f"Delta vs linear: {post_corr - linear_corr:.4f}")
     print(f"Failure cases (>20 abs error): {len(failure_cases)}")
     print(f"Saved report: {output_path}")
+
+    # Repeated-split confidence interval (only when --n-splits > 1)
+    if args.n_splits > 1:
+        print(f"\n=== Confidence Interval over {args.n_splits} Random Splits ===")
+        all_records_full, video_scores_full = build_records(root, index_path)
+        multi_post_corr: List[float] = [post_corr]
+        multi_post_mae: List[float] = [post_mae]
+        multi_pre_corr: List[float] = [pre_corr]
+        multi_pre_mae: List[float] = [pre_mae]
+
+        for split_i in range(1, args.n_splits):
+            seed_i = args.seed + split_i * 17
+            splits_i = stratified_video_split(video_scores_full, seed=seed_i)
+            _, _, test_recs_i = split_records(all_records_full, splits_i)
+            train_recs_i, _, _ = split_records(all_records_full, splits_i)
+            if not test_recs_i:
+                continue
+
+            ds_i = MultiModalRepDataset(test_recs_i, training=False)
+            loader_i = DataLoader(ds_i, batch_size=args.batch_size, shuffle=False, drop_last=False)
+
+            hs_i: List[float] = []
+            pp_i: List[float] = []
+            pre_i: List[float] = []
+            offset_i = 0
+            with torch.no_grad():
+                for batch_i in loader_i:
+                    bsz = batch_i["human_score"].shape[0]
+                    batch_i = to_device(batch_i, device)
+                    bo_i = bilstm(batch_i["bilstm"])
+                    so_i = stgcn(batch_i["stgcn"], batch_i["heuristic"][:, 10:15])
+                    pred_i, _ = fusion(batch_i["heuristic"], so_i["embedding"], bo_i["embedding"])
+                    pred_np_i = pred_i.detach().cpu().numpy()
+                    for j in range(bsz):
+                        r = test_recs_i[offset_i + j]
+                        clamped_i = apply_safety_clamps(float(pred_np_i[j]), r.heuristic_flags, r.flag_severities)
+                        hs_i.append(float(r.human_score))
+                        pp_i.append(float(clamped_i))
+                        pre_i.append(float(pred_np_i[j]))
+                    offset_i += bsz
+
+            multi_post_corr.append(pearson(pp_i, hs_i))
+            multi_post_mae.append(mae(pp_i, hs_i))
+            multi_pre_corr.append(pearson(pre_i, hs_i))
+            multi_pre_mae.append(mae(pre_i, hs_i))
+
+        print(f"Post-clamp Pearson: {np.mean(multi_post_corr):.4f} ± {np.std(multi_post_corr):.4f}  (splits: {[round(v,4) for v in multi_post_corr]})")
+        print(f"Post-clamp MAE:     {np.mean(multi_post_mae):.3f} ± {np.std(multi_post_mae):.3f}  (splits: {[round(v,3) for v in multi_post_mae]})")
+        print(f"Pre-clamp Pearson:  {np.mean(multi_pre_corr):.4f} ± {np.std(multi_pre_corr):.4f}")
+        print(f"Pre-clamp MAE:      {np.mean(multi_pre_mae):.3f} ± {np.std(multi_pre_mae):.3f}")
 
 
 if __name__ == "__main__":

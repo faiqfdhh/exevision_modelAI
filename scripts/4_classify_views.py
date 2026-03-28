@@ -12,7 +12,7 @@ from tqdm import tqdm
 FEATURES_EXCELLENT = "./squat/extracted_features_clean/excellent"
 FEATURES_GOOD = "./squat/extracted_features_clean/good"
 FEATURES_FAIR = "./squat/extracted_features_clean/fair"
-FEATURES_RAW_UNFILTERED = r"D:\squat\unlabeled_features\raw_unfiltered"
+FEATURES_RAW_UNFILTERED = "./squat/extracted_features_clean/raw_unfiltered"
 
 FEATURES_DIRS = [FEATURES_EXCELLENT, FEATURES_GOOD, FEATURES_FAIR, FEATURES_RAW_UNFILTERED]
 
@@ -195,7 +195,7 @@ def process_video_classification(json_path: str) -> tuple:
         return video_id, "Error", str(e)
 
 
-def run_classification(quality_filter=None):
+def run_classification(quality_filter=None, video_id_filter=None):
     """
     Process all extracted features and classify by view.
     Updates JSON files in place with view field.
@@ -218,6 +218,9 @@ def run_classification(quality_filter=None):
         if os.path.exists(folder):
             for f in os.listdir(folder):
                 if f.endswith(".json"):
+                    video_id = os.path.splitext(f)[0]
+                    if video_id_filter and video_id != video_id_filter:
+                        continue
                     full_path = os.path.join(folder, f)
                     json_files.append(full_path)
                     folder_map[full_path] = folder
@@ -273,8 +276,11 @@ print('='*70)
 
 
 if __name__ == "__main__":
-    # Run classification on all videos
-    run_classification(quality_filter=None)
-    
-    # Or run on specific quality:
-    # run_classification(quality_filter='good')
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Classify views from extracted pose features.")
+    parser.add_argument("--quality", choices=["excellent", "good", "fair", "raw_unfiltered"], help="Filter by quality")
+    parser.add_argument("--video-id", help="Process only one video id (e.g., 25709_1)")
+    args = parser.parse_args()
+
+    run_classification(quality_filter=args.quality, video_id_filter=args.video_id)

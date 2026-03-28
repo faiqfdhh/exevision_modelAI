@@ -76,6 +76,13 @@ STAGES: tuple[Stage, ...] = (
         args=(),
         output_paths=("squat/aqa_analysis_simple/analysis_visualizations",),
     ),
+    Stage(
+        key="neural_fusion",
+        label="9 Neural Fusion Scoring",
+        script_path=PROJECT_ROOT / "scripts" / "9_neural_fusion_inference.py",
+        args=(),
+        output_paths=("squat/neural_analysis",),
+    ),
 )
 
 
@@ -169,6 +176,7 @@ class PipelineRunnerUI:
         self.current_analysis_data: dict | None = None
         self.current_analysis_summary_data: dict | None = None
         self.current_score_data: dict | None = None
+        self.current_neural_data: dict | None = None
         self.current_run_root: Path | None = None
 
         self.stage_checks: dict[str, tk.BooleanVar] = {
@@ -298,9 +306,17 @@ class PipelineRunnerUI:
             variable=self.use_gpu_var,
         ).grid(row=2, column=0, sticky="w", pady=(8, 0))
 
+        # Neural Pipeline Section
+        neural_frame = ttk.LabelFrame(left_panel, text="Neural Pipeline (Optional)", padding=8)
+        neural_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        neural_frame.columnconfigure(0, weight=1)
+        ttk.Label(neural_frame, text="Run full pipeline with neural fusion scoring:", wraplength=250, justify=tk.LEFT).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        self.neural_button = ttk.Button(neural_frame, text="▶ Full Neural Pipeline", command=self._start_neural_pipeline, width=24)
+        self.neural_button.grid(row=1, column=0, columnspan=2, sticky="ew")
+
         # Start/Stop Buttons
         button_frame = ttk.Frame(left_panel)
-        button_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        button_frame.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         self.start_button = ttk.Button(button_frame, text="▶ Start", command=self._start, width=14)
         self.start_button.pack(side=tk.TOP, padx=(0, 0), fill=tk.X)
         self.stop_button = ttk.Button(button_frame, text="⏹ Stop", command=self._stop_pipeline_safe, state="disabled", width=14)
@@ -308,7 +324,7 @@ class PipelineRunnerUI:
 
         # Progress Bars
         progress_frame = ttk.LabelFrame(left_panel, text="Progress", padding=6)
-        progress_frame.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        progress_frame.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         progress_frame.columnconfigure(0, weight=1)
 
         self.overall_progress = ttk.Progressbar(progress_frame, variable=self.overall_progress_var, maximum=100, mode="determinate")
@@ -456,6 +472,65 @@ class PipelineRunnerUI:
         selected_keys = [k for k, v in self.stage_checks.items() if v.get()]
         return ordered_stages(selected_keys)
 
+    def _start_neural_pipeline(self) -> None:
+        """Start full pipeline with neural fusion scoring (stages 2.5 → 4 → 5 → 8 → neural_fusion)."""
+        # Run full pipeline ending with neural fusion stage
+        neural_stages = ordered_stages([
+            "extract_selected_features",
+            "classify_views",
+            "temporal_segmentation",
+            "scoring",
+            "neural_fusion",
+        ])
+        
+        input_mode = self.input_mode_var.get()
+        dataset_path: Path | None = None
+        video_path: Path | None = None
+
+        if input_mode == "dataset":
+            dataset_path = Path(self.dataset_var.get()).resolve()
+            if not dataset_path.exists() or not dataset_path.is_dir():
+                messagebox.showerror("Invalid dataset", f"Dataset folder not found:\n{dataset_path}")
+                return
+        else:
+            video_path = Path(self.video_var.get()).resolve()
+            valid_extensions = {".mp4", ".mov", ".avi", ".mkv", ".flv"}
+            if not video_path.exists() or not video_path.is_file():
+                messagebox.showerror("Invalid video", f"Video file not found:\n{video_path}")
+                return
+            if video_path.suffix.lower() not in valid_extensions:
+                messagebox.showerror("Invalid video", "Select a supported video file (.mp4, .mov, .avi, .mkv, .flv).")
+                return
+
+        run_name = f"neural_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_root = RUNS_ROOT / run_name
+        self.current_run_root = run_root
+
+        self.stop_requested = False
+        self.pipeline_running = True
+        self.start_button.configure(state="disabled")
+        self.neural_button.configure(state="disabled")
+        self.stop_button.configure(state="normal")
+        self._set_overall_progress(0)
+        self._set_stage_progress(0)
+        self._log(f"▶ Starting neural pipeline run: {run_name}")
+        self._set_preview_outputs([])
+        self._clear_score_display("Run in progress. Neural scoring results will appear here when available.")
+        
+        self._stop_preview(release_only=True)
+
+        if video_path is not None:
+            self._log(f"Input video: {video_path}")
+        else:
+            self._log(f"Input dataset: {dataset_path}")
+
+        thread = threading.Thread(
+            target=self._run_pipeline_thread,
+            args=(run_root, neural_stages, dataset_path, video_path),
+            daemon=True,
+        )
+        thread.start()
+
     def _start(self) -> None:
         stages = self._resolve_stage_selection()
         input_mode = self.input_mode_var.get()
@@ -547,7 +622,15 @@ class PipelineRunnerUI:
 
                 self.root.after(0, self._set_stage_progress, 0)
                 self._log(f"\n[{index}/{len(stages)}] Running: {stage.label}")
-                self._run_stage(stage, workspace_root, logs_root, video_path=video_path)
+                try:
+                    self._run_stage(stage, workspace_root, logs_root, video_path=video_path)
+                except Exception as exc:
+                    if stage.key == "neural_fusion":
+                        self._log(f"⚠️ Neural stage failed, continuing with heuristic results: {exc}")
+                        self.root.after(0, self._set_stage_progress, 100)
+                        self.root.after(0, self._set_overall_progress, index * 100 / max(len(stages), 1))
+                        continue
+                    raise
 
                 stage_folder = stage_outputs_root / f"{index:02d}_{stage.key}"
                 self._snapshot_stage_outputs(stage, workspace_root, stage_folder)
@@ -673,8 +756,16 @@ class PipelineRunnerUI:
             stage_args = [processing_mode] + stage_args
             if self.use_gpu_var.get():
                 stage_args.append("--gpu")
+            if video_path is not None:
+                stage_args.extend(["--video-id", video_path.stem])
+        elif stage.key == "classify_views" and video_path is not None:
+            stage_args = ["--video-id", video_path.stem]
+        elif stage.key == "temporal_segmentation" and video_path is not None:
+            stage_args = ["--video-id", video_path.stem]
         elif stage.key == "scoring" and video_path is not None:
             stage_args = [video_path.stem]
+        elif stage.key == "neural_fusion" and video_path is not None:
+            stage_args = ["--video-id", video_path.stem]
 
         cmd = [sys.executable, str(script_to_run), *stage_args]
         log_file = logs_root / f"{stage.key}.log"
@@ -881,6 +972,21 @@ class PipelineRunnerUI:
                 return matches[0]
         return None
 
+    def _find_neural_json(self, run_root: Path, video_id: str) -> Path | None:
+        """Find neural fusion scoring JSON for a video."""
+        search_roots = [
+            run_root / "workspace" / "squat" / "neural_analysis",
+            run_root / "stage_outputs",
+        ]
+
+        for root in search_roots:
+            if not root.exists():
+                continue
+            matches = sorted(root.rglob(f"{video_id}_neural.json"))
+            if matches:
+                return matches[0]
+        return None
+
     def _find_run_root_for_path(self, path: Path) -> Path | None:
         for parent in path.parents:
             if parent.parent.name == "pipeline_ui_runs":
@@ -1043,7 +1149,7 @@ class PipelineRunnerUI:
             )
         return lines
 
-    def _format_score_report(self, data: dict, analysis_summary: dict | None = None) -> str:
+    def _format_score_report(self, data: dict, analysis_summary: dict | None = None, neural_data: dict | None = None) -> str:
         lines = []
         lines.append(f"Video ID: {data.get('video_id', 'Unknown')}")
         lines.append(f"Overall Score: {data.get('overall_score', 0):.1f}/100")
@@ -1052,6 +1158,8 @@ class PipelineRunnerUI:
         lines.append(f"Source Quality: {str(data.get('source_quality', 'Unknown')).title()}")
         if data.get("message"):
             lines.append(f"Status: {data['message']}")
+        if neural_data and neural_data.get("message"):
+            lines.append(f"Neural Status: {neural_data['message']}")
         lines.append("-" * 40)
 
         repetitions = data.get("repetitions", [])
@@ -1065,12 +1173,19 @@ class PipelineRunnerUI:
                 lines.append(f"  {item}")
             lines.append("-" * 40)
 
+        # Create neural rep lookup (by rep_id)
+        neural_reps_by_id = {}
+        if neural_data and neural_data.get("reps"):
+            for nr in neural_data["reps"]:
+                neural_reps_by_id[nr.get("rep_id")] = nr
+
         for rep in repetitions:
             rep_score = rep.get("score", {})
             metrics = rep.get("metrics", {})
             metric_scores = rep_score.get("metric_scores", {})
+            rep_id = rep.get("rep_id", "?")
 
-            lines.append(f"Rep {rep.get('rep_id', '?')}: {rep_score.get('overall_score', 0):.1f}/100")
+            lines.append(f"Rep {rep_id}: {rep_score.get('overall_score', 0):.1f}/100")
             lines.append(
                 f"  Frames: {rep.get('start_frame', '?')} -> {rep.get('end_frame', '?')} | "
                 f"Duration: {rep.get('duration_seconds', 0):.2f}s"
@@ -1089,6 +1204,35 @@ class PipelineRunnerUI:
                     for name, value in metric_scores.items()
                 ]
                 lines.append("  Metric Scores: " + ", ".join(score_parts))
+            
+            # Add neural metrics if available
+            neural_rep = neural_reps_by_id.get(rep_id)
+            if neural_rep:
+                neural_score = neural_rep.get("neural_score", None)
+                if neural_score is not None:
+                    lines.append(f"  [NEURAL] Score: {neural_score:.1f}/100 | Pre-clamp: {neural_rep.get('neural_score_pre_clamp', neural_score):.1f}")
+                    
+                    # Sub-metrics
+                    sub_metrics = []
+                    if neural_rep.get("smoothness") is not None:
+                        sub_metrics.append(f"Smoothness: {neural_rep['smoothness']:.1f}")
+                    if neural_rep.get("control") is not None:
+                        sub_metrics.append(f"Control: {neural_rep['control']:.1f}")
+                    if neural_rep.get("depth") is not None:
+                        sub_metrics.append(f"Depth: {neural_rep['depth']:.1f}")
+                    if neural_rep.get("forward_lean") is not None:
+                        sub_metrics.append(f"Forward Lean: {neural_rep['forward_lean']:.1f}")
+                    if neural_rep.get("knee_tracking") is not None:
+                        sub_metrics.append(f"Knee Tracking: {neural_rep['knee_tracking']:.1f}")
+                    
+                    if sub_metrics:
+                        lines.append(f"  [NEURAL] Metrics: {' | '.join(sub_metrics)}")
+                    
+                    # Safety clamps applied
+                    clamps = neural_rep.get("safety_clamps_applied", [])
+                    if clamps:
+                        lines.append(f"  [NEURAL] Safety Clamps: {', '.join(clamps)}")
+            
             lines.extend(self._format_rep_analysis(rep, str(data.get("view", "unknown")), analysis_summary))
             lines.append("")
 
@@ -1114,6 +1258,7 @@ class PipelineRunnerUI:
             return
 
         analysis_summary = None
+        neural_data = None
         run_root = self._find_run_root_for_path(score_path)
         if run_root is not None:
             summary_path = self._find_analysis_summary_json(run_root, str(data.get("video_id", "")))
@@ -1123,14 +1268,25 @@ class PipelineRunnerUI:
                         analysis_summary = json.load(f)
                 except Exception:
                     analysis_summary = None
+            
+            # Load neural metrics if available
+            neural_path = self._find_neural_json(run_root, str(data.get("video_id", "")))
+            if neural_path is not None and neural_path.exists():
+                try:
+                    with open(neural_path, "r", encoding="utf-8") as f:
+                        neural_data = json.load(f)
+                except Exception:
+                    neural_data = None
 
         self.current_analysis_summary_data = analysis_summary
         self.current_score_data = data
+        self.current_neural_data = neural_data
         try:
-            report_text = self._format_score_report(data, analysis_summary)
+            report_text = self._format_score_report(data, analysis_summary, neural_data)
         except Exception as exc:
             self.current_analysis_summary_data = analysis_summary
             self.current_score_data = data
+            self.current_neural_data = neural_data
             self._set_score_display(
                 "Failed to format scoring results.\n\n"
                 f"{exc}\n\n"
@@ -1491,9 +1647,11 @@ class PipelineRunnerUI:
     def _update_button_states(self) -> None:
         if self.pipeline_running:
             self.start_button.configure(state="disabled")
+            self.neural_button.configure(state="disabled")
             self.stop_button.configure(state="normal")
         else:
             self.start_button.configure(state="normal")
+            self.neural_button.configure(state="normal")
             self.stop_button.configure(state="disabled")
 
     def _open_in_default_player(self) -> None:

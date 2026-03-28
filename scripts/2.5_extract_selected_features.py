@@ -44,7 +44,7 @@ def suppress_native_stderr():
 
 # --- Configuration ---
 DATASET_ROOT = "./squat/dataset_videos_all"
-OUTPUT_ROOT = r"D:\squat\unlabeled_features"
+OUTPUT_ROOT = "./squat/extracted_features_clean"
 VISUALIZATION_OUTPUT_ROOT = "./squat/visualized_poses_clean"
 ANALYSIS_OUTPUT_ROOT = "./squat/analysis_reports"
 MODEL_PATH = os.environ.get("EXEVISION_MODEL_PATH", os.path.join('models', 'pose_landmarker_heavy.task'))
@@ -1599,6 +1599,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-viz", action="store_true", help="Disable video visualization")
     parser.add_argument("--no-report", action="store_true", help="Disable analysis reports (PNG plots + text files)")
     parser.add_argument("--gpu", action="store_true", help="Try GPU delegate first, then fallback to CPU on failure")
+    parser.add_argument("--video-id", help="Process only one video id (e.g., 25709_1)")
     parser.add_argument("--workers", type=int, default=0, help="Number of workers (default: max available; use 1 for sequential)")
     args = parser.parse_args()
 
@@ -1615,5 +1616,9 @@ if __name__ == "__main__":
         if args.workers != 1:
             print("ℹ️  GPU mode requested, forcing workers=1 to avoid multi-process GPU contention")
             args.workers = 1
+
+    if args.video_id:
+        VIDEO_IDS[:] = [args.video_id]
+        print(f"ℹ️  Video filter enabled: {args.video_id}")
 
     run_extraction(mode=args.mode, workers=args.workers)

@@ -88,7 +88,7 @@ class STGCNScorer(nn.Module):
         self.block5 = STGCNBlock(128, 256, A, stride=2, dropout=dropout)
 
         self.spatial_head = nn.Sequential(
-            nn.Linear(256, 64),
+            nn.Linear(256 + 5, 64),  # +5 for view one-hot (dims 10-14 of heuristic_vec)
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(64, 3),
@@ -108,9 +108,13 @@ class STGCNScorer(nn.Module):
         x = self.block5(x)
         return x.mean(dim=(2, 3))
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, view_vec: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         embedding = self.encode(x)
-        spatial_scores = self.spatial_head(embedding)
+        # view_vec: (B, 5) one-hot from heuristic_vec[:, 10:15]. Zeros = unknown view.
+        if view_vec is None:
+            view_vec = torch.zeros(embedding.shape[0], 5, device=embedding.device)
+        spatial_input = torch.cat([embedding, view_vec], dim=-1)
+        spatial_scores = self.spatial_head(spatial_input)
         aux_metrics = self.auxiliary_heuristic_head(embedding)
         return {
             "embedding": embedding,

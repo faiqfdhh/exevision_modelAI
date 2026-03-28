@@ -32,7 +32,7 @@ def _env_flag(name: str, default: bool = True) -> bool:
 FEATURES_EXCELLENT = "./squat/extracted_features_clean/excellent"
 FEATURES_GOOD = "./squat/extracted_features_clean/good"
 FEATURES_FAIR = "./squat/extracted_features_clean/fair"
-FEATURES_RAW_UNFILTERED = r"D:\squat\unlabeled_features\raw_unfiltered"
+FEATURES_RAW_UNFILTERED = "./squat/extracted_features_clean/raw_unfiltered"
 
 FEATURES_DIRS = [FEATURES_EXCELLENT, FEATURES_GOOD, FEATURES_FAIR, FEATURES_RAW_UNFILTERED]
 VIDEO_IDS_TO_PROCESS = ["*"] 
@@ -40,7 +40,7 @@ VIDEO_IDS_TO_PROCESS = ["*"]
 OUTPUT_DIR_EXCELLENT = "./squat/segmented_reps/excellent"
 OUTPUT_DIR_GOOD = "./squat/segmented_reps/good"
 OUTPUT_DIR_FAIR = "./squat/segmented_reps/fair"
-OUTPUT_DIR_RAW_UNFILTERED = r"D:\squat\unlabeled_features\raw_unfiltered\segmented_reps"
+OUTPUT_DIR_RAW_UNFILTERED = "./squat/segmented_reps/raw_unfiltered"
 
 OUTPUT_DIRS = {
     "excellent": OUTPUT_DIR_EXCELLENT,
@@ -1555,6 +1555,7 @@ def run_segmentation(quality_filter=None, create_visualization=True):
         print(f"\n▶ [{idx}/{len(json_files)}] Segmenting {video_id}...", flush=True)
 
         video_id, status, result, quality = process_video(json_path)
+        source_quality = quality_mapping.get(json_path, quality)
         
         if status == "Success" and result and "error" not in result:
             stats["success"] += 1
@@ -1570,10 +1571,10 @@ def run_segmentation(quality_filter=None, create_visualization=True):
             
             # Determine quality (from metadata or folder)
             quality_from_metadata = info.get("quality_rating", "unknown").lower()
-            if quality == "raw_unfiltered":
+            if source_quality == "raw_unfiltered":
                 quality_to_use = "raw_unfiltered"
             else:
-                quality_to_use = quality_from_metadata if quality_from_metadata != "unknown" else quality
+                quality_to_use = quality_from_metadata if quality_from_metadata != "unknown" else source_quality
             
             if quality_to_use in stats["by_quality"]:
                 stats["by_quality"][quality_to_use] += 1
@@ -1661,11 +1662,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Segment squat videos into repetitions.")
     parser.add_argument("--no-viz", action="store_true", help="Disable video visualization")
     parser.add_argument("--quality", choices=["excellent", "good", "fair", "raw_unfiltered"], help="Filter by quality")
+    parser.add_argument("--video-id", help="Process only one video id (e.g., 25709_1)")
     args = parser.parse_args()
 
     # Priority: CLI flag > Env var > Default True
     create_viz = not args.no_viz
     if not create_viz:
         print("ℹ️  Visualization disabled via CLI")
+
+    if args.video_id:
+        VIDEO_IDS_TO_PROCESS[:] = [args.video_id]
+        print(f"ℹ️  Video filter enabled: {args.video_id}")
 
     run_segmentation(quality_filter=args.quality, create_visualization=create_viz)

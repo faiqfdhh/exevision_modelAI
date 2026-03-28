@@ -215,6 +215,24 @@ class MultiModalRepDataset(Dataset):
         if np.random.rand() < 0.10:
             channel = int(np.random.randint(0, x.shape[1]))
             x[:, channel] = 0.0
+
+        # Time warping: resample at ±15% speed, then re-pad/truncate to original length.
+        # Simulates squats performed at different tempos; teaches the BiLSTM that tempo
+        # should not change the quality score.
+        if np.random.rand() < 0.50:
+            T = x.shape[0]
+            warp = float(np.random.uniform(0.85, 1.15))
+            new_len = max(10, int(round(T * warp)))
+            old_idx = np.linspace(0, T - 1, new_len)
+            x = np.stack(
+                [np.interp(old_idx, np.arange(T), x[:, c]) for c in range(x.shape[1])],
+                axis=-1,
+            ).astype(np.float32)
+            if new_len >= T:
+                x = x[:T]
+            else:
+                x = np.concatenate([x, np.repeat(x[-1:], T - new_len, axis=0)], axis=0)
+
         return x
 
     def _augment_stgcn(self, seq: np.ndarray) -> np.ndarray:
@@ -472,7 +490,7 @@ def evaluate_stgcn(model: STGCNScorer, loader: DataLoader, device: torch.device)
     with torch.no_grad():
         for batch in loader:
             batch = to_device(batch, device)
-            out = model(batch["stgcn"])
+            out = model(batch["stgcn"], batch["heuristic"][:, 10:15])
             spatial_pred = torch.stack([out["depth"], out["forward_lean"], out["knee_tracking"]], dim=1)
             aux_pred = torch.stack(
                 [
@@ -526,7 +544,7 @@ def evaluate_fusion(
         for batch in loader:
             batch = to_device(batch, device)
             b_out = bilstm(batch["bilstm"])
-            s_out = stgcn(batch["stgcn"])
+            s_out = stgcn(batch["stgcn"], batch["heuristic"][:, 10:15])
             pred, residual = fusion(batch["heuristic"], s_out["embedding"], b_out["embedding"])
 
             weights = batch["weight"]
@@ -605,7 +623,7 @@ def train_phase_stgcn(
         losses: List[float] = []
         for batch in train_loader:
             batch = to_device(batch, device)
-            out = model(batch["stgcn"])
+            out = model(batch["stgcn"], batch["heuristic"][:, 10:15])
 
             spatial_pred = torch.stack([out["depth"], out["forward_lean"], out["knee_tracking"]], dim=1)
             aux_pred = torch.stack(
@@ -705,7 +723,7 @@ def train_phase_fusion(
             batch = to_device(batch, device)
 
             b_out = bilstm(batch["bilstm"])
-            s_out = stgcn(batch["stgcn"])
+            s_out = stgcn(batch["stgcn"], batch["heuristic"][:, 10:15])
             pred, residual = fusion(batch["heuristic"], s_out["embedding"], b_out["embedding"])
 
             weights = batch["weight"]
@@ -770,9 +788,11 @@ def train_optional_joint(
 
     params = list(bilstm.parameters()) + list(stgcn.parameters()) + list(fusion.parameters())
     optimizer = torch.optim.Adam(params, lr=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.5)
 
     best = float("inf")
     worsening = 0
+    early_stop_patience = 8  # was 3 — gives the joint phase breathing room to find a minimum
     for epoch in range(1, epochs + 1):
         bilstm.train()
         stgcn.train()
@@ -783,7 +803,7 @@ def train_optional_joint(
             batch = to_device(batch, device)
 
             b_out = bilstm(batch["bilstm"])
-            s_out = stgcn(batch["stgcn"])
+            s_out = stgcn(batch["stgcn"], batch["heuristic"][:, 10:15])
             pred, corr = fusion(batch["heuristic"], s_out["embedding"], b_out["embedding"])
 
             l_fusion = ((pred - batch["human_score"]) ** 2).mean()
@@ -823,9 +843,13 @@ def train_optional_joint(
             optimizer.step()
             losses.append(float(loss.item()))
 
-        val_loss, _, _ = evaluate_fusion(bilstm, stgcn, fusion, val_loader, device)
+        val_loss, mean_abs_res, std_res = evaluate_fusion(bilstm, stgcn, fusion, val_loader, device)
+        scheduler.step(val_loss)
         train_loss = float(np.mean(losses)) if losses else float("inf")
-        print(f"[Phase4] epoch={epoch:03d} train={train_loss:.5f} val={val_loss:.5f}")
+        print(
+            f"[Phase4] epoch={epoch:03d} train={train_loss:.5f} val={val_loss:.5f} "
+            f"|res|={mean_abs_res:.3f} res_std={std_res:.3f} lr={optimizer.param_groups[0]['lr']:.2e}"
+        )
 
         if val_loss < best:
             best = val_loss
@@ -841,8 +865,8 @@ def train_optional_joint(
             )
         else:
             worsening += 1
-            if worsening >= 3:
-                print("[Phase4] Early stopping triggered (validation worsened 3 consecutive epochs).")
+            if worsening >= early_stop_patience:
+                print(f"[Phase4] Early stopping: no improvement for {early_stop_patience} epochs. Stopping at epoch {epoch}.")
                 break
 
 
@@ -866,7 +890,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs-bilstm", type=int, default=20)
     parser.add_argument("--epochs-stgcn", type=int, default=20)
     parser.add_argument("--epochs-fusion", type=int, default=60)
-    parser.add_argument("--epochs-joint", type=int, default=8)
+    parser.add_argument("--epochs-joint", type=int, default=15)
 
     parser.add_argument("--lr-bilstm", type=float, default=5e-4)
     parser.add_argument("--lr-stgcn", type=float, default=5e-4)
@@ -929,7 +953,7 @@ def main() -> None:
         batch = to_device(batch, device)
         with torch.no_grad():
             bo = bilstm(batch["bilstm"])
-            so = stgcn(batch["stgcn"])
+            so = stgcn(batch["stgcn"], batch["heuristic"][:, 10:15])
             pred, corr = fusion(batch["heuristic"], so["embedding"], bo["embedding"])
         print(
             "Dry-run shapes:",
