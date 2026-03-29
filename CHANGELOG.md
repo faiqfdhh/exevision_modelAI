@@ -5,6 +5,40 @@
 
 ---
 
+## Session 2026-03-29 — Feedback Reliability Hotfix (Cloud Run)
+
+**Focus:** Resolve production "No feedback data in result_json" behavior and align docs/deployment assumptions with live Cloud Run runtime.
+
+**What was done:**
+
+1. **Backend fallback feedback payload** (`apps/api/pipeline.py`):
+   - Added schema-compatible fallback `feedback` object when merged reps exist but narrative config files are missing.
+   - Prevents `result.feedback = null` in done-state responses.
+
+2. **Feedback config build guardrails** (`Dockerfile`):
+   - Added build-time assertions for:
+     - `/app/core/exevision/config/exercises/squat.json`
+     - `/app/core/exevision/config/templates/feedback_templates.json`
+   - Build now fails early if required feedback config files are absent.
+
+3. **Cloud Build naming alignment** (`cloudbuild.yaml`):
+   - Updated substitutions to match live service naming:
+     - `_IMAGE_NAME: exevision-modelai`
+     - `_SERVICE_NAME: exevision-modelai`
+
+4. **Live runtime diagnosis captured (from Cloud Run logs):**
+   - `neural_available=True` with `has_feedback=False` traced to missing feedback config files in container runtime.
+   - Callback persistence also failed when callback URL pointed to localhost (`connection refused` from Cloud Run context).
+
+5. **Web integration gotchas documented:**
+   - `result_json` shape handling (`payload.result` vs full envelope) must be explicit in frontend parsing.
+   - Rep selector should align feedback by `rep_id` and only render narrative on `status === 'done'`.
+
+**Behavioral note:**
+- Current API policy is non-fatal for Stage 9 failures (returns fallback-capable responses and surfaces neural state via `result.neural_available`).
+
+---
+
 ## Session 2026-03-29 — GCR Deployment + Runtime Bug Fixes
 
 **Focus:** Containerize and deploy the FastAPI inference server to Google Cloud Run. Found and fixed several runtime bugs surfaced during containerization.

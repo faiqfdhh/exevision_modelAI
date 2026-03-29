@@ -223,6 +223,97 @@ def _find_json(base: Path, pattern: str) -> Path | None:
     matches = sorted(base.rglob(pattern))
     return matches[0] if matches else None
 
+
+def _build_phase_timeline(
+    seg_rep: dict,
+    rep_idx: int,
+    all_seg_reps: list[dict],
+    fps: float,
+    frame_count: int,
+) -> dict[str, Any] | None:
+    """
+    Build a phase timeline for one rep, including idle phases inferred from gaps.
+
+    Timeline origin is the start of the idle-before window (or rep.start_frame for
+    the first rep when the video begins immediately with movement). All times are in
+    seconds relative to that origin — so the chart x-axis always starts at 0.
+
+    Returns None if inputs are missing or fps is invalid.
+    """
+    if not seg_rep or fps <= 0:
+        return None
+
+    rep_start = int(seg_rep.get("start_frame", 0))
+    rep_end = int(seg_rep.get("end_frame", 0))
+
+    # Idle-before: from previous rep's end+1 (or frame 0 for the first rep) to rep start-1
+    prev_end = int(all_seg_reps[rep_idx - 1].get("end_frame", 0)) + 1 if rep_idx > 0 else 0
+    idle_before_start = prev_end
+    idle_before_end = rep_start - 1
+
+    # Idle-after: from rep end+1 to next rep's start-1 (or video end for the last rep)
+    next_start = int(all_seg_reps[rep_idx + 1].get("start_frame", frame_count)) if rep_idx < len(all_seg_reps) - 1 else frame_count
+    idle_after_start = rep_end + 1
+    idle_after_end = next_start - 1
+
+    # t=0 is the beginning of the idle-before window
+    origin = idle_before_start
+
+    def to_s(frame: int) -> float:
+        return round((frame - origin) / fps, 3)
+
+    phases: list[dict] = []
+    eccentric_s = isometric_s = concentric_s = 0.0
+
+    idle_before_frames = max(0, idle_before_end - idle_before_start + 1)
+    if idle_before_frames > 0:
+        phases.append({
+            "phase": "idle",
+            "start_s": to_s(idle_before_start),
+            "end_s": to_s(idle_before_end + 1),
+            "duration_s": round(idle_before_frames / fps, 3),
+        })
+
+    for phase in seg_rep.get("phases", []):
+        ptype = phase.get("phase_type", "unknown")
+        pstart = int(phase.get("start_frame", rep_start))
+        pend = int(phase.get("end_frame", rep_end))
+        dur = round(phase.get("duration_seconds", (pend - pstart + 1) / fps), 3)
+        phases.append({
+            "phase": ptype,
+            "start_s": to_s(pstart),
+            "end_s": to_s(pend + 1),
+            "duration_s": dur,
+        })
+        if ptype == "eccentric":
+            eccentric_s = dur
+        elif ptype == "isometric":
+            isometric_s = dur
+        elif ptype == "concentric":
+            concentric_s = dur
+
+    idle_after_frames = max(0, idle_after_end - idle_after_start + 1)
+    if idle_after_frames > 0:
+        phases.append({
+            "phase": "idle",
+            "start_s": to_s(idle_after_start),
+            "end_s": to_s(idle_after_end + 1),
+            "duration_s": round(idle_after_frames / fps, 3),
+        })
+
+    return {
+        "fps": fps,
+        "phases": phases,
+        "summary": {
+            "eccentric_s": eccentric_s,
+            "isometric_s": isometric_s,
+            "concentric_s": concentric_s,
+            "idle_before_s": round(idle_before_frames / fps, 3),
+            "idle_after_s": round(idle_after_frames / fps, 3),
+            "tempo_ratio": round(eccentric_s / concentric_s, 2) if concentric_s > 0 else None,
+        },
+    }
+
 def _tier_for_score(score: float) -> str:
     """Map numeric score to feedback tier labels expected by the frontend."""
     if score >= 85.0:
@@ -275,18 +366,20 @@ def _build_feedback_fallback(merged_reps: list[dict[str, Any]]) -> dict[str, Any
 
 def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
     """
-    Locate Stage 8 (heuristic) and Stage 9 (neural) output JSONs and merge them
-    into a single normalized result dict for the web app.
+    Locate Stage 8 (heuristic), Stage 9 (neural), and Stage 5 (segmentation) output
+    JSONs and merge them into a single normalized result dict for the web app.
     """
     import json
-    
+
     print(f"[DIAGNOSTIC] collect_results START: video_id={video_id}, workspace={workspace_root}", flush=True)
 
     aqa_base = workspace_root / "squat" / "aqa_analysis_simple"
     neural_base = workspace_root / "squat" / "neural_analysis"
+    seg_base = workspace_root / "squat" / "segmented_reps"
 
     aqa_file = _find_json(aqa_base, f"{video_id}_aqa_simple.json")
     neural_file = _find_json(neural_base, f"{video_id}_neural.json")
+    seg_file = _find_json(seg_base, f"{video_id}_segmented.json")
 
     if aqa_file is None:
         raise FileNotFoundError(
@@ -295,14 +388,21 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
 
     aqa = json.loads(aqa_file.read_text(encoding="utf-8"))
     neural = json.loads(neural_file.read_text(encoding="utf-8")) if neural_file else None
+    seg = json.loads(seg_file.read_text(encoding="utf-8")) if seg_file else None
 
     # Build rep-level merged list
     aqa_reps: list[dict] = aqa.get("repetitions", [])
     neural_reps: list[dict] = (neural or {}).get("reps", [])
     neural_by_id = {r["rep_id"]: r for r in neural_reps}
 
+    # Phase timeline data (from Stage 5 segmentation)
+    seg_reps: list[dict] = (seg or {}).get("repetitions", [])
+    seg_by_id = {r["rep_id"]: r for r in seg_reps}
+    seg_fps = (seg or {}).get("info", {}).get("fps", 30.0)
+    seg_frame_count = (seg or {}).get("info", {}).get("frame_count", 0)
+
     merged_reps = []
-    for r in aqa_reps:
+    for rep_idx, r in enumerate(aqa_reps):
         rid = r.get("rep_id")
         nr = neural_by_id.get(rid, {})
         h_score = r.get("score", {}).get("overall_score")
@@ -337,6 +437,18 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
             if spatial_vals:
                 stgcn_score = round(sum(spatial_vals) / len(spatial_vals), 2)
 
+        # Phase timeline from Stage 5 segmentation (optional)
+        seg_rep = seg_by_id.get(rid)
+        phase_timeline = None
+        if seg_rep:
+            phase_timeline = _build_phase_timeline(
+                seg_rep,
+                rep_idx,
+                seg_reps,
+                fps=seg_fps,
+                frame_count=seg_frame_count,
+            )
+
         merged_reps.append({
             "rep_id": rid,
             "start_frame": r.get("start_frame"),
@@ -360,6 +472,7 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
                 "knee_tracking": nr.get("knee_tracking"),
             } if nr else None,
             "safety_clamps": nr.get("safety_clamps_applied", []),
+            "phase_timeline": phase_timeline,
         })
 
     neural_scores = [r["neural_score"] for r in merged_reps if r["neural_score"] is not None]
