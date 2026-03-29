@@ -1,0 +1,38 @@
+# Dev artifacts and training data (not needed at runtime)
+training_dataset/
+_hidden_legacy/
+squat/
+pipeline_ui_runs/
+
+# Model training checkpoints (keep only finetuned inference models)
+models/bilstm_pretrained.pt
+models/stgcn_pretrained.pt
+models/stgcn_pretrained_encoder.pt
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE and OS artifacts
+.idea/
+.vscode/
+*.DS_Store
+*.log
+
+# Git
+.git/
+.gitignore
+
+# Docs and test artifacts
+docs/
+tests/
+*.md
