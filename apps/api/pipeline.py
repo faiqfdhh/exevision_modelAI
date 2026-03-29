@@ -223,6 +223,55 @@ def _find_json(base: Path, pattern: str) -> Path | None:
     matches = sorted(base.rglob(pattern))
     return matches[0] if matches else None
 
+def _tier_for_score(score: float) -> str:
+    """Map numeric score to feedback tier labels expected by the frontend."""
+    if score >= 85.0:
+        return "excellent"
+    if score >= 75.0:
+        return "strong"
+    if score >= 60.0:
+        return "okay"
+    if score >= 40.0:
+        return "needs_work"
+    return "focus_here"
+
+def _build_feedback_fallback(merged_reps: list[dict[str, Any]]) -> dict[str, Any]:
+    """Create a schema-compatible fallback when template/config files are unavailable."""
+    rep_payload: list[dict[str, Any]] = []
+    rep_scores: list[float] = []
+
+    for rep in merged_reps:
+        score_val = rep.get("neural_score")
+        if score_val is None:
+            score_val = rep.get("heuristic_score")
+        score = float(score_val if score_val is not None else 0.0)
+        rep_scores.append(score)
+        rep_payload.append(
+            {
+                "rep_id": rep.get("rep_id"),
+                "score": round(score, 2),
+                "tier": _tier_for_score(score),
+                "text": "Coaching baseline: detailed narrative template is unavailable in this deployment, but scoring data is valid.",
+                "wins": [],
+                "issues": [],
+            }
+        )
+
+    avg_score = round(sum(rep_scores) / len(rep_scores), 2) if rep_scores else 0.0
+    return {
+        "schema_version": "1.0",
+        "exercise": "squat",
+        "reps": rep_payload,
+        "session": {
+            "avg_score": avg_score,
+            "trajectory": "stable",
+            "most_improved_metric": None,
+            "persistent_issue": None,
+            "aggregate_text": "Detailed coaching template unavailable in this deployment.",
+            "coach_text": "Scoring completed successfully. Narrative templates are temporarily unavailable.",
+        },
+    }
+
 
 def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
     """
@@ -420,6 +469,19 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
                 "exercise": "squat",
                 "error": f"Feedback generation skipped: {exc}",
             }
+    elif merged_reps:
+        logger.warning(
+            "[pipeline] Feedback config missing; returning schema-compatible fallback payload. "
+            "exercise_config=%s templates_config=%s",
+            exercise_config_exists,
+            templates_config_exists,
+        )
+        feedback_payload = _build_feedback_fallback(merged_reps)
+        print(
+            f"[DIAGNOSTIC] Fallback feedback generated: {len(feedback_payload.get('reps', []))} reps "
+            f"(exercise_config={exercise_config_exists}, templates_config={templates_config_exists})",
+            flush=True,
+        )
     else:
         # Log why we skip feedback generation
         if not exercise_config_exists:

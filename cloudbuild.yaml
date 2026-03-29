@@ -31,8 +31,8 @@ steps:
 
 substitutions:
   _REGION: asia-southeast1
-  _IMAGE_NAME: exevision-api
-  _SERVICE_NAME: exevision-api
+  _IMAGE_NAME: exevision-modelai
+  _SERVICE_NAME: exevision-modelai
 
 options:
   logging: CLOUD_LOGGING_ONLY

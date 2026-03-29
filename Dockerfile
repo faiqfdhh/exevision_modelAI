@@ -32,6 +32,11 @@ RUN pip install --no-cache-dir -r requirements-runtime.txt
 # Copy source tree (training_dataset/, _hidden_legacy/, etc. excluded by .dockerignore)
 COPY . .
 
+# Ensure feedback narrative config files are always present in the runtime image.
+# If these are missing, API responses will omit `result.feedback`.
+RUN test -f /app/core/exevision/config/exercises/squat.json
+RUN test -f /app/core/exevision/config/templates/feedback_templates.json
+
 # ── Runtime configuration ─────────────────────────────────────────────────────
 # GCR injects PORT; default to 8000 for local docker run
 ENV PORT=8000
