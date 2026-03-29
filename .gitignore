@@ -8,5 +8,9 @@ venv
 png
 *.png
 *.txt
+!requirements-runtime.txt
 
 pipeline_ui_runs/
+CLAUDE.md
+CHANGELOG.md
+Faiqs SRD.md
