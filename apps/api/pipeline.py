@@ -230,6 +230,8 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
     into a single normalized result dict for the web app.
     """
     import json
+    
+    print(f"[DIAGNOSTIC] collect_results START: video_id={video_id}, workspace={workspace_root}", flush=True)
 
     aqa_base = workspace_root / "squat" / "aqa_analysis_simple"
     neural_base = workspace_root / "squat" / "neural_analysis"
@@ -317,18 +319,30 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
     any_corrections = any(r.get("anchor_correction_applied", False) for r in merged_reps)
 
     feedback_payload = None
+    
+    # === Diagnostic logging (forcing output for GCR visibility) ===
+    exercise_config_exists = FEEDBACK_EXERCISE_CONFIG.exists()
+    templates_config_exists = FEEDBACK_TEMPLATES_CONFIG.exists()
+    merged_reps_count = len(merged_reps)
+    
+    print(f"[DIAGNOSTIC] Feedback prereqs: exercise_config={exercise_config_exists} ({FEEDBACK_EXERCISE_CONFIG}), templates={templates_config_exists} ({FEEDBACK_TEMPLATES_CONFIG}), merged_reps={merged_reps_count}", flush=True)
     logger.info(
         "[pipeline] Feedback config check — exercise_config exists: %s, templates exists: %s, merged_reps: %d",
-        FEEDBACK_EXERCISE_CONFIG.exists(),
-        FEEDBACK_TEMPLATES_CONFIG.exists(),
-        len(merged_reps),
+        exercise_config_exists,
+        templates_config_exists,
+        merged_reps_count,
     )
-    if FEEDBACK_EXERCISE_CONFIG.exists() and FEEDBACK_TEMPLATES_CONFIG.exists() and merged_reps:
+    
+    if exercise_config_exists and templates_config_exists and merged_reps:
+        print(f"[DIAGNOSTIC] All prereqs met. Initializing FeedbackEngine...", flush=True)
         try:
+            print(f"[DIAGNOSTIC] Loading exercise config from: {FEEDBACK_EXERCISE_CONFIG}", flush=True)
+            print(f"[DIAGNOSTIC] Loading templates from: {FEEDBACK_TEMPLATES_CONFIG}", flush=True)
             feedback_engine = FeedbackEngine(
                 exercise_config_path=str(FEEDBACK_EXERCISE_CONFIG),
                 templates_path=str(FEEDBACK_TEMPLATES_CONFIG),
             )
+            print(f"[DIAGNOSTIC] FeedbackEngine initialized successfully", flush=True)
             feedback_input: list[dict[str, Any]] = []
             for rep in merged_reps:
                 metric_scores = rep.get("metric_scores") or {}
@@ -358,7 +372,9 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
                     }
                 )
 
+            print(f"[DIAGNOSTIC] Built feedback_input for {len(feedback_input)} reps. Calling generate_feedback...", flush=True)
             feedback_result = feedback_engine.generate_feedback(feedback_input, video_id=video_id)
+            print(f"[DIAGNOSTIC] generate_feedback returned successfully with {len(feedback_result.reps)} reps", flush=True)
             feedback_payload = {
                 "schema_version": feedback_result.schema_version,
                 "exercise": feedback_result.exercise,
@@ -382,6 +398,7 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
                     "coach_text": feedback_result.session.coach_text,
                 },
             }
+            print(f"[DIAGNOSTIC] Feedback payload built successfully: {len(feedback_payload['reps'])} reps, trajectory={feedback_payload['session']['trajectory']}", flush=True)
             logger.info(
                 "[pipeline] Feedback generated successfully: %d rep(s), session trajectory=%s",
                 len(feedback_payload["reps"]),
@@ -389,19 +406,30 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
             )
         except Exception as exc:
             import traceback
+            tb_str = traceback.format_exc()
+            print(f"[DIAGNOSTIC] FeedbackEngine EXCEPTION: {type(exc).__name__}: {exc}", flush=True)
+            print(f"[DIAGNOSTIC] Traceback:\n{tb_str}", flush=True)
             logger.error(
                 "[pipeline] Feedback generation FAILED for video_id=%s: %s\n%s",
                 video_id,
                 exc,
-                traceback.format_exc(),
+                tb_str,
             )
             feedback_payload = {
                 "schema_version": "1.0",
                 "exercise": "squat",
                 "error": f"Feedback generation skipped: {exc}",
             }
+    else:
+        # Log why we skip feedback generation
+        if not exercise_config_exists:
+            print(f"[DIAGNOSTIC] Skipping feedback: exercise_config not found at {FEEDBACK_EXERCISE_CONFIG}", flush=True)
+        if not templates_config_exists:
+            print(f"[DIAGNOSTIC] Skipping feedback: templates_config not found at {FEEDBACK_TEMPLATES_CONFIG}", flush=True)
+        if not merged_reps:
+            print(f"[DIAGNOSTIC] Skipping feedback: no merged_reps to process (count={merged_reps_count})", flush=True)
 
-    return {
+    result = {
         "video_id": video_id,
         "view": aqa.get("view"),
         "quality": aqa.get("source_quality"),
@@ -415,6 +443,12 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
         "reps": merged_reps,
         "feedback": feedback_payload,
     }
+    
+    has_feedback = feedback_payload is not None and "error" not in (feedback_payload or {})
+    feedback_reps = len(feedback_payload.get("reps", [])) if has_feedback else 0
+    print(f"[DIAGNOSTIC] collect_results END: rep_count={result['rep_count']}, has_feedback={has_feedback}, feedback_reps={feedback_reps}, neural_available={result['neural_available']}", flush=True)
+    
+    return result
 
 
 # ── Top-level runner ───────────────────────────────────────────────────────────
@@ -447,6 +481,7 @@ def run_pipeline_sync(
     Called from a background thread/process by the API server.
     Returns the merged result dict.
     """
+    print(f"[DIAGNOSTIC] run_pipeline_sync START: job_id={job_id}, video={video_path.name}, stages={stages or 'default'}, mode={mode}", flush=True)
     stages = stages or DEFAULT_STAGES
     run_root = RUNS_ROOT / job_id
     workspace_root = run_root / "workspace"
@@ -500,4 +535,5 @@ def run_pipeline_sync(
     # Logs are retained for debugging; only the heavy intermediate files are removed.
     _cleanup_workspace(workspace_root)
 
+    print(f"[DIAGNOSTIC] run_pipeline_sync END: job_id={job_id}, rep_count={result['rep_count']}, has_feedback={result['feedback'] is not None}, neural_available={result['neural_available']}", flush=True)
     return result
