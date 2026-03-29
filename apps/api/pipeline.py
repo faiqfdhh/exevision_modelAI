@@ -317,6 +317,12 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
     any_corrections = any(r.get("anchor_correction_applied", False) for r in merged_reps)
 
     feedback_payload = None
+    logger.info(
+        "[pipeline] Feedback config check — exercise_config exists: %s, templates exists: %s, merged_reps: %d",
+        FEEDBACK_EXERCISE_CONFIG.exists(),
+        FEEDBACK_TEMPLATES_CONFIG.exists(),
+        len(merged_reps),
+    )
     if FEEDBACK_EXERCISE_CONFIG.exists() and FEEDBACK_TEMPLATES_CONFIG.exists() and merged_reps:
         try:
             feedback_engine = FeedbackEngine(
@@ -376,7 +382,19 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
                     "coach_text": feedback_result.session.coach_text,
                 },
             }
+            logger.info(
+                "[pipeline] Feedback generated successfully: %d rep(s), session trajectory=%s",
+                len(feedback_payload["reps"]),
+                feedback_payload["session"]["trajectory"],
+            )
         except Exception as exc:
+            import traceback
+            logger.error(
+                "[pipeline] Feedback generation FAILED for video_id=%s: %s\n%s",
+                video_id,
+                exc,
+                traceback.format_exc(),
+            )
             feedback_payload = {
                 "schema_version": "1.0",
                 "exercise": "squat",

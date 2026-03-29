@@ -24,6 +24,7 @@ Usage
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -63,6 +64,7 @@ from pipeline import (
 # Set INFERENCE_API_SECRET in both services' environment variables.
 _API_SECRET = os.environ.get("INFERENCE_API_SECRET", "")
 _bearer = HTTPBearer(auto_error=False)
+logger = logging.getLogger(__name__)
 
 
 def _verify_secret(
@@ -165,6 +167,39 @@ class JobStatus(BaseModel):
     error: str | None = None
 
 
+# ── Callback helper ───────────────────────────────────────────────────────────
+def _fire_callback(callback_url: str, payload: dict[str, Any]) -> None:
+    """
+    POST the job result to the Next.js callback endpoint.
+    Includes the Authorization header required by callback/route.ts.
+    Failures are logged but never propagate — the job result is already
+    persisted in the in-memory store and returned via /jobs/{job_id}.
+    """
+    import httpx
+
+    headers = {"Content-Type": "application/json"}
+    if _API_SECRET:
+        headers["Authorization"] = f"Bearer {_API_SECRET}"
+
+    try:
+        with httpx.Client(timeout=15) as client:
+            resp = client.post(callback_url, json=payload, headers=headers)
+        if resp.status_code >= 400:
+            logger.warning(
+                "[callback] POST to %s returned HTTP %s — result may not be persisted in DB.",
+                callback_url,
+                resp.status_code,
+            )
+        else:
+            logger.info("[callback] POST to %s succeeded (HTTP %s).", callback_url, resp.status_code)
+    except Exception as exc:
+        logger.warning(
+            "[callback] POST to %s failed (network error): %s — result not persisted via callback.",
+            callback_url,
+            exc,
+        )
+
+
 # ── Background task ────────────────────────────────────────────────────────────
 def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, callback_url: str | None) -> None:
     """Downloads the video and runs the full pipeline. Runs in a background thread."""
@@ -198,11 +233,7 @@ def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, ca
 
         # Fire-and-forget callback to Next.js / Supabase if requested
         if callback_url:
-            try:
-                with httpx.Client(timeout=10) as client:
-                    client.post(callback_url, json={"job_id": job_id, "status": "done", "result": result})
-            except Exception:
-                pass  # Callback failure must not affect job status
+            _fire_callback(callback_url, {"job_id": job_id, "status": "done", "result": result})
 
     except Exception as exc:
         completed_at = datetime.now(timezone.utc).isoformat()
@@ -213,11 +244,7 @@ def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, ca
             completed_at=completed_at,
         )
         if callback_url:
-            try:
-                with httpx.Client(timeout=10) as client:
-                    client.post(callback_url, json={"job_id": job_id, "status": "failed", "error": str(exc)})
-            except Exception:
-                pass
+            _fire_callback(callback_url, {"job_id": job_id, "status": "failed", "error": str(exc)})
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
