@@ -278,7 +278,102 @@ Adding new templates:
 
 ---
 
-## 15. Out of Scope
+## 15. Deterministic Phrase Selection
+
+Template libraries contain multiple phrases per slot (e.g., 2 win phrases, 3 improvement phrases). To keep text **varied but repeatable** without generative AI:
+
+**Rule:** Select phrase index using a hash of the composite key modulo the phrase count.
+
+```python
+import hashlib
+
+def select_phrase(phrases: list[str], video_id: str, rep_id: int, metric_key: str) -> str:
+    key = f"{video_id}:{rep_id}:{metric_key}"
+    hash_int = int(hashlib.md5(key.encode()).hexdigest(), 16)
+    return phrases[hash_int % len(phrases)]
+```
+
+**Properties:**
+- Same `video_id + rep_id + metric_key` always produces the same phrase (repeatable — no surprise on page refresh)
+- Different videos, reps, or metrics produce different phrases (varied across context)
+- No randomness, no generative AI, fully deterministic
+- Applied in `template_renderer.py` for all phrase lists: `win_phrases`, `improvement_phrases`, `trajectory_openers`
+
+---
+
+## 16. Quality Checks & Fallback Mode
+
+Handles **tone-content mismatch** when overall score and sub-metrics disagree.
+
+### Case 1: Overall score low, all sub-metrics ≥ 75
+- Neural fusion detected a quality issue the rule-based metrics didn't capture
+- **Behaviour:** Use the overall score tier for tone opener (poor/critical), but suppress specific issue coaching cues since sub-metrics don't support them
+- **Fallback text:** Append: *"The system detected concerns with the overall movement quality it couldn't pinpoint to a specific metric. Consider reviewing the full rep video."*
+- **Signal that wins:** Overall score (trust the fusion)
+
+### Case 2: Overall score ≥ 75, sub-metrics below threshold
+- Rules detected specific faults the fusion didn't penalise heavily
+- **Behaviour:** Use the overall score tier for tone opener (good/excellent), but still surface the sub-metric issues with **softened urgency**
+- **Softened language:** Replace "Work on..." with "Something to keep in mind:..." for issues when overall score ≥ 75
+- **Signal that wins:** Sub-metrics win for content; overall score wins for tone
+
+### Case 3: Both agree (normal case)
+- Overall score and sub-metrics consistently indicate same quality level
+- Standard feedback flow applies; no fallback needed
+
+### Mismatch Detection
+```python
+def detect_mismatch(overall_score: float, sub_scores: dict[str, float], threshold: float = 75) -> str:
+    any_issue = any(v < threshold for v in sub_scores.values())
+    if overall_score < threshold and not any_issue:
+        return "low_overall_no_issues"
+    if overall_score >= threshold and any_issue:
+        return "high_overall_has_issues"
+    return "normal"
+```
+
+---
+
+## 17. Schema Versioning
+
+All config files and the output payload carry a `schema_version` field to ensure web app and API compatibility as configs evolve.
+
+### Exercise Config (`exercises/squat.json`)
+```json
+{
+  "schema_version": "1.0",
+  "exercise": "squat",
+  ...
+}
+```
+
+### Template Library (`templates/feedback_templates.json`)
+```json
+{
+  "schema_version": "1.0",
+  "improvement_phrases": { ... },
+  ...
+}
+```
+
+### FeedbackResult Payload
+```python
+@dataclass
+class FeedbackResult:
+    schema_version: str          # e.g., "1.0"
+    exercise: str
+    reps: list[RepFeedback]
+    session: SessionSummary
+```
+
+### Versioning Rules
+- **Patch (1.0 → 1.1):** New phrase variants added, no structural change — backwards compatible
+- **Minor (1.0 → 1.1 → 2.0 breaking):** New required fields in config or output — bump to `2.0`
+- Web app should check `schema_version` on `FeedbackResult` and display a graceful degradation message if it receives an unexpected version
+
+---
+
+## 18. Out of Scope
 
 - Visual evidence GIFs (3-frame extraction) — separate concern, deferred
 - Edge mode real-time feedback — deferred

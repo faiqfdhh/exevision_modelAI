@@ -1,18 +1,24 @@
 # CLAUDE.MD — ExeVision AI Project Knowledge Base
 
-_Last updated: 2026-03-21 (Step 2 fusion architecture overhauled; correction collapse diagnosed and fixed; new best evaluation snapshot recorded)_
+_Last updated: 2026-03-29 (Neural anchor bug fixed; three-judge scoring model; disk optimization; feedback template system designed)_
 
 ---
 
-## 0) Latest Status (2026-03-21 — Current)
+## 0) Latest Status (2026-03-29 — Current)
 
-ExeVision AI is in **late prototyping / early pre-production** state for squat analysis. The production pipeline is operational and actively used (50+ runs documented in `pipeline_ui_runs/`). Core workflow is UI-driven via `pipeline_ui/app.py` with two active tabs: **Inference** (traditional pipeline orchestration) and **Annotation** (human scoring tool for dataset collection).
+ExeVision AI remains in **late prototyping / early pre-production** for squat analysis, but the repository has now entered a **structure migration phase**. The codebase was reorganized to improve long-term deployment readiness while preserving existing capabilities.
 
-**Key components:** `scripts/2.5` (pose extraction) → `scripts/4` (view classification) → `scripts/5` (temporal segmentation with strict phase sequencing as of 2026-03-17) → `scripts/8` (rule-based AQA scoring). All stages are routed through `pipeline_ui/app.py`, which manages isolated workspaces, logging, and preview rendering.
+**Current top-level structure (new):**
+- `apps/` — application layer (`desktop-ui/`, `api/` inference server, `web/` scaffold)
+- `core/` — modularized code scaffold under `core/exevision/` (`stages`, `neural`, `training`, `analysis`, `rules`, `config`)
+- `adapters/` — compatibility bridge (`adapters/legacy-cli/`)
+- `models/` — model/checkpoint artifacts
+- `training_dataset/` — centralized training/annotation dataset artifacts
+- `_hidden_legacy/` — archived legacy layout and historical runtime artifacts
 
-**Annotation ecosystem** reached maturity on 2026-03-15 with async batch processing, continuous severity scales (0–5), per-video JSON storage, and heuristic bias-hiding.
+**Operational note:** legacy runtime folders and historical artifacts were moved under `_hidden_legacy/` during cleanup. New scaffolded paths under `apps/` and `core/` now exist and are the intended future canonical structure.
 
-**Step 2 (Neural Fusion) — major improvement recorded 2026-03-21.** A correction collapse bug in `HeuristicGuidedFusion` was diagnosed and fixed: the prior model was applying a near-constant −0.4 point offset regardless of input (residual std ≈ 0.05). After architecture and training changes (see §12 and Appendix A), the model now learns genuine per-rep corrections (residual std ≈ 14–15) and achieves:
+**Step 2 (Neural Fusion) — major improvement recorded 2026-03-21 (unchanged):** A correction collapse bug in `HeuristicGuidedFusion` was diagnosed and fixed: the prior model was applying a near-constant −0.4 point offset regardless of input (residual std ≈ 0.05). After architecture and training changes (see §12 and Appendix A), the model now learns genuine per-rep corrections (residual std ≈ 14–15) and achieves:
 
 | Metric | Before fix | After fix | Δ |
 |---|---|---|---|
@@ -23,7 +29,51 @@ ExeVision AI is in **late prototyping / early pre-production** state for squat a
 | Failure cases (>\|20\|) | 4 | **0** | −4 |
 | vs linear baseline MAE | 10.39 (neural was worse) | **9.28 beats linear** | ✅ |
 
-Integration into `pipeline_ui/app.py` inference flow remains pending.
+Integration of fully modularized runtime paths into the new `apps/` + `core/` structure remains in progress.
+
+---
+
+## Quick Start
+
+### Launch Desktop UI
+```bash
+python apps/desktop-ui/app.py
+```
+
+### Launch Inference API Server (for web app integration)
+```bash
+python -m pip install -r apps/api/requirements.txt
+
+# PowerShell (Windows):
+$env:INFERENCE_API_SECRET="your-secret"; python -m uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
+# bash/Linux:
+INFERENCE_API_SECRET=your-secret python -m uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
+
+# Health check: curl http://localhost:8000/health
+# Submit job:   curl -X POST http://localhost:8000/infer -H "Authorization: Bearer your-secret" \
+#               -d '{"video_url":"<url>","job_id":"<uuid>"}'
+```
+
+### Run Training (Step 2 Neural)
+```bash
+# Fine-tune all phases (BiLSTM → ST-GCN → Fusion)
+python core/exevision/training/finetune_models.py
+# Evaluate on test split → writes results/evaluation_report.json
+python core/exevision/training/evaluate_model.py
+```
+
+### Annotation Quality Check
+```bash
+python core/exevision/analysis/analyze_annotations.py
+```
+
+### Environment
+- **Python:** 3.10+ recommended (MediaPipe may require <3.12 on some builds)
+- **Key packages:** `mediapipe`, `torch`, `torchvision`, `opencv-python`, `numpy`, `scipy` (no `requirements.txt` yet — see §9)
+- **MediaPipe model:** `models/pose_landmarker_heavy.task` must be present before running Stage 2.5
+- **Dataset videos:** `squat/dataset_videos_all/` (not tracked in git; required for pipeline runs)
+
+> **Note:** `adapters/legacy-cli/run_stage.py` is currently broken post-migration (points to deleted `scripts/` paths — see §9 issue #8). Use `apps/desktop-ui/app.py` or invoke stage scripts from `core/exevision/stages/` directly.
 
 ---
 
@@ -34,9 +84,11 @@ Integration into `pipeline_ui/app.py` inference flow remains pending.
 **Domain:** AI-assisted exercise form analysis (current focus: squat)  
 **Core approach:** MediaPipe pose extraction + rule-based biomechanical analysis + stage-wise pipeline orchestration.
 
-This repository is a practical implementation of a multi-stage human movement analysis pipeline, with both:
-- **Production-style modular code** under `src/` (stages 1–3 integrated), and
-- **Script-driven full pipeline** under `scripts/` + `pipeline_ui/` (stages through scoring/analytics).
+This repository is now organized around a migration target architecture:
+- **Application layer** under `apps/` (desktop UI and future web app)
+- **Core modular logic** under `core/exevision/`
+- **Compatibility adapters** under `adapters/`
+- **Archived legacy runtime** under `_hidden_legacy/` for reference and rollback
 
 ---
 
@@ -63,50 +115,52 @@ Symbolic rule engine (currently active) + learned temporal scorer (BiLSTM; plann
 
 ## 3) Production vs Legacy: Active Components
 
-### ✅ PRODUCTION (Active, Deployed)
+### ✅ ACTIVE RUNTIME (During Migration)
 
-**Core pipeline (stages):**
-- `scripts/2.5_extract_selected_features.py` — MediaPipe pose extraction + quality gating
-- `scripts/4_classify_views.py` — Visibility-based view classification (front/back/side/front_side/back_side/unknown) [Latest: 2026-03-07]
-- `scripts/5_temporal_segmentation.py` — FSM phase segmentation with strict legal sequences [Latest: 2026-03-17]
-- `scripts/8_scoring.py` — Rule-based AQA scoring and metrics [Latest: 2026-03-11]
+**Core pipeline logic (canonical scaffold paths):**
+- `core/exevision/stages/extract_selected_features.py` — MediaPipe pose extraction + quality gating
+- `core/exevision/stages/classify_views.py` — Visibility-based view classification
+- `core/exevision/stages/temporal_segmentation.py` — FSM phase segmentation with strict legal sequences
+- `core/exevision/stages/scoring.py` — Rule-based AQA scoring and metrics
+- `core/exevision/stages/neural_fusion_inference.py` — Neural fusion stage (Step 9)
 
 **UI & Orchestration:**
-- `pipeline_ui/app.py` — Dual-tab Tkinter runner (Inference + Annotation) [Latest: 2026-03-15]
-  - `PipelineRunnerUI` class: traditional dataset/single-video pipeline execution with preview
-  - `AnnotationToolUI` class: folder-based rep annotation with bias-blind heuristic reveal
+- `apps/desktop-ui/app.py` — current desktop UI scaffold (Inference + Annotation flow)
+- `apps/api/main.py` — FastAPI inference server (HTTP wrapper for web app integration)
+- `apps/api/pipeline.py` — pipeline execution logic used by the API server
+- `adapters/legacy-cli/launch_pipeline_ui.py` — compatibility launcher
+- `adapters/legacy-cli/run_stage.py` — compatibility stage runner
 
-**Annotation Ecosystem:**
-- `scripts/select_annotation_samples.py` [NEW 2026-03-11] — Strategic rep subset selection
-- `scripts/analyze_annotations.py` [NEW 2026-03-11] — Annotation quality self-check (correlation, disagreement stats)
-- `dataset/annotations/index.json` [NEW 2026-03-11] — Master list of all annotated videos + global stats
-- `dataset/annotations/videos/{video_id}.json` — Per-video annotation file with all reps, human scores, and flags
+**Annotation/Data Ecosystem:**
+- `core/exevision/analysis/select_annotation_samples.py` — strategic rep subset selection
+- `core/exevision/analysis/analyze_annotations.py` — annotation quality self-check
+- `training_dataset/annotations/index.json` — master annotation list + stats
+- `training_dataset/annotations/videos/{video_id}.json` — per-video annotation files
 
-**Evidence:** 50+ runs in `pipeline_ui_runs/`; heavy daily use through March 2026
+**Historical evidence:** 50+ runs preserved in `_hidden_legacy/pipeline_ui_runs/`
 
-### ⚠️ LEGACY / EXPERIMENTAL (Rarely Used)
+### ⚠️ LEGACY / ARCHIVED
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| `src/` (modular pipeline) | Medium | Stages 1–3 clean; stages 4–7 remain placeholders. Not actively invoked by UI. |
-| `squat_analysis/` | Active reference | Dedicated AQA module with microprograms; maintained separately from `scripts/8_scoring.py`. |
-| `rule_based_programs_sample/` | Reference only | Diving AQA; completely separate exercise domain. |
-| `scripts/1, 2, 3, 5.5, 5.6, 7` | Superseded | Pre-dating refactored stages 2.5/4/5/8. Some visualization utilities still useful. |
-| Old feature folders | Deprecated | `extracted_features/`, `extracted_features1/` replaced by `extracted_features_clean/` with quality tiers. |
-| `analyze_results.py` | Snapshot-only | Exists in historical run workspaces but not tracked in source tree. |
+| `_hidden_legacy/2026-03-28/folders/src/` | Archived | Previous modular pipeline reference snapshot. |
+| `_hidden_legacy/2026-03-28/folders/rule_based_programs_sample/` | Archived | Reference-only diving AQA snapshot. |
+| `_hidden_legacy/2026-03-28/scripts/` | Archived | Superseded scripts moved for cleanup visibility. |
+| `_hidden_legacy/pipeline_ui/`, `_hidden_legacy/scripts/`, `_hidden_legacy/squat/` | Archived runtime snapshot | Preserved for rollback/reference while migration finalizes. |
+| `_hidden_legacy/pipeline_ui_runs/` | Historical artifacts | Legacy run evidence retained. |
 
 ### Key Fragmentation Points
 
-1. **Parallel code paths:** `src/` (modular, clean) vs. `scripts/` (operational, actively maintained)
-2. **Missing dependency manifest:** No `requirements.txt`, `pyproject.toml`, or `setup.py` versioning
-3. **Path coupling:** Scripts assume fixed relative paths; onboarding friction
-4. **Artifact drift:** Some runtime expectations rely on historical workspace snapshots
+1. **Migration rewiring pending:** some runtime references still assume old path contracts.
+2. **Missing dependency manifest:** no finalized `requirements.txt`/`pyproject.toml` lock strategy yet.
+3. **Path coupling risk:** legacy assumptions need full migration to centralized config in `core/exevision/config/`.
+4. **Dual-state complexity:** both scaffolded new structure and archived legacy snapshot currently coexist.
 
 ---
 
 ## 4) Current Production Flow
 
-The UI (`pipeline_ui/app.py`) is the single entry point for all production workloads. It provides two tabs for different workflows:
+The desktop UI flow is transitioning to `apps/desktop-ui/app.py`, while legacy orchestration references are preserved under `_hidden_legacy/`; two-tab workflows (Inference + Annotation) remain the operating model.
 
 ### **Inference Tab: Full Pipeline Execution**
 
@@ -148,7 +202,7 @@ User picks folder → async background scan for processed videos
   ├─ Display current rep with dual videos (raw + visualized)
   ├─ User scores 0–100 + optional flags (F1–F6 shortcuts) + confidence + notes
   ├─ Heuristic score hidden until submission → revealed with Δ disagreement
-  ├─ Save to dataset/annotations/videos/{video_id}.json
+  ├─ Save to training_dataset/annotations/videos/{video_id}.json
   └─ Auto-advance to next rep (or next unannotated video)
 
 Batch mode (multi-select):
@@ -159,11 +213,11 @@ Batch mode (multi-select):
 
 **Auto-Pipeline:** If video lacks existing pipeline outputs, annotation tab spawns stages 2.5/4/5/8 in an isolated workspace (does not interfere with existing runs).
 
-**Data Format:** Each annotated video produces `dataset/annotations/videos/{video_id}.json` with:
+**Data Format:** Each annotated video produces `training_dataset/annotations/videos/{video_id}.json` with:
 - Video metadata (source, view, quality, FPS)
 - Per-rep: rep ID, start/end frames, duration, phases, heuristic metrics, human score, human flags, severity scales (0–5), confidence, notes
 
-**Annotation Index:** Master `dataset/annotations/index.json` tracks all annotated videos, totals, and summary statistics.
+**Annotation Index:** Master `training_dataset/annotations/index.json` tracks all annotated videos, totals, and summary statistics.
 
 ---
 
@@ -296,9 +350,9 @@ Segmented Reps JSON + Phase Videos (segmented_reps/, visualized_segmentation/)
   ↓ [Stage 8]
 AQA Scores JSON (aqa_analysis_simple/{quality}/)
   ↓ [Annotation Tab]
-Per-Video Annotation JSON (dataset/annotations/videos/{video_id}.json)
+Per-Video Annotation JSON (training_dataset/annotations/videos/{video_id}.json)
   +
-Master Index JSON (dataset/annotations/index.json)
+Master Index JSON (training_dataset/annotations/index.json)
 ```
 
 ### Annotation File Format (Per-Video JSON)
@@ -351,38 +405,62 @@ Master Index JSON (dataset/annotations/index.json)
 
 ## 7) Workspace Inventory
 
-### Core Authored Code
+### Active Code (post-migration canonical paths)
 
-- **`src/`**: Modular pipeline package (stages 1–3 clean; 4–7 placeholders)
-  - `config.py`, `pose_extractor.py`, `view_classifier.py`, `temporal_segmenter.py`, `main.py`
-- **`scripts/`**: Operational script stages (actively maintained)
-  - `2.5_extract_selected_features.py` — MediaPipe pose + quality gating
-  - `4_classify_views.py` — Visibility-based view classification
-  - `5_temporal_segmentation.py` — FSM phase segmentation + strict sequencing
-  - `8_scoring.py` — Rule-based AQA scoring
-  - `select_annotation_samples.py` [NEW 2026-03-11] — Rep subset selection for annotation
-  - `analyze_annotations.py` [NEW 2026-03-11] — Annotation quality self-check
-  - Legacy: `1`, `2`, `3`, `5.5`, `5.6`, `7` (visualization utilities, superseded stages)
-- **`pipeline_ui/`**: Tkinter UI runner
-  - `app.py` — Dual-tab interface (Inference + Annotation)
-- **`squat_analysis/`**: Dedicated squat AQA module (maintained separately)
-  - `aqa_metaProgram_squat.py`, `scoring_functions.py`
-- **`rule_based_programs_sample/`**: Diving AQA reference (separate exercise domain)
+**Application Layer (`apps/`):**
+- `apps/desktop-ui/app.py` — Tkinter dual-tab UI (Inference + Annotation)
+  - `PipelineRunnerUI` — Stage orchestration, run management, preview
+  - `AnnotationToolUI` — Video browser, rep-by-rep scoring, batch processing
+- `apps/api/main.py` — FastAPI inference server (web app integration)
+  - `POST /infer` — accept video URL + job_id, run pipeline in background
+  - `GET /jobs/{job_id}` — poll status + retrieve result JSON
+  - `GET /health` — model/stage readiness check
+- `apps/api/pipeline.py` — pipeline execution logic (mirrors desktop UI subprocess flow)
+- `apps/api/requirements.txt` — API-only dependencies (`fastapi`, `uvicorn`, `httpx`, `pydantic`)
+- `apps/web/INTEGRATION_PROMPT.md` — full integration spec for the Next.js web app agent
+
+**Pipeline Stages (`core/exevision/stages/`):**
+- `extract_selected_features.py` — MediaPipe pose extraction + quality gating (Stage 2.5)
+- `classify_views.py` — Visibility-based view classification (Stage 4)
+- `temporal_segmentation.py` — FSM phase segmentation + strict sequencing (Stage 5)
+- `scoring.py` — Rule-based AQA scoring (Stage 8)
+- `neural_fusion_inference.py` — Neural fusion inference (Stage 9)
+
+**Neural Models (`core/exevision/neural/`):**
+- `nn_models.py` — PyTorch model classes (`BiLSTMScorer`, `STGCNScorer`, `HeuristicGuidedFusion`)
+- `nn_utils.py` — Skeleton graph, sequence utilities, adjacency matrix
+
+**Training & Evaluation (`core/exevision/training/`):**
+- `finetune_models.py` — Phased fine-tuning orchestrator (BiLSTM → ST-GCN → Fusion)
+- `evaluate_model.py` — Test evaluation → `results/evaluation_report.json`
+- `pretrain_bilstm.py` — BiLSTM masked reconstruction pretraining
+- `pretrain_stgcn.py` — ST-GCN masked reconstruction pretraining
+
+**Analysis Tools (`core/exevision/analysis/`):**
+- `select_annotation_samples.py` — Strategic rep subset selection for annotation
+- `analyze_annotations.py` — Annotation quality self-check
+
+**Compatibility Adapters (`adapters/legacy-cli/`):**
+- `launch_pipeline_ui.py` — Legacy launcher shim
+- `run_stage.py` — Stage runner CLI (**currently broken** — points to deleted `scripts/` paths; see §9 #8)
 
 ### Data & Artifacts
 
-- `squat/dataset_videos_all/` — Raw dataset videos
-- `models/pose_landmarker_heavy.task` — MediaPipe model file
-- `pipeline_ui_runs/` — Historical run folders (~50 documented runs)
-  - Each run: `workspace/` (isolated), `logs/` (per-stage), `stage_outputs/` (archival snapshots)
-- **`dataset/annotations/`** [NEW 2026-03-11] — Centralized annotation store
+- `squat/dataset_videos_all/` — Raw dataset videos (not tracked in git)
+- `models/pose_landmarker_heavy.task` — MediaPipe Pose Landmarker v2 heavy model
+- `models/*.pt` — Neural checkpoints (pretrained + finetuned; see §11 artifacts list)
+- `training_dataset/annotations/` — Centralized annotation store
   - `index.json` — Master list + global stats
   - `videos/{video_id}.json` — Per-video annotation files
+- `training_dataset/splits.json` — Persisted train/val/test video split
+- `_hidden_legacy/pipeline_ui_runs/` — Historical run folders (~50 documented runs)
 
 ### Documentation
 
-- `README.md`, `pipeline_ui/README.md`, `squat_analysis/README.md`, `progress.md`
-- No `requirements.txt`, `pyproject.toml`, or `setup.py` (infrastructure gap)
+- `README.md` — Project overview
+- `progress.md` — Roadmap & milestone tracking
+- `CHANGELOG.md` — Historical session logs (archived from Appendix A, 2026-03-28)
+- No `requirements.txt`, `pyproject.toml`, or `setup.py` (infrastructure gap — see §9 #2)
 
 ---
 
@@ -395,22 +473,22 @@ Master Index JSON (dataset/annotations/index.json)
 - ✅ Pipeline UI with run management, logging, preview, and dual tabs
 - ✅ Annotation tool with async batch processing, bias-blind UI, and per-video JSON storage
 - ✅ 50+ documented production runs
-- ✅ Annotation data ecosystem (`select_annotation_samples.py`, `analyze_annotations.py`, `dataset/annotations/`)
-- ✅ Step 2 neural infrastructure scripts implemented (`nn_models.py`, `finetune_models.py`, `evaluate_model.py`, `nn_utils.py`, `pretrain_bilstm.py`, `pretrain_stgcn.py`)
+- ✅ Annotation data ecosystem (`core/exevision/analysis/`, `training_dataset/annotations/`)
+- ✅ Step 2 neural infrastructure implemented (`core/exevision/neural/`, `core/exevision/training/`)
 - ✅ Step 2 phased fine-tuning executed and checkpoints saved (`bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt`)
 - ✅ Step 2 evaluation pipeline executed with report artifact (`results/evaluation_report.json`)
 - ✅ Step 2 correction collapse diagnosed and fixed (2026-03-21): fusion now learns per-rep residuals (std ≈ 14–15 vs prior 0.05), beating linear baseline on MAE for the first time (9.28 vs 10.39)
 
 ### Partially Complete / Fragmented
 
-- ⚠️ Two parallel code paths: `src/` (modular, clean) vs. `scripts/` (operational, actively maintained)
-- ⚠️ Stage 4–7 in `src/main.py` remain placeholders vs. full operational script pipeline
+- ⚠️ Migration rewiring: `adapters/legacy-cli/run_stage.py` still points to deleted `scripts/` paths (broken — see §9 #8)
+- ✅ `apps/desktop-ui/app.py` wiring to `core/exevision/stages/` — fixed 2026-03-28: removed `_detect_runtime_root()`, hardcoded `STAGES_DIR = WORKSPACE_ROOT / "core" / "exevision" / "stages"`
 - ⚠️ `analyze_results.py` exists only in historical run workspaces, not in source tree
 
 ### Not Yet Realized (vs Stated Ambition)
 
-- ❌ BiLSTM/ST-GCN/fusion inference integrated into production UI orchestration path
-- ❌ Symbolic + neural fused scoring exposed as first-class runtime mode in `pipeline_ui/app.py`
+- ✅ Neural fusion inference (Stage 9) integrated into API pipeline (`apps/api/pipeline.py` `DEFAULT_STAGES`) — live since 2026-03-28
+- ⚠️ Neural fusion NOT yet integrated into desktop UI (`apps/desktop-ui/app.py`) — desktop still runs heuristic-only
 - ❌ Fully reproducible environment manifest (requirements.txt/pyproject.toml)
 - ⏳ Human annotation dataset scale-up — tooling exists; current Step 2 run used 147 reps (train=121, test=26), still sparse for robust extreme-score generalization
 
@@ -420,13 +498,16 @@ Master Index JSON (dataset/annotations/index.json)
 
 ### Active Issues
 
-1. **Pipeline divergence:** `src/` and `scripts/` may drift; plan mid-term unification
+1. **Pipeline divergence:** legacy `src/` snapshot archived; `core/exevision/stages/` is canonical. `apps/desktop-ui/app.py` wiring fixed 2026-03-28 (`STAGES_DIR` hardcoded). `apps/api/pipeline.py` already wired correctly. Remaining risk: `adapters/legacy-cli/run_stage.py` still broken (see #8).
 2. **Missing dependency manifest:** Onboarding and reproducibility risk
 3. **File-path coupling:** Scripts assume fixed relative paths
 4. **Step 2 integration gap:** Neural scorer exists as standalone scripts but is not yet wired into production inference tab
 5. **Dataset scale and distribution risk:** Current test set is 26 reps with no 0–20 bucket coverage; generalization to poor-form squats remains unvalidated
 6. **Per-metric prediction weakness:** Smoothness/control are reasonable (MAE ~10), but depth/lean/knee-tracking MAE remains high (~24) — ST-GCN Phase 2 converges but the spatial signal is inherently noisy on diagonal views
 7. **Stage 5 sensitivity tuning:** Shallow-rep detection threshold balance remains iterative across dataset
+8. **`adapters/legacy-cli/run_stage.py` is broken post-migration:** Maps stage keys to `scripts/*.py` paths that were deleted during the 2026-03-28 restructure (moved to `core/exevision/stages/`). The adapter will fail at runtime with "Stage script not found". Requires rewiring to point to `core/exevision/stages/` before the CLI is usable.
+9. **`extract_selected_features.py` silent exit-0 on failure:** When all videos fail processing, `run_extraction()` returns normally without calling `sys.exit(1)` (line 1624). The stage subprocess exits 0, so `_run_stage` in `apps/api/pipeline.py` does not raise — the pipeline silently continues with empty `extracted_features_clean/` directories. Downstream stages then fail with misleading errors (e.g., "Features JSON not found" from the scoring stage). Fix: add `sys.exit(1)` when `len(errors) == len(video_paths)` (all failed), or validate output directory non-empty in `run_pipeline_sync()` after each stage.
+10. **`extract_selected_features.py` error message truncated to 100 chars:** Line 1581 prints `error[:100]` — the full exception traceback (stored in `error_details`) is never logged. When diagnosing extraction failures via `pipeline_ui_runs/{job_id}/logs/extract_selected_features.log`, the root cause is cut off. Run the stage script directly with the `.venv` Python against the failing workspace to see the full traceback.
 
 ### Recently Resolved (✓ Fixed)
 
@@ -438,19 +519,21 @@ Master Index JSON (dataset/annotations/index.json)
 | Shallow-squat detection | 2026-03-17 | Low-motion thresholds + strict phase sequencing + transition auto-repair |
 | **Step 2 correction collapse** | **2026-03-21** | **Removed L1 reg + orphaned confidence head; unfroze encoders with diff LR; tanh×40 bounded residual. Pre-clamp MAE dropped from 11.98 → 9.28; beats linear baseline; 0 failure cases.** |
 | **Linear baseline parity** | **2026-03-21** | **Pre-clamp MAE 9.28 now beats linear (10.39); neural is earning its complexity.** |
+| **Neural heuristic anchor always 0 at inference** | **2026-03-29** | **Two-layer fix: (1) `neural_fusion_inference.py` `process_video()` was reading only the segmentation JSON, which has no `heuristic_score` — AND the AQA lookup searched `aqa_analysis_simple/{quality_tier}/` but Stage 8 writes to `aqa_analysis_simple/{source_quality}/{score_tier}/` where source_quality differs (e.g. `unknown` vs `raw_unfiltered`). Fixed by searching the whole `aqa_analysis_simple/` tree. (2) Added defensive correction in `pipeline.py` `collect_results()`: if `|neural - heuristic| > 40` (impossible with tanh×40), re-anchors the score at `heuristic + clamp(deviation, -40, 40)`.** |
 
-### Maturity by Layer (as of 2026-03-21)
+### Maturity by Layer (as of 2026-03-29)
 
 - **Data processing pipeline:** Strongly progressed (end-to-end stages fully integrated)
 - **Stage 4 (view classification):** Robust (visibility-based + nose-vs-hip Z-depth)
 - **Stage 5 (temporal segmentation):** Improved (strict sequencing + transition repair)
 - **Stage 8 (scoring/AQA):** Improved (per-leg depth, Z-drift false-negative fixed)
+- **Stage 9 (neural fusion inference):** Working — integrated into API pipeline; anchor bug fixed; three-judge output (BiLSTM/ST-GCN/Heuristic) added
 - **Annotation tooling:** High maturity (async batch, bias-blind, continuous severity scales)
 - **Step 2 training/evaluation tooling:** Improved — fusion architecture fixed, per-rep corrections working, beats linear baseline
-- **Step 2 production integration:** Pending (not yet part of UI runtime path)
+- **Step 2 production integration:** API pipeline live (Stage 9 in `DEFAULT_STAGES`); desktop UI still heuristic-only
 - **Modular package (`src`):** Medium (clean stages 1–3; later placeholders)
-- **Ops/productization:** Medium (good UI; missing lock file)
-- **Roadmap completion:** Partial (symbolic active; dataset collection in progress; neural inference integration pending)
+- **Ops/productization:** Medium (good UI + API server; missing lock file)
+- **Roadmap completion:** Partial (symbolic active; dataset collection in progress; neural inference live in API, pending in desktop UI)
 
 ### Run History Evidence
 
@@ -467,7 +550,8 @@ From `pipeline_ui_runs/` (50 runs documented):
 ## 10) Next Milestones
 
 ### Immediate (Ongoing)
-1. **Integrate Step 2 neural inference into `pipeline_ui/app.py`** — expose explicit mode switch (heuristic-only vs neural-fused) in the Inference tab; use saved checkpoints (`bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt`) for live prediction
+1. **Wire `apps/api/` into the Next.js web app** — ✅ integration implemented and first end-to-end test run completed (2026-03-28). Web app successfully submits jobs and receives results via callback. Fix extraction silent-exit bug (#9 above) so pipeline failures surface cleanly.
+2. **Integrate Step 2 neural inference into `pipeline_ui/app.py`** — expose explicit mode switch (heuristic-only vs neural-fused) in the Inference tab; use saved checkpoints (`bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt`) for live prediction
 2. **Expand annotations in 20–60 score range** — currently 51 reps in this range (out of 173 total); annotate 30+ more to cover poor-form squats and improve generalization of residual learning
 3. Port scoring/analysis stages into `src/` and extend `src/main.py` to full end-to-end parity
 
@@ -495,66 +579,74 @@ From `pipeline_ui_runs/` (50 runs documented):
 ## 11) File/Module Reference
 
 **UI & Orchestration:**
-- `pipeline_ui/app.py` — Dual-tab runner (Inference + Annotation)
+- `apps/desktop-ui/app.py` — Dual-tab UI runner (Inference + Annotation)
   - `PipelineRunnerUI` — Inference pipeline executor
   - `AnnotationToolUI` — Annotation folder browser & scorer
-- `pipeline_ui/README.md` — UI workflow documentation
+- `apps/api/main.py` — FastAPI inference server
+  - `POST /infer` — video URL + job_id → background pipeline run
+  - `GET /jobs/{job_id}` — poll status; `result` populated when `status=done`
+  - `GET /health` — stage scripts + model file readiness check
+  - Auth: `Authorization: Bearer {INFERENCE_API_SECRET}` (env var)
+  - **Gotcha:** inserts `apps/api/` into `sys.path` at import time so `from pipeline import ...` works when run as `uvicorn apps.api.main:app` from the project root (CWD is root, not `apps/api/`)
+- `apps/api/pipeline.py` — pipeline execution logic (no Tkinter; mirrors `app.py` subprocess flow)
+  - `run_pipeline_sync()` — runs all 5 stages, returns merged `AnalysisResult` dict
+  - `collect_results()` — merges Stage 8 AQA JSON + Stage 9 neural JSON
+  - `download_video()` — async download from Supabase signed URL
+- `apps/web/INTEGRATION_PROMPT.md` — full Next.js integration spec for the web app agent
 
-**Modular Pipeline (`src/`):**
-- `src/main.py` — Orchestrator entry point
-- `src/config.py` — Configuration & dataclasses
-- `src/pose_extractor.py` — Stage 1: Pose extraction
-- `src/view_classifier.py` — Stage 2: View classification
-- `src/temporal_segmenter.py` — Stage 3: Temporal segmentation
+**Compatibility Adapters:**
+- `adapters/legacy-cli/launch_pipeline_ui.py` — Legacy launcher
+- `adapters/legacy-cli/run_stage.py` — Stage runner CLI (**broken post-migration** — maps to deleted `scripts/` paths; see §9 #8)
 
-**Script Pipeline (`scripts/`):**
-- `scripts/2.5_extract_selected_features.py` — Pose extraction + quality gating
-- `scripts/4_classify_views.py` — View classification
-- `scripts/5_temporal_segmentation.py` — Phase segmentation + strict sequencing
-- `scripts/8_scoring.py` — AQA scoring
-- `scripts/select_annotation_samples.py` — Strategic rep selection for annotation
-- `scripts/analyze_annotations.py` — Annotation quality check
+**Pipeline Stages (`core/exevision/stages/`):**
+- `extract_selected_features.py` — Pose extraction + quality gating (Stage 2.5)
+- `classify_views.py` — View classification (Stage 4)
+- `temporal_segmentation.py` — Phase segmentation + strict sequencing (Stage 5)
+- `scoring.py` — AQA scoring (Stage 8)
+- `neural_fusion_inference.py` — Neural fusion inference (Stage 9)
 
-**Step 2 Neural Infrastructure (`scripts/`):**
-- `scripts/nn_models.py` — Shared PyTorch modules for fine-tuning and inference
+**Neural Models (`core/exevision/neural/`):**
+- `nn_models.py` — Shared PyTorch modules
   - `BiLSTMScorer`: temporal encoder + smoothness/control heads
   - `STGCNScorer`: 5-block ST-GCN encoder + 3 spatial heads + 4 auxiliary heuristic-raw heads
-  - `HeuristicGuidedFusion`: heuristic-anchored gated residual model (`final = clamp(heuristic + tanh(residual_head) × 40, 0, 100)`); confidence head removed 2026-03-21
+  - `HeuristicGuidedFusion`: heuristic-anchored gated residual (`final = clamp(heuristic + tanh(residual_head) × 40, 0, 100)`)
   - `build_heuristic_vector()`: 15D vector contract
   - `apply_safety_clamps()`: post-prediction rule caps
-- `scripts/finetune_models.py` — End-to-end supervised fine-tuning orchestrator
-  - Index-gated annotation loading from `dataset/annotations/index.json`
+- `nn_utils.py` — Shared sequence and skeleton utilities
+  - Active-joint graph (11 joints), adjacency matrix construction
+  - ST-GCN rep extraction and normalization contract
+  - Fixed length pad/truncate
+
+**Training & Evaluation (`core/exevision/training/`):**
+- `finetune_models.py` — End-to-end supervised fine-tuning orchestrator
+  - Index-gated annotation loading from `training_dataset/annotations/index.json`
   - Video-level stratified split by score bucket (seed 42)
   - Sample weighting: confidence × inverse-bucket
   - Training phases: BiLSTM → ST-GCN → Fusion (+ optional joint phase 4)
-- `scripts/evaluate_model.py` — Test evaluation and report generation
+- `evaluate_model.py` — Test evaluation and report generation
   - Primary metrics on post-clamp predictions
   - Pre-clamp diagnostics
   - Baselines: heuristic-only and linear regression on heuristic vector
   - Output report: `results/evaluation_report.json`
-- `scripts/nn_utils.py` — Shared sequence and skeleton utilities
-  - Active-joint graph (11 joints), adjacency matrix construction
-  - ST-GCN rep extraction and normalization contract
-  - Fixed length pad/truncate
-- `scripts/pretrain_bilstm.py` — BiLSTM encoder pretraining (masked reconstruction)
-- `scripts/pretrain_stgcn.py` — ST-GCN encoder pretraining (masked reconstruction)
+- `pretrain_bilstm.py` — BiLSTM encoder pretraining (masked reconstruction)
+- `pretrain_stgcn.py` — ST-GCN encoder pretraining (masked reconstruction)
 
-**Squat AQA Module:**
-- `squat_analysis/aqa_metaProgram_squat.py` — Orchestrator
-- `squat_analysis/scoring_functions.py` — Rule-based scoring logic
-- `squat_analysis/README.md` — Module documentation
+**Analysis Tools (`core/exevision/analysis/`):**
+- `select_annotation_samples.py` — Strategic rep selection for annotation
+- `analyze_annotations.py` — Annotation quality check
 
 **Annotation Data:**
-- `dataset/annotations/index.json` — Master annotation list + stats
-- `dataset/annotations/videos/{video_id}.json` — Per-video annotation files
+- `training_dataset/annotations/index.json` — Master annotation list + stats
+- `training_dataset/annotations/videos/{video_id}.json` — Per-video annotation files
 
 **Project Docs:**
 - `README.md` — Root project overview
 - `progress.md` — Roadmap & milestone tracking
-- `CLAUDE.MD` — This file
+- `CHANGELOG.md` — Historical development session logs
+- `CLAUDE.md` — This file
 
 **Current Step 2 Artifacts:**
-- `dataset/splits.json` — Persisted train/val/test video split
+- `training_dataset/splits.json` — Persisted train/val/test video split
 - `models/bilstm_pretrained.pt` — BiLSTM pretraining checkpoint
 - `models/stgcn_pretrained.pt` — ST-GCN pretraining checkpoint
 - `models/stgcn_pretrained_encoder.pt` — ST-GCN encoder-only checkpoint
@@ -569,22 +661,59 @@ From `pipeline_ui_runs/` (50 runs documented):
 
 ### 12.1 What Is Implemented
 
-Step 2 is implemented as a standalone training/evaluation stack under `scripts/` and is runnable in the current workspace. The flow is:
+Step 2 is implemented as a standalone training/evaluation stack under `core/exevision/training/` and is runnable in the current workspace. The flow is:
 
-1. Load indexed annotations from `dataset/annotations/index.json`.
+1. Load indexed annotations from `training_dataset/annotations/index.json`.
 2. Resolve per-video annotation JSON and features JSON.
 3. Build rep-level multimodal records (temporal signals + skeleton sequence + heuristic vector).
 4. Split by `video_id` using stratified score buckets.
 5. Train in phases (BiLSTM, then ST-GCN, then fusion).
 6. Evaluate on test split and write `results/evaluation_report.json`.
 
-Production wiring into `pipeline_ui/app.py` is not yet implemented.
+Production wiring into `apps/desktop-ui/app.py` is not yet implemented (neural inference only; heuristic pipeline is wired).
+
+### 12.0 Score Interpretation for Consumers (Web App / UI)
+
+`neural_score` **is** the fusion output — it is not a separate model. Formula:
+```
+neural_score = clamp(heuristic_score + tanh(residual_head(fused_encoding)) × 40,  0, 100)
+```
+The heuristic is the anchor; the neural model applies a correction of up to ±40 points based on what the BiLSTM + ST-GCN encoders detect that the rules miss.
+
+**Display contract for the web app (three-judge model):**
+
+The API returns three independent "judge" scores per rep, plus the fused overall:
+
+| Field | Judge | What it measures | Display as |
+|-------|-------|-----------------|-----------|
+| `neural_score` | Fusion (all three) | Best single number — heuristic-anchored + neural correction | **Primary score** ("Overall Score") |
+| `bilstm_score` | BiLSTM (temporal) | Average of smoothness + control — motion quality over time | "Temporal Judge" |
+| `stgcn_score` | ST-GCN (spatial) | Average of depth + forward lean + knee tracking — body geometry quality | "Spatial Judge" |
+| `heuristic_score` | Heuristic (rules) | Deterministic rule-based score from exact joint angles | "Rule-Based Judge" |
+| `sub_scores` | Per-dimension breakdown | Individual head outputs (smoothness, control, depth, lean, knee tracking) | Expandable detail under each judge |
+| `metrics` | Raw biomechanical measurements | Exact angles/ratios with targets | "Biomechanical Metrics" section |
+
+**Overall-level fields** (averaged across reps): `overall_neural_score`, `overall_bilstm_score`, `overall_stgcn_score`, `overall_heuristic_score`.
+
+**Recommended UI hierarchy:**
+1. **Top:** Overall fusion score (large, primary)
+2. **Three-judge panel:** BiLSTM | ST-GCN | Heuristic side-by-side (equal-weight visual)
+3. **Expandable:** Sub-scores under each judge (smoothness/control under BiLSTM, depth/lean/knee under ST-GCN, metric_scores under Heuristic)
+4. **Bottom:** Biomechanical metrics (raw numbers with target ranges)
+
+**Why the scores differ:** Each judge sees different aspects:
+- BiLSTM → temporal patterns (was the movement smooth and controlled?)
+- ST-GCN → spatial quality (was the body positioned correctly?)
+- Heuristic → exact geometry (angles, ratios, thresholds)
+- Fusion → weighted combination that anchors on heuristic and corrects with neural evidence
+
+**Defensive correction:** If `anchor_correction_applied` is true for a rep, the neural score was re-anchored (original broken value in `neural_score_raw`). The `any_anchor_corrections` flag at the top level signals a data-flow issue occurred.
 
 ### 12.2 Data Contract Used by Step 2
 
 #### Source-of-truth loading policy
-- Only videos listed in `dataset/annotations/index.json` are considered.
-- Per-video annotations are read from `dataset/annotations/videos/{video_id}.json`.
+- Only videos listed in `training_dataset/annotations/index.json` are considered.
+- Per-video annotations are read from `training_dataset/annotations/videos/{video_id}.json`.
 
 #### Per-rep fields consumed
 - `human_score` (required)
@@ -664,7 +793,7 @@ Production wiring into `pipeline_ui/app.py` is not yet implemented.
 
 ### 12.5 Safety Clamp Policy (Post-Fusion)
 
-Clamp rules currently applied in `scripts/nn_models.py`:
+Clamp rules currently applied in `core/exevision/neural/nn_models.py`:
 
 - If `knee_valgus` severity ≥ 2: score cap 60
 - If `forward_lean` severity ≥ 2: score cap 65
@@ -684,17 +813,66 @@ Primary metrics are computed on post-clamp scores, with pre-clamp metrics preser
 
 For rapid agent onboarding, inspect in this order:
 
-1. `CLAUDE.MD` §0, §12, §9, §10 (status, contracts, risks, next actions)
-2. `scripts/finetune_models.py` (training flow and split/weight policy)
-3. `scripts/nn_models.py` (model formulas and clamp policy)
-4. `scripts/evaluate_model.py` + `results/evaluation_report.json` (actual performance)
-5. `pipeline_ui/app.py` and §4 (what is production-wired vs standalone)
+1. `CLAUDE.md` §0, §12, §9, §10 (status, contracts, risks, next actions)
+2. `core/exevision/training/finetune_models.py` (training flow and split/weight policy)
+3. `core/exevision/neural/nn_models.py` (model formulas and clamp policy)
+4. `core/exevision/training/evaluate_model.py` + `results/evaluation_report.json` (actual performance)
+5. `apps/desktop-ui/app.py` and §4 (what is production-wired vs standalone)
 
 ---
 
 ## Appendix A: Chronological Session Changelog (Historical Development)
 
-_All day-to-day development notes preserved for reference. Latest session (2026-03-21, fusion fix) summarized in §0. See §5 for full production feature details._
+_Latest sessions kept here for quick reference. Older sessions archived to [CHANGELOG.md](CHANGELOG.md)._
+
+---
+
+### Session 2026-03-29 — Feedback Template System Designed
+
+**Focus:** Design the slot-based feedback generation system for rep-level and session-level coaching output.
+
+**What was done:**
+1. Reviewed SRD §4.3.4 (Decision Feedback Generation) — confirmed Dynamic Template Slot-Filling approach, no generative AI.
+2. Designed **Modular Feedback Engine** (Approach 2): exercise config layer + shared template library. Spec written to `docs/superpowers/specs/2026-03-29-feedback-template-design.md`.
+3. Key design decisions locked:
+   - **Tone-first:** Overall score dictates tone tier (5 brackets: excellent/good/fair/poor/critical)
+   - **Issue surfacing:** All sub-metrics below 75 surfaced; severity-banded (±5 rule groups same-urgency issues); predefined taxonomy groups related errors into one cue
+   - **Rep-relative progress tracking:** Each rep compares to previous (significant/moderate/slight tiers)
+   - **Positive reinforcement:** Wins called out for metrics ≥75 that improved; relative language only (no raw numbers)
+   - **Exercise-specific configs:** Each exercise has its own score brackets, metric thresholds, and issue group taxonomy
+   - **Deterministic phrase selection:** `hash(video_id:rep_id:metric_key) % len(phrases)` — varied but repeatable, no randomness
+   - **Quality check/fallback mode:** Handles mismatch between overall score and sub-metrics (two mismatch cases; defined which signal wins)
+   - **Schema versioning:** `schema_version` field in exercise config, template library, and FeedbackResult payload
+
+**New files/folders (design only — not yet implemented):**
+- `core/exevision/feedback/` — FeedbackEngine, RepComparator, SessionAggregator, TemplateRenderer
+- `core/exevision/config/exercises/squat.json` — squat exercise config
+- `core/exevision/config/templates/feedback_templates.json` — shared template library
+- `docs/superpowers/specs/2026-03-29-feedback-template-design.md` — full design spec
+
+---
+
+### Session 2026-03-28 — Web App Integration Live + Extraction Bug Discovery + Disk Optimization
+
+**Focus:** Wire `apps/api/` into the Next.js web app, achieve first end-to-end test, diagnose pipeline failure, and minimize per-run disk usage for hosting readiness.
+
+**What was done:**
+1. Fixed `apps/api/main.py` import bug: added `sys.path.insert(0, str(Path(__file__).parent))` so `from pipeline import ...` works when run as `uvicorn apps.api.main:app` from the project root (CWD is root, not `apps/api/`).
+2. Updated Quick Start commands in `CLAUDE.md` for Windows/PowerShell syntax (`python -m pip`, `$env:KEY="val"; python -m uvicorn ...`).
+3. Cross-checked the Next.js agent's integration plan against the API contract; identified 7 gaps (signed URL expiry, callback URL env var, polling specifics, error states, safety clamp messages, score color coding, `mode` field flow).
+4. First end-to-end test: web app submitted job → Python server received and processed → callback delivered `result_json` → web app displayed results.
+5. **Bug discovered:** `extract_selected_features.py` exits 0 even when all videos fail (line 1624 — no `sys.exit(1)`). Pipeline continues silently with empty feature directories; scoring stage produces misleading "Features JSON not found" error. Also: error message truncated to 100 chars at line 1581.
+6. Documented fusion score display contract: `neural_score` IS the fusion output (`heuristic + tanh(residual) × 40`). Web app should display it as the primary score; heuristic as secondary reference; `sub_scores` for motion quality breakdown; `metrics` for biomechanical explanation.
+7. **Disk optimization for API runs** (`apps/api/pipeline.py` only, no stage logic changed):
+   - Pass `--no-viz --no-report` to stage 2.5 (skips annotated MP4 + PNG plots — ~2.6 MB)
+   - Pass `--no-viz` to stage 5 (skips phase overlay MP4 — ~1.7 MB)
+   - Delete input video copy from workspace immediately after stage 2.5 completes (~1.2 MB)
+   - Call `_cleanup_workspace()` after `collect_results()` — removes feature JSONs, segmented reps, and any remaining intermediate dirs; retains logs + final result JSONs
+   - Net result: ~6.9 MB per run → ~25 KB per run (logs + 2 KB result JSONs)
+
+**Key bugs documented (not yet fixed):**
+- `extract_selected_features.py` line 1624: silent exit-0 on full-batch failure → see §9 issue #9
+- `extract_selected_features.py` line 1581: `error[:100]` truncation → see §9 issue #10
 
 ---
 
@@ -811,164 +989,7 @@ Three external reviews were collected and cross-validated against the actual cod
 
 ---
 
-### Session 2026-03-17 — Stage 5 Strict Sequencing + Annotation Controls
-
-**Part 1: Strict Phase Sequencing**  
-**Focus:** Force deterministic phase ordering while preserving shallow-squat detection.
-
-**What was built:**
-1. Enforced strict global adjacency in `scripts/5_temporal_segmentation.py` with sanitizer passes after `detect_phases()` and after `_enforce_minimum_durations()`
-2. Constrained legal cycle to: `idle -> eccentric -> [isometric] -> concentric -> idle`
-3. Restricted `isometric` entry to `eccentric -> isometric` only, requiring >1 second of stillness while knees remain bent
-4. Preserved shallow reps by reducing motion thresholds and lowering confirmation latency, while limiting anti-jitter merging to ultra-short flicker segments only
-5. Added explicit metadata reporting via `analysis_params.strict_phase_sequence` and `analysis_params.illegal_transition_repairs`
-
-**Part 2: Annotation Process Controls**  
-**Focus:** Make annotation processing mode-selectable and keep annotation labels safe during reprocess.
-
-**What was built:**
-1. Added extraction mode dropdown to Annotation tab with `Filtered` (default) and `Unfiltered (raw)` options
-2. Wired selected mode into stage 2.5 execution for both single-video and batch pipeline paths
-3. Changed **Reprocess Selected** semantics to preserve annotation JSON files, resetting only pipeline reference fields before re-running
-4. Updated status messaging to show active extraction mode while queueing jobs
-
----
-
-### Session 2026-03-15 — UI Polish & Batch Setup
-
-**Focus:** Vastly improve UI responsiveness, throughput efficiency, and data collection nuance in Annotation tool.
-
-**What was built:**
-1. **Multi-Video Batching:** Video listbox now supports extended selection; users can queue dozens of videos for sequential background processing
-2. **Async Folder Scanning:** Moved folder scanning to background thread; dropping thousands of videos no longer freezes UI on startup
-3. **Color-Coded Status UI:** Listbox auto-paints rows (green=processed, red=unprocessed, checkmark=annotated) via thread-safe callbacks
-4. **Indeterminate Progress:** Added `ttk.Progressbar` and success messagebox to indicate batch queue completion
-5. **Heuristic Reference Panel:** Exposed raw biomechanical metrics (Depth Ratio, Knee Angle, Valgus, Trunk Lean) on right side for annotator reference
-6. **Spectrum Severity Scaling:**
-   - Replaced binary checkboxes with 0–5 sliders for six biomechanical faults
-   - Removed mutually exclusive "Correct Form" flag (movement quality is spectrum, not binary)
-   - Intertwined sliders & checkboxes: dragging >0 auto-checks; unchecking snaps to 0
-7. **`analyze_annotations.py` Update:** Modified CLI to sum/average continuous severities instead of binary counts
-
----
-
-### Session 2026-03-11 (Part 1) — Annotation Tool Launch
-
-**Focus:** Design and implement human annotation tool in `pipeline_ui/app.py`.
-
-**What was built:**
-
-1. **`AnnotationToolUI` class** (entire new workflow in Notebook tab):
-   - Folder-based video browser with status markers (`✓` complete, `(2/3)` partial)
-   - Auto-detection of existing pipeline output (newest-first search in `pipeline_ui_runs/`)
-   - Auto-pipeline execution (stages 2.5→4→5→8) in background if no output exists
-   - Rep-by-rep video playback using visualization videos (safer than annotated overlays)
-   - Bias-blind scoring: heuristic hidden until human score submitted → revealed with Δ
-   - F1–F5 keyboard shortcuts for annotation flags
-   - Per-video JSON storage at `dataset/annotations/videos/{video_id}.json`
-   - `index.json` master list updated on every submit
-   - Resume support: reloads existing annotation files on video click
-
-2. **`scripts/select_annotation_samples.py`** (strategic rep subset selection):
-   - Priority 1: boundary reps (scores 45–55, 65–75, 80–90)
-   - Priority 2: view-stratified equal sampling
-   - Priority 3: score extremes (top + bottom)
-   - Priority 4: random fill
-   - Gracefully handles small pools
-
-3. **`scripts/analyze_annotations.py`** (quality self-check):
-   - Score distributions, human-heuristic correlation, disagreement stats
-   - Training-readiness warnings (correlation >0.95, variance <10, disagreement std <3, count <50)
-
-4. **`main()` modified** to use `ttk.Notebook` with two tabs: Inference (PipelineRunnerUI) and Annotation (AnnotationToolUI)
-
----
-
-### Session 2026-03-11 (Part 2) — Pipeline Path Fixes
-
-**Focus:** Restore end-to-end support for Unfiltered runs without changing downstream logic.
-
-**Root-cause diagnosis & fix:**
-
-**Issue: Pipeline path mismatch for raw BlazePose outputs**
-- **Symptom:** UI Unfiltered runs produced feature JSONs but stages 4/5/8 didn't discover them
-- **Cause:** Stage 2.5 writes unfiltered outputs to `raw_unfiltered/`, but stages 4/5/8 hardcoded discovery for quality-tier folders only
-- **Fix:** Added `raw_unfiltered` discovery/routing to all three downstream stages
-- **Scope:** Path discovery/routing only; no analysis logic changed
-
----
-
-### Session 2026-03-11 (Part 3) — Depth Metric Bug Fix
-
-**Focus:** Diagnose and fix squat depth false-negative in `scripts/8_scoring.py`.
-
-**Root-cause diagnosis & fix:**
-
-**Issue: `calculate_vertical_depth()` bilateral averaging bug**
-- **Symptom:** Video 49226_1 scored `squat_depth = -0.099`, `below_parallel = false` despite visible below-parallel squat
-- **Investigation:** All 71 rep frames showed negative bilateral average despite high confidence (hip 99.9%, knee 93.8%)
-- **Per-leg diagnosis at frame 47:**
-  - `L_Hip_Y: 0.8397, L_Knee_Y: 0.8134` → `L_Disp: +0.0263` ✅ (correct)
-  - `R_Hip_Y: 0.8429, R_Knee_Y: 0.8728` → `R_Disp: -0.0299` ❌ (Z-drift artifact on far side)
-  - Bilateral average: `-0.0018` (false negative)
-- **Root cause:** Diagonal/front-side camera view: farther knee's Z-depth projects into drifted 2D Y; high confidence ≠ accurate position
-- **Fix:** Per-leg independent computation; return `max()` of valid candidates; one valid leg sufficient
-- **Outcome:** Left leg correctly produces `+0.0263`; `below_parallel = true`; rep score now non-zero
-
----
-
-### Session 2026-03-07 — View Classification Robustness
-
-**Focus:** Fix view classification edge cases; robust phase recovery for temporal segmentation.
-
-**Root-cause analysis & fixes:**
-
-**Issue: Stage 4 diagonal ambiguity**
-- **Problem:** Visibility-based classifier could misclassify diagonals because MediaPipe hallucinates face landmarks even on back views
-- **Evidence:**
-  - Video 25728_1 (front-angled): face confidence 0.0 but remaining trackable → would be mistaken for back
-  - Video 25886_1 (truly back): nose + eyes at ~0.999 confidence (hallucination) but nose depth far behind hips (`nose_rel_z ≈ +0.392`)
-- **Root cause:** Face visibility/confidence = model certainty, not camera-facing geometry
-- **Fix:** Diagonal disambiguation via **nose-vs-hip Z-depth** instead of face confidence
-  - `nose_z < avg_hip_z` → `front_side` (nose physically closer to camera)
-  - `nose_z > avg_hip_z` → `back_side` (nose physically farther)
-- **Why:** Nose is anatomically front-facing; its depth relative to hip plane directly reveals subject orientation
-- **Validation:** Video 25886_1 now yields `back_side` with 60/60 frame votes
-
-**Issue: Stage 5 sequence robustness**
-- **Status:** Now uses strict sequence sanitation + explicit transition constraints (not startup normalization helpers)
-- **Behavior:** Illegal adjacency repaired in-place; `isometric` only from `eccentric` after sustained hold; shallow thresholds tuned for early eccentric capture
-- **Deployed:** In `scripts/5_temporal_segmentation.py`
-
----
-
-### Session 2026-03-05 — Visibility-Based View Refactor
-
-**Focus:** Improve robustness of view classification (stage 4) and pipeline continuity.
-
-**Changes:**
-
-1. **Stage 4 refactor** (`scripts/4_classify_views.py`):
-   - Replaced rotation-angle/facing-signal voting with **visibility-based frame classification**
-   - Eliminated hard fallback-to-`side`; returns `unknown` only when zero trackable frames
-   - Per-frame voting: face/eye/ear visibility + shoulder width → concrete label or `unknown`
-
-2. **Stage 5 update** (`scripts/5_temporal_segmentation.py`):
-   - Added `'unknown'` to `VALID_VIEWS` set
-   - Accepts all valid views including `unknown`; lets pose quality determine success
-   - No longer rejects on questionable view; gracefully degrades instead
-
-**Rationale:**
-- Old approach (Z-coordinate rotation): brittle on back views (MediaPipe hallucinates face)
-- New approach (visibility): intuitive & robust; "can I see the face?" is ground truth
-- Removing hard `side` fallback: bad data now honest (`unknown`) rather than hidden
-- Stage 5 graceful degradation: processes or fails based on actual pose quality, not view label semantics
-
-**Expected outcome:**
-- Pipeline continuity: stage 4 outputs concrete label or `unknown` (never surprises)
-- Diagnostic clarity: `unknown` signals poor frame tracking; stage 5 logs show actual failure points
-
----
+_Older sessions (2026-03-05 through 2026-03-17) archived to [CHANGELOG.md](CHANGELOG.md)._
 
 ## Appendix B: How to Update This Document
 
@@ -978,7 +999,7 @@ Three external reviews were collected and cross-validated against the actual cod
 3. Include root-cause analysis for any bug fixes (keep full technical detail)
 4. Update §0 "Latest Status" with current state snapshot (1–2 paragraphs)
 5. Update section headers' "Latest: YYYY-MM-DD" dates if relevant
-6. Keep all historical entries intact (no deletions)
+6. Keep the most recent 1–2 sessions here; move older entries to `CHANGELOG.md`
 
 **Sections that change rarely (no update needed unless major refactor):**
 - §1–3 (Project Identity, Vision, Production vs Legacy)
