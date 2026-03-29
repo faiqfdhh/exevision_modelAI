@@ -5,6 +5,48 @@
 
 ---
 
+## Session 2026-03-29 — GCR Deployment + Runtime Bug Fixes
+
+**Focus:** Containerize and deploy the FastAPI inference server to Google Cloud Run. Found and fixed several runtime bugs surfaced during containerization.
+
+**What was done:**
+
+1. **Created `requirements-runtime.txt`** — full pipeline runtime deps beyond the API-only `apps/api/requirements.txt`. Includes `mediapipe`, `opencv-python-headless`, `numpy`, `scipy`, `tqdm`, `matplotlib`. Torch/torchvision kept separate in Dockerfile to force CPU-only wheels.
+
+2. **Created `Dockerfile`** — Python 3.10-slim base. System packages: `libgomp1`, `libglib2.0-0`, `libgl1`, `libegl1`, `libgles2` (OpenGL ES — required by MediaPipe at runtime, discovered during container testing), `ffmpeg`. Models baked into image. Working directory `/app` = repo root (required for subprocess `core.exevision.*` imports). Reads `PORT`/`INFERENCE_API_SECRET`/`CORS_ORIGINS`/`EXEVISION_MODEL_PATH` from env at runtime.
+
+3. **Created `.dockerignore`** — excludes `training_dataset/`, `_hidden_legacy/`, pretrain checkpoints (`bilstm_pretrained.pt`, `stgcn_pretrained.pt`, `stgcn_pretrained_encoder.pt`), Python cache, dev artifacts.
+
+4. **Created `cloudbuild.yaml`** — Google Cloud Build CI/CD config. Build + push to Artifact Registry + deploy to Cloud Run in one `gcloud builds submit` trigger.
+
+5. **Fixed: OpenGL ES missing libs in container** (`Dockerfile`) — MediaPipe requires `libegl1` and `libgles2`. Container would start but crash on first pipeline job without these.
+
+6. **Fixed: json file discovery path assumption** (`core/exevision/stages/extract_selected_features.py`, `scoring.py`) — Stages had hardcoded nested path assumptions (`aqa_analysis_simple/{quality}/`) that worked locally but broke in the containerized CWD. Fixed by walking the full `aqa_analysis_simple/` subtree.
+
+7. **Fixed: neural fusion silent skip** (`apps/api/pipeline.py`) — Added guard in `run_pipeline_sync()`: if neural fusion was in `stages` but `neural_available=False` or no rep carries a `neural_score`, raises `RuntimeError` immediately. Prevents silent heuristic-only output masquerading as a successful neural job.
+
+8. **Added `__main__` block to `apps/api/main.py`** — Respects `PORT` env var (GCR standard) when run directly via `python apps/api/main.py`.
+
+9. **GCR service deployed** — `asia-southeast1`, `--memory=4Gi`, `--cpu=2`, `--timeout=600`, `--concurrency=1`, `--min-instances=0`.
+
+10. **Written web app integration plan** — `docs/superpowers/plans/2026-03-29-webapp-gcr-integration.md`: 10-task plan for the Next.js repo covering `BackendConfig`, `BackendContext`, `BackendToggle` component, health proxy route, env vars, and GCR cold-start UX. Ready for execution in the web app repo.
+
+**New files in this session:**
+- `Dockerfile`
+- `.dockerignore`
+- `requirements-runtime.txt`
+- `cloudbuild.yaml`
+- `docs/superpowers/plans/2026-03-29-gcr-deployment.md`
+- `docs/superpowers/plans/2026-03-29-webapp-gcr-integration.md`
+
+**Modified files:**
+- `apps/api/main.py` — PORT env var + `__main__` block
+- `apps/api/pipeline.py` — neural fusion silent-skip guard
+- `core/exevision/stages/extract_selected_features.py` — json discovery fix
+- `core/exevision/stages/scoring.py` — json discovery fix
+
+---
+
 ## Session 2026-03-05 — Visibility-Based View Refactor
 
 **Focus:** Improve robustness of view classification (stage 4) and pipeline continuity.

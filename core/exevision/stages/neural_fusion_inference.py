@@ -479,8 +479,8 @@ def main() -> int:
         logger.info(f"Video filter enabled: {args.video_id}")
     logger.info(f"Discovered {len(videos)} videos across quality tiers")
     if not videos:
-        logger.warning("No videos found. Exiting.")
-        return 0
+        logger.warning("No videos found in extracted_features_clean. This usually means Stage 2.5 (extract_selected_features) failed or was not run.")
+        return 1
 
     # Load models
     logger.info("Loading models...")

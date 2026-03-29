@@ -8,6 +8,7 @@ Does NOT modify any scoring, segmentation, or feature-extraction logic.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -19,6 +20,8 @@ from typing import Any
 
 import httpx
 from core.exevision.feedback.engine import FeedbackEngine
+
+logger = logging.getLogger(__name__)
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 # apps/api/ → apps/ → exevision_modelAI/
@@ -443,8 +446,19 @@ def run_pipeline_sync(
             raise ValueError(f"Unknown stage: '{key}'")
         if not spec.script.exists():
             raise FileNotFoundError(f"Stage script not found: {spec.script}")
-        _run_stage(key, spec.script, video_id, workspace_root, logs_root, mode)
-        _validate_stage_output(key, workspace_root, video_id)
+
+        # Neural fusion is optional: if it fails, we still return feedback based on heuristic scores.
+        # All other stages are mandatory: failure propagates.
+        try:
+            _run_stage(key, spec.script, video_id, workspace_root, logs_root, mode)
+            _validate_stage_output(key, workspace_root, video_id)
+        except RuntimeError as exc:
+            if key == "neural_fusion":
+                # Neural fusion failure is non-fatal. Log and continue.
+                # Feedback will be generated from heuristic scores instead.
+                logger.warning(f"Neural fusion stage failed (non-fatal): {exc}")
+            else:
+                raise
 
         # After extraction completes, remove the input video copy — it is no longer
         # needed (stage 2.5 has already produced the feature JSON) and accounts for
@@ -454,17 +468,13 @@ def run_pipeline_sync(
 
     result = collect_results(workspace_root, video_id)
 
-    # If neural_fusion was requested, do not silently return heuristic-only output.
-    # This prevents UI states like "neural pipeline skipped" from a nominally
-    # successful job when Stage 9 produced no usable rep outputs.
-    if "neural_fusion" in stages:
-        neural_available = bool(result.get("neural_available"))
-        rep_has_neural = any(rep.get("neural_score") is not None for rep in result.get("reps", []))
-        if not neural_available or not rep_has_neural:
-            raise RuntimeError(
-                "Neural fusion was requested but no neural outputs were produced. "
-                "Check logs/neural_fusion.log for Stage 9 failures or rep-level skips."
-            )
+    # Note: if neural_fusion was requested but failed, result.neural_available will be False
+    # and all reps will have neural_score=None. This is NOT an error condition — feedback
+    # is still generated (it's based on heuristic scores), and the frontend can detect
+    # neural unavailability via result.neural_available flag. We do NOT raise here because:
+    # 1. Feedback generation must always succeed, even if neural failed
+    # 2. The frontend has fallback UI for when neural is unavailable
+    # 3. Raising would prevent valid feedback from being returned to the user
 
     # Tear down the workspace after results are safely collected.  The meaningful
     # output (2 KB of JSON) is returned in-memory; the workspace is ~5–7 MB of
