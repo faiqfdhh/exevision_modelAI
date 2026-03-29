@@ -32,6 +32,7 @@ import argparse
 import json
 import math
 import os
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,18 +42,8 @@ import numpy as np
 # --------------------------
 # Paths / discovery
 # --------------------------
-FEATURES_DIRS = [
-        "./squat/extracted_features_clean/excellent",
-        "./squat/extracted_features_clean/good",
-        "./squat/extracted_features_clean/fair",
-    "./squat/extracted_features_clean/raw_unfiltered",
-]
-SEGMENTED_DIRS = [
-        "./squat/segmented_reps/excellent",
-        "./squat/segmented_reps/good",
-        "./squat/segmented_reps/fair",
-    "./squat/segmented_reps/raw_unfiltered",
-]
+FEATURES_ROOT = Path("./squat/extracted_features_clean")
+SEGMENTED_ROOT = Path("./squat/segmented_reps")
 OUTPUT_DIR = "./squat/aqa_analysis_simple"
 
 
@@ -235,37 +226,45 @@ def calculate_torso_tibia_offset(frame: Any, min_conf: float = 0.4) -> Optional[
 # Phase + rep detection (simple)
 # --------------------------
 
-def find_feature_json(video_id: str) -> Optional[str]:
-    for d in FEATURES_DIRS:
-        p = os.path.join(d, f"{video_id}.json")
-        if os.path.exists(p):
-            return p
+def _fallback_single_json(root: Path, suffix: str) -> Optional[str]:
+    """Fallback for single-video API runs when id mapping drifts across stages."""
+    candidates = sorted(root.rglob(f"*{suffix}"))
+    if len(candidates) == 1:
+        return str(candidates[0])
     return None
+
+
+def find_feature_json(video_id: str) -> Optional[str]:
+    if not FEATURES_ROOT.exists():
+        return None
+
+    exact_matches = sorted(FEATURES_ROOT.rglob(f"{video_id}.json"))
+    if exact_matches:
+        return str(exact_matches[0])
+
+    return _fallback_single_json(FEATURES_ROOT, ".json")
 
 
 def find_segmented_json(video_id: str) -> Optional[str]:
-    for d in SEGMENTED_DIRS:
-        p = os.path.join(d, f"{video_id}_segmented.json")
-        if os.path.exists(p):
-            return p
-    return None
+    if not SEGMENTED_ROOT.exists():
+        return None
+
+    exact_matches = sorted(SEGMENTED_ROOT.rglob(f"{video_id}_segmented.json"))
+    if exact_matches:
+        return str(exact_matches[0])
+
+    return _fallback_single_json(SEGMENTED_ROOT, "_segmented.json")
 
 
 def find_all_video_ids() -> List[Tuple[str, str]]:
-    """Find all video IDs from all quality folders.
-    
-    Returns:
-        List of tuples (video_id, quality_folder) e.g., [("25713_3", "excellent"), ...]
-    """
-    video_ids = []
-    for features_dir in FEATURES_DIRS:
-        if not os.path.exists(features_dir):
-            continue
-        quality = os.path.basename(features_dir)  # excellent, good, or fair
-        for filename in os.listdir(features_dir):
-            if filename.endswith(".json"):
-                video_id = filename.replace(".json", "")
-                video_ids.append((video_id, quality))
+    """Find all video IDs from the extracted feature tree, regardless of tier layout."""
+    if not FEATURES_ROOT.exists():
+        return []
+
+    video_ids: List[Tuple[str, str]] = []
+    for path in FEATURES_ROOT.rglob("*.json"):
+        quality = path.parent.name.lower()
+        video_ids.append((path.stem, quality))
     return video_ids
 
 
@@ -710,6 +709,9 @@ def process_single_video(video_id: str, source_quality: str, save_output: bool =
     features_path = find_feature_json(video_id)
     if not features_path or not os.path.exists(features_path):
         print(f"❌ Features JSON not found for {video_id}")
+        if FEATURES_ROOT.exists():
+            available = sorted(FEATURES_ROOT.rglob("*.json"))
+            print(f"   Available feature JSON count: {len(available)}")
         return None
 
     with open(features_path, "r") as f:
@@ -724,6 +726,9 @@ def process_single_video(video_id: str, source_quality: str, save_output: bool =
     seg_path = find_segmented_json(video_id)
     if not seg_path or not os.path.exists(seg_path):
         print(f"❌ Segmented JSON not found for {video_id}")
+        if SEGMENTED_ROOT.exists():
+            available = sorted(SEGMENTED_ROOT.rglob("*_segmented.json"))
+            print(f"   Available segmented JSON count: {len(available)}")
         print(f"   Run script 5_temporal_segmentation.py first")
         return None
 

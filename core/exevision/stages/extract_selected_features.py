@@ -1469,7 +1469,7 @@ def run_extraction(mode="filtered", workers=None):
     
     if not video_paths:
         print("No videos found to process.")
-        return
+        sys.exit(1)
 
     # Skip videos that already have output JSON files.
     pending_video_paths = []
@@ -1534,7 +1534,7 @@ def run_extraction(mode="filtered", workers=None):
     # Process results (may be partial if interrupted)
     if not results:
         print("No results to process.")
-        return
+        sys.exit(1)
     successes = [r for r in results if r[1] == "Success"]
     errors = [r for r in results if r[1] == "Error"]
     skipped = [r for r in results if r[1] == "Skipped"]
@@ -1578,7 +1578,11 @@ def run_extraction(mode="filtered", workers=None):
         print('='*60)
         for vid, status, error, analysis, avg_vis in errors:
             vid_name = os.path.basename(vid) if isinstance(vid, str) else vid
-            print(f"  - {vid_name}: {error[:100]}...")
+            print(f"  - {vid_name}: {error}")
+
+    if len(successes) == 0:
+        print("\n❌ No videos were successfully processed; failing stage.")
+        sys.exit(1)
     
     print(f"\n{'='*60}")
     print("OUTPUT FILES")

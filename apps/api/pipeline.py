@@ -152,6 +152,28 @@ def _run_stage(
     return combined
 
 
+def _validate_stage_output(key: str, workspace_root: Path, video_id: str) -> None:
+    """Ensure each stage produced the expected artifact for the requested video."""
+    expected_patterns = {
+        "extract_selected_features": f"squat/extracted_features_clean/**/{video_id}.json",
+        "classify_views": f"squat/extracted_features_clean/**/{video_id}.json",
+        "temporal_segmentation": f"squat/segmented_reps/**/{video_id}_segmented.json",
+        "scoring": f"squat/aqa_analysis_simple/**/{video_id}_aqa_simple.json",
+        "neural_fusion": f"squat/neural_analysis/**/{video_id}_neural.json",
+    }
+
+    pattern = expected_patterns.get(key)
+    if not pattern:
+        return
+
+    matches = sorted(workspace_root.glob(pattern))
+    if not matches:
+        raise RuntimeError(
+            f"Stage '{key}' completed but expected output was not found for video '{video_id}'. "
+            f"Missing pattern: {workspace_root / pattern}"
+        )
+
+
 # ── Workspace cleanup helpers ──────────────────────────────────────────────────
 def _delete_input_video(workspace_root: Path, filename: str) -> None:
     """Remove the input video copy from the workspace after extraction."""
@@ -422,6 +444,7 @@ def run_pipeline_sync(
         if not spec.script.exists():
             raise FileNotFoundError(f"Stage script not found: {spec.script}")
         _run_stage(key, spec.script, video_id, workspace_root, logs_root, mode)
+        _validate_stage_output(key, workspace_root, video_id)
 
         # After extraction completes, remove the input video copy — it is no longer
         # needed (stage 2.5 has already produced the feature JSON) and accounts for
