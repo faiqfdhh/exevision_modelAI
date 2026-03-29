@@ -1,6 +1,6 @@
 # CLAUDE.MD — ExeVision AI Project Knowledge Base
 
-_Last updated: 2026-03-29 (Neural anchor bug fixed; three-judge scoring model; disk optimization; feedback template system designed)_
+_Last updated: 2026-03-29 (Neural anchor bug fixed; three-judge scoring model; disk optimization; feedback template system designed; tier-language feedback implementation; score-band tone policy for issue cues)_
 
 ---
 
@@ -29,7 +29,9 @@ ExeVision AI remains in **late prototyping / early pre-production** for squat an
 | Failure cases (>\|20\|) | 4 | **0** | −4 |
 | vs linear baseline MAE | 10.39 (neural was worse) | **9.28 beats linear** | ✅ |
 
-Integration of fully modularized runtime paths into the new `apps/` + `core/` structure remains in progress.
+**Feedback Engine Tier Language (2026-03-29):** Metric-agnostic tier language system implemented. All metrics now mentioned in coaching narratives using unified tiers (excellent/strong/okay/needs_work/focus_here). New "stable mentions" for ≥75 metrics that didn't improve. Severity-tiered issue cues (needs_work for 60-74, focus_here for <60). Full implementation in `core/exevision/feedback/engine.py`, `core/exevision/config/templates/feedback_templates.json`, and `core/exevision/config/exercises/squat.json`.
+
+**Feedback Issue Tone Policy (2026-03-29):** Rep-level issue tone is now score-band driven in `core/exevision/feedback/engine.py`: scores 80-100 use soft issue language, scores 70-79 use stricter coaching language, and scores below 70 use very strict language. This is a wording-layer change only; API payload schema is unchanged.
 
 ---
 
@@ -335,6 +337,50 @@ squat/aqa_analysis_simple/{quality}/{video_id}/
 
 ---
 
+### **Stage 9.5 — Feedback Generation (API Post-Processing)**
+
+**Input:** Merged rep outputs from Stage 8 (AQA) and Stage 9 (neural fusion)  
+**Output:** Deterministic coaching text per rep + session summary
+
+**Engine:** `core/exevision/feedback/engine.py` (`FeedbackEngine`)
+- Loads exercise config: `core/exevision/config/exercises/squat.json`
+- Loads template library: `core/exevision/config/templates/feedback_templates.json`
+- Classifies score tier (`excellent|good|fair|poor|critical`) from overall score
+- Surfaces issues where sub-score `< 75`, grouped by exercise taxonomy
+- Adds positive reinforcement only for metrics `>= 75` that improved vs previous rep
+- Applies mismatch handling when overall score and sub-metrics disagree
+- Builds session summary (average score, trajectory, most improved metric, persistent issue)
+
+**Response payload added under API result:**
+```json
+{
+  "feedback": {
+    "schema_version": "1.0",
+    "exercise": "squat",
+    "reps": [
+      {
+        "rep_id": 1,
+        "score": 72.0,
+        "tier": "fair",
+        "text": "Decent effort, but a few things to address.",
+        "wins": ["smoothness"],
+        "issues": ["forward_lean", "hip_depth"]
+      }
+    ],
+    "session": {
+      "avg_score": 78.33,
+      "trajectory": "improving",
+      "most_improved_metric": "forward_lean",
+      "persistent_issue": "hip_depth",
+      "aggregate_text": "Most improved this session: forward lean. Keep working on: hip depth.",
+      "coach_text": "Good session! You improved consistently. Next time, focus on Drop your hips lower - aim for parallel or below."
+    }
+  }
+}
+```
+
+---
+
 ## 6) Annotation Workflow & Data Artifacts
 
 ### Data Flow: Video → Pipeline → Annotation JSON
@@ -590,9 +636,21 @@ From `pipeline_ui_runs/` (50 runs documented):
   - **Gotcha:** inserts `apps/api/` into `sys.path` at import time so `from pipeline import ...` works when run as `uvicorn apps.api.main:app` from the project root (CWD is root, not `apps/api/`)
 - `apps/api/pipeline.py` — pipeline execution logic (no Tkinter; mirrors `app.py` subprocess flow)
   - `run_pipeline_sync()` — runs all 5 stages, returns merged `AnalysisResult` dict
-  - `collect_results()` — merges Stage 8 AQA JSON + Stage 9 neural JSON
+  - `collect_results()` — merges Stage 8 AQA JSON + Stage 9 neural JSON and appends `feedback`
   - `download_video()` — async download from Supabase signed URL
 - `apps/web/INTEGRATION_PROMPT.md` — full Next.js integration spec for the web app agent
+
+**Feedback Engine (`core/exevision/feedback/`):**
+- `engine.py` — orchestration + dataclass output contracts (`RepFeedback`, `SessionSummary`, `FeedbackResult`)
+  - `generate_feedback(rep_scores, video_id)` — main public method
+  - `QualityChecker.detect_mismatch()` — mismatch handling (`normal`, `low_overall_no_issues`, `high_overall_has_issues`)
+- `rep_comparator.py` — rep-over-rep deltas + improvement tiering
+- `session_aggregator.py` — session trajectory, average, most-improved, persistent issue
+- `template_renderer.py` — deterministic phrase selection + template slot filling
+
+**Feedback Configs:**
+- `core/exevision/config/exercises/squat.json` — score brackets, issue groups, thresholds
+- `core/exevision/config/templates/feedback_templates.json` — phrase catalogs and session templates
 
 **Compatibility Adapters:**
 - `adapters/legacy-cli/launch_pipeline_ui.py` — Legacy launcher
@@ -827,6 +885,25 @@ _Latest sessions kept here for quick reference. Older sessions archived to [CHAN
 
 ---
 
+### Session 2026-03-29 — Score-Band Issue Tone Policy (80+ Softening)
+
+**Focus:** Reduce tone mismatch on high-scoring reps by softening issue wording when overall rep score is high.
+
+**What was done:**
+1. Updated `core/exevision/feedback/engine.py` to add score-band issue tone policy via `_resolve_issue_tone_mode()`:
+  - `80-100` → `soft`
+  - `70-79` → `strict`
+  - `<70` → `very_strict`
+2. Updated `_build_rep_feedback()` to pass rep `score` into issue-cue generation so tone is decided per-rep.
+3. Updated `_group_issue_cues()` behavior by mode:
+  - `soft`: avoids harsh cue tiering and prefixes issue lines with "Something to keep in mind:"
+  - `strict`: preserves severity-based behavior
+  - `very_strict`: forces strong cue tiering and prefixes with "Priority fix:"
+4. Preserved backward compatibility and contract stability: no API schema changes, only narrative wording changes.
+5. Ran live smoke validation over three reps (`score=91`, `score=74`, `score=65`) and confirmed expected tone output across all three bands.
+
+---
+
 ### Session 2026-03-29 — Feedback Template System Designed
 
 **Focus:** Design the slot-based feedback generation system for rep-level and session-level coaching output.
@@ -849,6 +926,45 @@ _Latest sessions kept here for quick reference. Older sessions archived to [CHAN
 - `core/exevision/config/exercises/squat.json` — squat exercise config
 - `core/exevision/config/templates/feedback_templates.json` — shared template library
 - `docs/superpowers/specs/2026-03-29-feedback-template-design.md` — full design spec
+
+---
+
+### Session 2026-03-29 — Metric-Agnostic Tier Language Feedback Implementation
+
+**Focus:** Implement unified tier-language feedback narrative system so all metrics appear in coaching text with appropriate tone, not just wins and issues.
+
+**What was done:**
+1. **Updated `feedback_templates.json`:**
+   - Split `win_phrases` into tier-aware categories: `improving_metric_excellent`, `improving_metric_strong`, `improving_metric_okay`
+   - Added **new `stable_phrases` section** (excellent/strong/okay) for metrics ≥75 that aren't wins
+   - Expanded `improvement_phrases` with additional variants per tier
+
+2. **Updated `squat.json` exercise config:**
+   - Migrated all `single_cues` (forward_lean, hip_depth, knee_valgus, knee_tracking) from flat strings to `{needs_work, focus_here}` dicts
+   - Migrated all `combined_cue` entries to severity-tiered dicts
+   - Backwards-compatible: dict structure falls back to `needs_work` tier if present
+
+3. **Updated `engine.py` feedback logic:**
+   - Added `_metric_phrase_tier()` helper: maps score 90+ → "excellent", 85-89 → "strong", <85 → "okay"
+   - Updated `_build_win_texts()` to use tier-aware phrase keys (`improving_metric_{tier}`)
+   - **Added `_build_stable_texts()` method** (new): generates brief mentions for ≥75 metrics that didn't improve
+   - Updated `_group_issue_cues()` to read tier-aware cue dicts and select based on severity (`< 60 → focus_here`, else `needs_work`)
+   - Updated `_resolve_issue_cue_text()` to safely handle both dict and legacy string cues
+   - Wired stable mentions into narrative flow: Opener → Wins → Stable → Issues
+
+4. **Narrative structure now covers all metrics:**
+   - **Wins** (≥75, improved): Tier-appropriate opener + improvement phrase
+   - **Stable** (≥75, no improvement / rep 1): Tier-appropriate brief mention
+   - **Issues** (<75): Severity-tiered coaching cue (needs_work / focus_here)
+
+5. **Code review completed:** Implementation matches spec (95% compliant, minor hyphen/em-dash punctuation variance, zero functional impact).
+
+**Implementation plan saved to:** `docs/superpowers/plans/2026-03-29-tier-language.md` (4 tasks, no tests/git per user instruction)
+
+**Example narratives (post-implementation):**
+- Rep 1 (score 95): "Excellent squat form! Excellent depth! Excellent knee tracking! Strong forward lean!"
+- Rep 2 (score 78): "Good squat overall. Strong depth - improving from last rep! Your knee tracking is okay. Work on keeping your torso more upright."
+- Rep 3 (score 45): "Your form needs significant attention. Your descent needs significant work - stay upright and drop much deeper. Knee valgus is critical - your knees are collapsing inward and need immediate attention."
 
 ---
 

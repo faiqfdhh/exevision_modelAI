@@ -5,6 +5,59 @@
 
 ---
 
+## Session 2026-03-29 — Score-Band Issue Tone Policy (80+ Softening)
+
+**Focus:** Reduce tone mismatch on high-scoring reps by softening issue wording when overall rep score is high.
+
+**What was done:**
+1. Updated `core/exevision/feedback/engine.py` with score-band issue tone policy in `_resolve_issue_tone_mode()`:
+   - `80-100` -> `soft`
+   - `70-79` -> `strict`
+   - `<70` -> `very_strict`
+2. Updated `_build_rep_feedback()` to pass rep score into issue-cue generation so issue tone is selected per rep.
+3. Updated `_group_issue_cues()` behavior by mode:
+   - `soft`: avoids harsh cue tiering and prefixes issue cues with "Something to keep in mind:"
+   - `strict`: keeps prior severity-based behavior
+   - `very_strict`: enforces stronger cue tiering and prefixes with "Priority fix:"
+4. Preserved output contract: API payload schema unchanged; only narrative text changes.
+5. Verified with runtime smoke check using three synthetic reps (91/74/65), confirming soft/strict/very-strict output transitions.
+
+---
+
+## Session 2026-03-29 — Metric-Agnostic Tier Language Feedback Implementation
+
+**Focus:** Implement unified tier-language feedback narrative system so all metrics appear in coaching text with appropriate tone, not just wins and issues.
+
+**What was done:**
+1. **Updated `feedback_templates.json`:**
+   - Split `win_phrases` into tier-aware categories: `improving_metric_excellent`, `improving_metric_strong`, `improving_metric_okay`
+   - Added **new `stable_phrases` section** (excellent/strong/okay) for metrics ≥75 that aren't wins
+   - Expanded `improvement_phrases` with additional variants per tier
+
+2. **Updated `squat.json` exercise config:**
+   - Migrated all `single_cues` (forward_lean, hip_depth, knee_valgus, knee_tracking) from flat strings to `{needs_work, focus_here}` dicts
+   - Migrated all `combined_cue` entries to severity-tiered dicts
+   - Backwards-compatible: dict structure falls back to `needs_work` tier if present
+
+3. **Updated `engine.py` feedback logic:**
+   - Added `_metric_phrase_tier()` helper: maps score 90+ → "excellent", 85-89 → "strong", <85 → "okay"
+   - Updated `_build_win_texts()` to use tier-aware phrase keys (`improving_metric_{tier}`)
+   - **Added `_build_stable_texts()` method** (new): generates brief mentions for ≥75 metrics that didn't improve
+   - Updated `_group_issue_cues()` to read tier-aware cue dicts and select based on severity (`< 60 → focus_here`, else `needs_work`)
+   - Updated `_resolve_issue_cue_text()` to safely handle both dict and legacy string cues
+   - Wired stable mentions into narrative flow: Opener → Wins → Stable → Issues
+
+4. **Narrative structure now covers all metrics:**
+   - **Wins** (≥75, improved): Tier-appropriate opener + improvement phrase
+   - **Stable** (≥75, no improvement / rep 1): Tier-appropriate brief mention
+   - **Issues** (<75): Severity-tiered coaching cue (needs_work / focus_here)
+
+5. **Code review completed:** Implementation matches spec (95% compliant, minor hyphen/em-dash punctuation variance, zero functional impact).
+
+**Implementation plan saved to:** `docs/superpowers/plans/2026-03-29-tier-language.md` (4 tasks, no tests/git per user instruction)
+
+---
+
 ## Session 2026-03-28 — Web App Integration Live + Extraction Bug Discovery + Disk Optimization
 
 **Focus:** Wire `apps/api/` into the Next.js web app, achieve first end-to-end test, diagnose pipeline failure, and minimize per-run disk usage for hosting readiness.
