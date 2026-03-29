@@ -6,6 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     libglib2.0-0 \
     libgl1 \
+    libegl1 \
+    libgles2 \
     libsm6 \
     libxext6 \
     libxrender-dev \
