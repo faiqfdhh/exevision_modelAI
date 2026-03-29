@@ -454,6 +454,18 @@ def run_pipeline_sync(
 
     result = collect_results(workspace_root, video_id)
 
+    # If neural_fusion was requested, do not silently return heuristic-only output.
+    # This prevents UI states like "neural pipeline skipped" from a nominally
+    # successful job when Stage 9 produced no usable rep outputs.
+    if "neural_fusion" in stages:
+        neural_available = bool(result.get("neural_available"))
+        rep_has_neural = any(rep.get("neural_score") is not None for rep in result.get("reps", []))
+        if not neural_available or not rep_has_neural:
+            raise RuntimeError(
+                "Neural fusion was requested but no neural outputs were produced. "
+                "Check logs/neural_fusion.log for Stage 9 failures or rep-level skips."
+            )
+
     # Tear down the workspace after results are safely collected.  The meaningful
     # output (2 KB of JSON) is returned in-memory; the workspace is ~5–7 MB of
     # intermediate files that are not needed after this point.
