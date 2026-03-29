@@ -86,6 +86,51 @@ def _update_job(job_id: str, **kwargs: Any) -> None:
             _jobs[job_id].update(kwargs)
 
 
+def _normalize_stage_selection(requested_stages: list[str] | None) -> list[str]:
+    """
+    Validate and normalize requested stages.
+
+    Rules:
+    - Unknown stage names are rejected.
+    - Dependencies are auto-included and execution is forced into canonical order.
+    - If scoring is requested, neural_fusion is auto-included so coaching feedback
+      is not silently downgraded to heuristic-only output.
+    """
+    if not requested_stages:
+        return list(DEFAULT_STAGES)
+
+    allowed = set(DEFAULT_STAGES)
+    requested = set(requested_stages)
+    unknown = requested - allowed
+    if unknown:
+        raise ValueError(f"Unknown stage(s): {sorted(unknown)}")
+
+    # Dependency closure in canonical pipeline order.
+    deps: dict[str, tuple[str, ...]] = {
+        "extract_selected_features": tuple(),
+        "classify_views": ("extract_selected_features",),
+        "temporal_segmentation": ("extract_selected_features", "classify_views"),
+        "scoring": ("extract_selected_features", "classify_views", "temporal_segmentation"),
+        "neural_fusion": ("extract_selected_features", "classify_views", "temporal_segmentation", "scoring"),
+    }
+
+    # Coaching payload expects neural outputs whenever scoring is requested.
+    if "scoring" in requested:
+        requested.add("neural_fusion")
+
+    expanded = set(requested)
+    changed = True
+    while changed:
+        changed = False
+        for stage in list(expanded):
+            for dep in deps.get(stage, tuple()):
+                if dep not in expanded:
+                    expanded.add(dep)
+                    changed = True
+
+    return [stage for stage in DEFAULT_STAGES if stage in expanded]
+
+
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="ExeVision AI Inference API",
@@ -183,7 +228,10 @@ def submit_inference(req: InferRequest, background_tasks: BackgroundTasks) -> di
     Returns immediately with a job_id; poll GET /jobs/{job_id} for results.
     """
     job_id = req.job_id or str(uuid.uuid4())
-    stages = req.stages or DEFAULT_STAGES
+    try:
+        stages = _normalize_stage_selection(req.stages)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     now = datetime.now(timezone.utc).isoformat()
 
     with _jobs_lock:
