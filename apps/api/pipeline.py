@@ -314,6 +314,67 @@ def _build_phase_timeline(
         },
     }
 
+
+def _build_kinematic_data(
+    seg_rep: dict,
+    all_seg_reps: list[dict],
+    rep_idx: int,
+    fps: float,
+    frame_count: int,
+    hip_displacement: list[float],
+) -> list[dict[str, float]] | None:
+    """
+    Build ROM time-series for one rep using hip vertical displacement.
+
+    Returns list of {time, rom} dicts, sampled at phase transitions + uniform spacing.
+    ROM = (1 - normalized_hip_displacement) * 100, so:
+    - 0% = deepest squat (max displacement)
+    - 100% = standing (zero displacement)
+
+    If hip_displacement is missing or rep data incomplete, return None.
+    """
+    if not seg_rep or not hip_displacement:
+        return None
+
+    rep_start = int(seg_rep.get("start_frame", 0))
+    rep_end = int(seg_rep.get("end_frame", 0))
+    phases = seg_rep.get("phases", [])
+
+    if rep_end <= rep_start or rep_end >= len(hip_displacement):
+        return None
+
+    # Collect all sample frame indices
+    sample_frames = set()
+
+    # Add phase transition frames
+    sample_frames.add(rep_start)  # Idle start
+    for phase in phases:
+        sample_frames.add(int(phase.get("start_frame", rep_start)))
+        sample_frames.add(int(phase.get("end_frame", rep_end)))
+    sample_frames.add(rep_end)  # Last frame
+
+    # Add uniform spacing: target 10–20 samples per rep
+    rep_frames = rep_end - rep_start + 1
+    target_count = 15  # Aim for 15 samples
+    interval = max(1, rep_frames // target_count)
+    for f in range(rep_start, rep_end + 1, interval):
+        sample_frames.add(f)
+
+    # Remove out-of-bounds frames
+    sample_frames = sorted(f for f in sample_frames if rep_start <= f <= rep_end)
+
+    # Build kinematic data
+    kinematic_data = []
+    for frame in sample_frames:
+        disp = hip_displacement[frame]
+        rom = round((1.0 - disp) * 100.0, 1)  # 1.0 disp → 0% ROM, 0.0 disp → 100% ROM
+        rom = max(0.0, min(100.0, rom))  # Clamp to [0, 100]
+        time = round((frame - rep_start) / fps, 3)
+        kinematic_data.append({"time": time, "rom": rom})
+
+    return sorted(kinematic_data, key=lambda x: x["time"])
+
+
 def _tier_for_score(score: float) -> str:
     """Map numeric score to feedback tier labels expected by the frontend."""
     if score >= 85.0:
@@ -401,6 +462,12 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
     seg_fps = (seg or {}).get("info", {}).get("fps", 30.0)
     seg_frame_count = (seg or {}).get("info", {}).get("frame_count", 0)
 
+    # Extract per-frame hip displacement from segmented JSON
+    seg_hip_displacement = []
+    if seg:
+        seg_signals = seg.get("signals", {})
+        seg_hip_displacement = seg_signals.get("normalized_hip_displacement", [])
+
     merged_reps = []
     for rep_idx, r in enumerate(aqa_reps):
         rid = r.get("rep_id")
@@ -449,6 +516,18 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
                 frame_count=seg_frame_count,
             )
 
+        # Kinematic data (ROM time-series) from Stage 5 segmentation
+        kinematic_data = None
+        if seg_rep and seg_hip_displacement:
+            kinematic_data = _build_kinematic_data(
+                seg_rep,
+                seg_reps,
+                rep_idx,
+                fps=seg_fps,
+                frame_count=seg_frame_count,
+                hip_displacement=seg_hip_displacement,
+            )
+
         merged_reps.append({
             "rep_id": rid,
             "start_frame": r.get("start_frame"),
@@ -473,6 +552,7 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
             } if nr else None,
             "safety_clamps": nr.get("safety_clamps_applied", []),
             "phase_timeline": phase_timeline,
+            "kinematic_data": kinematic_data,
         })
 
     neural_scores = [r["neural_score"] for r in merged_reps if r["neural_score"] is not None]
