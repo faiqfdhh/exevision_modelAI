@@ -10,6 +10,9 @@ png
 *.txt
 !requirements-runtime.txt
 
+# Whitelist config files needed at runtime
+!core/exevision/config/**/*.json
+
 pipeline_ui_runs/
 CLAUDE.md
 CHANGELOG.md

@@ -1,0 +1,67 @@
+{
+  "schema_version": "1.0",
+  "improvement_phrases": {
+    "significant": [
+      "notably better than last rep",
+      "much improved from last rep",
+      "a major step up from before"
+    ],
+    "moderate": [
+      "getting better",
+      "improving from last rep",
+      "showing steady progress"
+    ],
+    "slight": [
+      "a little better than last rep",
+      "slightly improved from before",
+      "moving in the right direction"
+    ]
+  },
+  "win_phrases": {
+    "improving_metric_excellent": [
+      "Excellent [METRIC_LABEL] - [IMPROVEMENT_PHRASE]!",
+      "Outstanding [METRIC_LABEL] - [IMPROVEMENT_PHRASE]!",
+      "[METRIC_LABEL] is superb - [IMPROVEMENT_PHRASE]!"
+    ],
+    "improving_metric_strong": [
+      "Strong [METRIC_LABEL] - [IMPROVEMENT_PHRASE]!",
+      "Solid [METRIC_LABEL] - [IMPROVEMENT_PHRASE]!",
+      "[METRIC_LABEL] is impressive - [IMPROVEMENT_PHRASE]!"
+    ],
+    "improving_metric_okay": [
+      "Your [METRIC_LABEL] is okay and [IMPROVEMENT_PHRASE].",
+      "[METRIC_LABEL] is acceptable - [IMPROVEMENT_PHRASE].",
+      "[METRIC_LABEL] is reasonable and [IMPROVEMENT_PHRASE]."
+    ]
+  },
+  "stable_phrases": {
+    "excellent": [
+      "Excellent [METRIC_LABEL]!",
+      "Outstanding [METRIC_LABEL]!",
+      "[METRIC_LABEL] is superb!"
+    ],
+    "strong": [
+      "Strong [METRIC_LABEL].",
+      "Solid [METRIC_LABEL].",
+      "[METRIC_LABEL] is looking good."
+    ],
+    "okay": [
+      "Your [METRIC_LABEL] is okay.",
+      "[METRIC_LABEL] is acceptable.",
+      "[METRIC_LABEL] is reasonable."
+    ]
+  },
+  "issue_templates": {
+    "single_issue": "[ISSUE_CUE]",
+    "combined_issue": "[COMBINED_CUE]"
+  },
+  "session_summary": {
+    "trajectory_openers": {
+      "improving": "Good session! You improved consistently.",
+      "stable": "Consistent session. Solid foundation.",
+      "declining": "Tough session - it happens."
+    },
+    "metric_summary": "Most improved this session: [TOP_IMPROVEMENT]. Keep working on: [PERSISTENT_ISSUE].",
+    "coach_cue": "Next time, focus on [PERSISTENT_ISSUE_CUE]."
+  }
+}

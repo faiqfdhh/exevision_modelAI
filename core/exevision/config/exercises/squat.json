@@ -1,0 +1,98 @@
+{
+  "schema_version": "1.0",
+  "exercise": "squat",
+  "score_brackets": {
+    "90-100": {
+      "tier": "excellent",
+      "opener": "Excellent squat form!"
+    },
+    "75-89": {
+      "tier": "good",
+      "opener": "Good squat overall."
+    },
+    "60-74": {
+      "tier": "fair",
+      "opener": "Decent effort, but a few things to address."
+    },
+    "40-59": {
+      "tier": "poor",
+      "opener": "Your form needs significant attention."
+    },
+    "0-39": {
+      "tier": "critical",
+      "opener": "Let's work on the fundamentals."
+    }
+  },
+  "improvement_threshold": 75,
+  "severity_band": 5,
+  "issue_groups": {
+    "descent_quality": {
+      "metrics": ["forward_lean", "hip_depth"],
+      "label": "descent quality",
+      "single_cues": {
+        "forward_lean": {
+          "needs_work": "Work on keeping your torso more upright.",
+          "focus_here": "Your forward lean needs serious attention - stay upright throughout the movement."
+        },
+        "hip_depth": {
+          "needs_work": "Work on getting lower - aim for parallel or below.",
+          "focus_here": "Hip depth is insufficient - you need to go significantly deeper."
+        }
+      },
+      "combined_cue": {
+        "needs_work": "Work on your descent: lean back slightly and drop your hips lower.",
+        "focus_here": "Your descent needs significant work - stay upright and drop much deeper."
+      }
+    },
+    "knee_stability": {
+      "metrics": ["knee_valgus", "knee_tracking"],
+      "label": "knee stability",
+      "single_cues": {
+        "knee_valgus": {
+          "needs_work": "Work on keeping your knees from caving inward.",
+          "focus_here": "Knee valgus is critical - your knees are collapsing inward and need immediate attention."
+        },
+        "knee_tracking": {
+          "needs_work": "Work on keeping your knees tracking over your toes.",
+          "focus_here": "Knee tracking needs significant work - they're drifting off alignment."
+        }
+      },
+      "combined_cue": {
+        "needs_work": "Work on knee stability: keep your knees tracking over your toes throughout.",
+        "focus_here": "Knee stability is a priority - both alignment and inward collapse need addressing."
+      }
+    }
+  },
+  "metrics": {
+    "forward_lean": {
+      "good_threshold": 20,
+      "bad_threshold": 45,
+      "unit": "degrees"
+    },
+    "hip_depth": {
+      "good_threshold": 0.1,
+      "bad_threshold": -0.1,
+      "unit": "normalized"
+    },
+    "knee_valgus": {
+      "good_threshold": 0.95,
+      "bad_threshold": 0.75,
+      "unit": "ratio"
+    },
+    "knee_tracking": {
+      "good_threshold": 0.95,
+      "bad_threshold": 0.75,
+      "unit": "ratio"
+    },
+    "smoothness": {
+      "good_threshold": 75,
+      "bad_threshold": 50,
+      "unit": "score"
+    },
+    "control": {
+      "good_threshold": 75,
+      "bad_threshold": 50,
+      "unit": "score"
+    }
+  }
+}
