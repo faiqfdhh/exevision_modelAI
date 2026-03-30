@@ -387,6 +387,66 @@ def _tier_for_score(score: float) -> str:
         return "needs_work"
     return "focus_here"
 
+
+def coerce_old_feedback_format(old_feedback: dict[str, Any]) -> dict[str, Any]:
+    """Convert old {wins, issues} format to new {items} format for backward compatibility."""
+    items: list[dict[str, Any]] = []
+
+    # Process old wins array
+    for win in old_feedback.get("wins", []):
+        if isinstance(win, dict):
+            text = win.get("text", "")
+            score = win.get("score", 80)
+        else:
+            text = str(win)
+            score = 80
+
+        items.append(
+            {
+                "text": text,
+                "score": int(max(0, min(100, score))),
+                "category": "geometric",
+                "type": "win",
+            }
+        )
+
+    # Process old issues array
+    for issue in old_feedback.get("issues", []):
+        if isinstance(issue, dict):
+            text = issue.get("text", "")
+            score = issue.get("score") or issue.get("metric_value", 50)
+        else:
+            text = str(issue)
+            score = 50
+
+        items.append(
+            {
+                "text": text,
+                "score": int(max(0, min(100, score))),
+                "category": "geometric",
+                "type": "issue",
+            }
+        )
+
+    # Sort by score (ascending — most severe first)
+    items.sort(key=lambda x: x["score"])
+
+    # Build new format
+    return {
+        "schema_version": "2.0",
+        "reps": [
+            {
+                "rep_id": old_feedback.get("rep_id"),
+                "score": old_feedback.get("score", 50),
+                "tier": old_feedback.get("tier", "fair"),
+                "text": old_feedback.get("text", ""),
+                "items": items,
+            }
+        ],
+        "session": old_feedback.get("session", {}),
+    }
+
+
 def _build_feedback_fallback(merged_reps: list[dict[str, Any]]) -> dict[str, Any]:
     """Create a schema-compatible fallback when template/config files are unavailable."""
     rep_payload: list[dict[str, Any]] = []
@@ -404,14 +464,13 @@ def _build_feedback_fallback(merged_reps: list[dict[str, Any]]) -> dict[str, Any
                 "score": round(score, 2),
                 "tier": _tier_for_score(score),
                 "text": "Coaching baseline: detailed narrative template is unavailable in this deployment, but scoring data is valid.",
-                "wins": [],
-                "issues": [],
+                "items": [],
             }
         )
 
     avg_score = round(sum(rep_scores) / len(rep_scores), 2) if rep_scores else 0.0
     return {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "exercise": "squat",
         "reps": rep_payload,
         "session": {
@@ -618,7 +677,7 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
             feedback_result = feedback_engine.generate_feedback(feedback_input, video_id=video_id)
             print(f"[DIAGNOSTIC] generate_feedback returned successfully with {len(feedback_result.reps)} reps", flush=True)
             feedback_payload = {
-                "schema_version": feedback_result.schema_version,
+                "schema_version": "2.0",
                 "exercise": feedback_result.exercise,
                 "reps": [
                     {
@@ -626,8 +685,7 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
                         "score": item.score,
                         "tier": item.tier,
                         "text": item.text,
-                        "wins": item.wins,
-                        "issues": item.issues,
+                        "items": item.items,
                     }
                     for item in feedback_result.reps
                 ],

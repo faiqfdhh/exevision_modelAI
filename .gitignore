@@ -10,9 +10,10 @@ png
 *.txt
 !requirements-runtime.txt
 *.pyc
+__pycache__/
+.pytest_cache/
 # Whitelist config files needed at runtime
 !core/exevision/config/**/*.json
-.pyc
 pipeline_ui_runs/
 CLAUDE.md
 CHANGELOG.md

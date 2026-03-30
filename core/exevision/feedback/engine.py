@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 from core.exevision.feedback.rep_comparator import RepComparator
 from core.exevision.feedback.session_aggregator import SessionAggregator
 from core.exevision.feedback.template_renderer import TemplateRenderer
+
+
+class FeedbackItem(TypedDict):
+    """Individual feedback item with score for color-coding."""
+
+    text: str
+    score: int  # 0-100, for frontend color-coding
+    category: Literal["spatial", "temporal", "geometric"]
+    type: Literal["issue", "win"]
 
 
 @dataclass
@@ -19,6 +28,8 @@ class RepFeedback:
     score: float
     tier: str
     text: str
+    items: list[FeedbackItem] = field(default_factory=list)
+    # Legacy fields for backward compatibility (populated only if needed)
     wins: list[str] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
 
@@ -66,6 +77,58 @@ class QualityChecker:
         return "normal"
 
 
+class FeedbackItemBuilder:
+    """Helper class for building and scoring feedback items."""
+
+    @staticmethod
+    def score_for_metric(metric_name: str, metric_value: float | None) -> int:
+        """Map a metric name and value to a 0-100 score."""
+        if metric_value is None:
+            return 50
+        return int(max(0, min(100, metric_value)))
+
+    @staticmethod
+    def get_category_for_metric(metric_name: str) -> Literal["spatial", "temporal", "geometric"]:
+        """Classify metric into category for frontend filtering."""
+        spatial_metrics = {"hip_depth", "depth", "knee_tracking"}
+        temporal_metrics = {"smoothness", "control"}
+        
+        if metric_name in spatial_metrics:
+            return "spatial"
+        if metric_name in temporal_metrics:
+            return "temporal"
+        return "geometric"
+
+    @staticmethod
+    def assign_item_scores(
+        metrics_dict: dict[str, float], item_dicts: list[dict[str, Any]]
+    ) -> list[FeedbackItem]:
+        """Attach scores to feedback items based on metrics."""
+        scored_items: list[FeedbackItem] = []
+        
+        for item in item_dicts:
+            metric_key = item.get("metric_name", "unknown")
+            score = FeedbackItemBuilder.score_for_metric(
+                metric_key, metrics_dict.get(metric_key, None)
+            )
+            category = FeedbackItemBuilder.get_category_for_metric(metric_key)
+            
+            scored_item: FeedbackItem = {
+                "text": item["text"],
+                "score": score,
+                "category": category,
+                "type": item.get("type", "issue"),
+            }
+            scored_items.append(scored_item)
+        
+        return scored_items
+
+    @staticmethod
+    def sort_items_by_severity(items: list[FeedbackItem]) -> list[FeedbackItem]:
+        """Sort feedback items ascending by score (most severe first)."""
+        return sorted(items, key=lambda x: x["score"])
+
+
 class FeedbackEngine:
     """Main feedback orchestrator using config + templates + deterministic rendering."""
 
@@ -77,6 +140,7 @@ class FeedbackEngine:
         self._rep_comparator = RepComparator()
         self._session_aggregator = SessionAggregator()
         self._quality_checker = QualityChecker()
+        self._item_builder = FeedbackItemBuilder()
         self._renderer = TemplateRenderer()
 
     @staticmethod
@@ -117,14 +181,37 @@ class FeedbackEngine:
                 threshold=threshold,
             )
 
+            # ── Phase 2: Build items with metric tracking, score them, and sort ──
+            all_item_dicts: list[dict[str, Any]] = []
+
+            # Collect win items
+            _, win_items = self._build_win_texts(video_id, rep_id, wins, sub_scores, comparison)
+            all_item_dicts.extend(win_items)
+
+            # Collect stable items (metrics ≥ threshold, not wins, not issues)
+            _, stable_items = self._build_stable_texts(video_id, rep_id, sub_scores, wins, issues, threshold)
+            all_item_dicts.extend(stable_items)
+
+            # Collect issue items
+            issue_tone_mode = self._resolve_issue_tone_mode(score, mismatch_type)
+            _, issue_items = self._group_issue_cues(issue_scores, tone_mode=issue_tone_mode)
+            all_item_dicts.extend(issue_items)
+
+            # Assign scores to all items based on their metric_name
+            scored_items = self._item_builder.assign_item_scores(sub_scores, all_item_dicts)
+
+            # Sort by severity (ascending score)
+            sorted_items = self._item_builder.sort_items_by_severity(scored_items)
+
             rep_feedbacks.append(
                 RepFeedback(
                     rep_id=rep_id,
                     score=score,
                     tier=tier,
                     text=rep_text,
-                    wins=wins,
-                    issues=issues,
+                    items=sorted_items,
+                    wins=wins,  # Backward compatibility
+                    issues=issues,  # Backward compatibility
                 )
             )
 
@@ -198,11 +285,13 @@ class FeedbackEngine:
         wins: list[str],
         sub_scores: dict[str, float],
         comparison: dict[str, Any] | None,
-    ) -> list[str]:
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """Build win text for narrative and return items with metric tracking."""
         if not wins or comparison is None:
-            return []
+            return [], []
 
         texts: list[str] = []
+        items: list[dict[str, Any]] = []
         metric_tiers = comparison.get("metric_tiers", {})
         improvement_catalog = self.templates.get("improvement_phrases", {})
         win_catalog = self.templates.get("win_phrases", {})
@@ -238,8 +327,15 @@ class FeedbackEngine:
                 },
             )
             texts.append(text)
+            items.append(
+                {
+                    "text": text,
+                    "metric_name": metric_key,
+                    "type": "win",
+                }
+            )
 
-        return texts
+        return texts, items
 
     def _build_stable_texts(
         self,
@@ -249,13 +345,14 @@ class FeedbackEngine:
         wins: list[str],
         issue_keys: list[str],
         threshold: float,
-    ) -> list[str]:
-        """Generate brief tier-appropriate mentions for metrics >= threshold that are not wins."""
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """Generate brief tier-appropriate items for metrics >= threshold that are not wins."""
         stable_catalog = self.templates.get("stable_phrases", {})
         if not stable_catalog:
-            return []
+            return [], []
 
         texts: list[str] = []
+        items: list[dict[str, Any]] = []
         issue_key_set = set(issue_keys)
         for metric_key, score in sub_scores.items():
             if score < threshold:
@@ -281,8 +378,15 @@ class FeedbackEngine:
                 {"METRIC_LABEL": self._renderer.humanize_metric(metric_key)},
             )
             texts.append(text)
+            items.append(
+                {
+                    "text": text,
+                    "metric_name": metric_key,
+                    "type": "win",
+                }
+            )
 
-        return texts
+        return texts, items
 
     @staticmethod
     def _resolve_issue_tone_mode(overall_score: float, mismatch_type: str) -> str:
@@ -301,14 +405,15 @@ class FeedbackEngine:
             return "strict"
         return "very_strict"
 
-    def _group_issue_cues(self, issue_scores: dict[str, float], tone_mode: str) -> list[str]:
+    def _group_issue_cues(self, issue_scores: dict[str, float], tone_mode: str) -> tuple[list[str], list[dict[str, Any]]]:
+        """Generate issue items with text and metric tracking."""
         if not issue_scores:
-            return []
+            return [], []
 
         issue_groups = self.exercise_config.get("issue_groups", {})
         severity_band = float(self.exercise_config.get("severity_band", 5.0))
 
-        entries: list[tuple[str, float]] = []
+        entries: list[tuple[str, float, str]] = []  # (cue, severity, metric_name)
         consumed: set[str] = set()
 
         for _, group_info in issue_groups.items():
@@ -331,6 +436,8 @@ class FeedbackEngine:
                     cue = str(combined.get(cue_tier, combined.get("needs_work", ""))).strip()
                 else:
                     cue = str(combined).strip()
+                # For combined cues, use the lowest-scored metric as representative
+                primary_metric = low_metrics[0]
             else:
                 metric = low_metrics[0]
                 single = group_info.get("single_cues", {}).get(metric, "")
@@ -338,9 +445,10 @@ class FeedbackEngine:
                     cue = str(single.get(cue_tier, single.get("needs_work", ""))).strip()
                 else:
                     cue = str(single).strip()
+                primary_metric = metric
 
             if cue:
-                entries.append((cue, severity))
+                entries.append((cue, severity, primary_metric))
             consumed.update(low_metrics)
 
         for metric, score in issue_scores.items():
@@ -348,31 +456,44 @@ class FeedbackEngine:
                 continue
             label = self._renderer.humanize_metric(metric)
             if tone_mode == "soft":
-                entries.append((f"You can improve {label} a bit more for cleaner reps.", score))
+                cue = f"You can improve {label} a bit more for cleaner reps."
             elif tone_mode == "very_strict":
-                entries.append((f"{label} needs immediate correction on your next reps.", score))
+                cue = f"{label} needs immediate correction on your next reps."
             elif score < 60:
-                entries.append((f"Let's address {label} - this needs significant work.", score))
+                cue = f"Let's address {label} - this needs significant work."
             else:
-                entries.append((f"Work on {label} - there's room for improvement.", score))
+                cue = f"Work on {label} - there's room for improvement."
+
+            entries.append((cue, score, metric))
 
         entries.sort(key=lambda item: item[1])
 
         # Keep severe issues together by score proximity (±severity_band) while
         # preserving deterministic order from the sorted entries.
         ordered_cues: list[str] = []
+        ordered_items: list[dict[str, Any]] = []
         band_anchor: float | None = None
-        for cue, severity in entries:
+        for cue, severity, metric_name in entries:
             if band_anchor is None or abs(severity - band_anchor) > severity_band:
                 band_anchor = severity
-            ordered_cues.append(cue)
 
-        if tone_mode == "soft":
-            return [f"Something to keep in mind: {cue}" for cue in ordered_cues]
-        if tone_mode == "very_strict":
-            return [f"Priority fix: {cue}" for cue in ordered_cues]
+            if tone_mode == "soft":
+                formatted_cue = f"Something to keep in mind: {cue}"
+            elif tone_mode == "very_strict":
+                formatted_cue = f"Priority fix: {cue}"
+            else:
+                formatted_cue = cue
 
-        return ordered_cues
+            ordered_cues.append(formatted_cue)
+            ordered_items.append(
+                {
+                    "text": formatted_cue,
+                    "metric_name": metric_name,
+                    "type": "issue",
+                }
+            )
+
+        return ordered_cues, ordered_items
 
     def _build_rep_feedback(
         self,
@@ -400,10 +521,10 @@ class FeedbackEngine:
             )
             return " ".join(parts).strip()
 
-        win_texts = self._build_win_texts(video_id, rep_id, wins, sub_scores, comparison)
+        win_texts, _ = self._build_win_texts(video_id, rep_id, wins, sub_scores, comparison)
         parts.extend(win_texts)
 
-        stable_texts = self._build_stable_texts(
+        stable_texts, _ = self._build_stable_texts(
             video_id,
             rep_id,
             sub_scores,
@@ -414,7 +535,7 @@ class FeedbackEngine:
         parts.extend(stable_texts)
 
         issue_tone_mode = self._resolve_issue_tone_mode(score, mismatch_type)
-        issue_cues = self._group_issue_cues(issue_scores, tone_mode=issue_tone_mode)
+        issue_cues, _ = self._group_issue_cues(issue_scores, tone_mode=issue_tone_mode)
         parts.extend(issue_cues)
 
         return " ".join(part for part in parts if part).strip()
