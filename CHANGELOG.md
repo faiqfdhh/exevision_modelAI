@@ -5,6 +5,28 @@
 
 ---
 
+## Session 2026-03-30 — Results Layout Contract + Rep Payload Expansion
+
+**Focus:** Align documentation with current backend payload and external web layout contract used by the separate Next.js repo.
+
+**What changed:**
+1. Documented narrative-first rep layout contract (details panel for judges and raw metrics).
+2. Captured rep selector gotchas:
+   - bind feedback to reps by `rep_id` (not only array index)
+   - single-rep vs multi-rep conditional rendering behavior
+   - evaluate feedback fallback only when `status === 'done'`
+3. Documented additional rep payload fields emitted by API merge logic:
+   - `phase_timeline` (phase spans + tempo summary)
+   - `kinematic_data` (ROM time-series points for charts)
+4. Added web parsing/typing guardrails for `result_json` normalization:
+   - read using `result_json?.result ?? result_json`
+   - validate feedback schema/shape before narrative render
+
+**Notes:**
+- Web app implementation remains in a separate repository; this repo contains integration contracts under `apps/web/*PROMPT.md`.
+
+---
+
 ## Session 2026-03-29 — Feedback Reliability Hotfix (Cloud Run)
 
 **Focus:** Resolve production "No feedback data in result_json" behavior and align docs/deployment assumptions with live Cloud Run runtime.
@@ -57,7 +79,8 @@
 
 6. **Fixed: json file discovery path assumption** (`core/exevision/stages/extract_selected_features.py`, `scoring.py`) — Stages had hardcoded nested path assumptions (`aqa_analysis_simple/{quality}/`) that worked locally but broke in the containerized CWD. Fixed by walking the full `aqa_analysis_simple/` subtree.
 
-7. **Fixed: neural fusion silent skip** (`apps/api/pipeline.py`) — Added guard in `run_pipeline_sync()`: if neural fusion was in `stages` but `neural_available=False` or no rep carries a `neural_score`, raises `RuntimeError` immediately. Prevents silent heuristic-only output masquerading as a successful neural job.
+7. **Fixed: neural fusion silent skip (historical step)** (`apps/api/pipeline.py`) — Guard was introduced during early rollout.
+   - **Superseded later on 2026-03-29:** policy changed to non-fatal Stage 9 handling with fallback-capable result payloads and `result.neural_available` signaling.
 
 8. **Added `__main__` block to `apps/api/main.py`** — Respects `PORT` env var (GCR standard) when run directly via `python apps/api/main.py`.
 
