@@ -93,18 +93,23 @@ def _prepare_workspace(workspace_root: Path, video_path: Path) -> None:
     shutil.copy2(video_path, dest)
 
 
-def _build_stage_cmd(key: str, script: Path, video_id: str, mode: str) -> list[str]:
+def _build_stage_cmd(key: str, script: Path, video_id: str, mode: str, generate_viz: bool = True) -> list[str]:
     """Build the subprocess command for a stage, mirroring app.py arg construction.
 
-    API runs skip all visualization outputs (--no-viz, --no-report) because the
-    annotated MP4s and PNG plots are only consumed by the desktop UI — they account
-    for ~60% of per-run disk usage and are never served by the API.
+    API runs skip all visualization outputs (--no-report) by default.
+    Visualized outputs (--no-viz) are generated only if generate_viz is True.
     """
     base = [sys.executable, str(script)]
     if key == "extract_selected_features":
-        return base + [mode, "--video-id", video_id, "--no-viz", "--no-report"]
+        cmd = base + [mode, "--video-id", video_id, "--no-report"]
+        if not generate_viz:
+            cmd.append("--no-viz")
+        return cmd
     elif key == "temporal_segmentation":
-        return base + ["--video-id", video_id, "--no-viz"]
+        cmd = base + ["--video-id", video_id]
+        if not generate_viz:
+            cmd.append("--no-viz")
+        return cmd
     elif key == "classify_views":
         return base + ["--video-id", video_id]
     elif key == "scoring":
@@ -127,9 +132,10 @@ def _run_stage(
     workspace_root: Path,
     logs_root: Path,
     mode: str,
+    generate_viz: bool = True,
 ) -> str:
     """Run one pipeline stage; returns captured stdout+stderr."""
-    cmd = _build_stage_cmd(key, script, video_id, mode)
+    cmd = _build_stage_cmd(key, script, video_id, mode, generate_viz)
     env = os.environ.copy()
     env["EXEVISION_MODEL_PATH"] = str(SHARED_MODEL_PATH)
     env["EXEVISION_FACE_MODEL_PATH"] = str(SHARED_FACE_MODEL_PATH)
@@ -186,16 +192,20 @@ def _delete_input_video(workspace_root: Path, filename: str) -> None:
         video_copy.unlink()
 
 
-def _cleanup_workspace(workspace_root: Path) -> None:
+def _cleanup_workspace(workspace_root: Path, generate_viz: bool = True) -> None:
     """
     Remove heavy intermediate artifacts from the workspace after results are collected.
 
+    Args:
+        workspace_root: Root directory of the workspace
+        generate_viz: If True, visualization directories are KEPT (served to frontend).
+                      If False, they are removed as they are unneeded.
+
     What is removed:
-    - squat/visualized_poses_clean/   (annotated pose MP4s — only useful in desktop UI)
-    - squat/visualized_segmentation/  (phase overlay MP4s — only useful in desktop UI)
+    - squat/visualized_segmentation/  (phase overlay MP4s — only removed if generate_viz=False)
     - squat/analysis_reports/         (PNG plots — only useful in desktop UI)
-    - squat/dataset_videos_all/       (input video copy — deleted earlier; belt-and-suspenders)
     - squat/extracted_features_clean/ (large landmark JSONs — no longer needed after scoring)
+    - squat/segmented_reps/           (intermediate rep JSON — no longer needed)
 
     What is kept (in run_root/logs/):
     - Per-stage log files (~21 KB) — useful for debugging failures
@@ -203,15 +213,21 @@ def _cleanup_workspace(workspace_root: Path) -> None:
     What is kept (in run_root/workspace/squat/):
     - aqa_analysis_simple/  (AQA JSON — source of truth for re-collecting results)
     - neural_analysis/      (neural JSON — same)
+    - visualized_poses_clean/    (annotated pose MP4s — kept if generate_viz=True)
+    - visualized_segmentation/   (phase overlay MP4s — kept if generate_viz=True)
     """
     subdirs_to_remove = [
-        "squat/visualized_poses_clean",
-        "squat/visualized_segmentation",
         "squat/analysis_reports",
-        "squat/dataset_videos_all",
         "squat/extracted_features_clean",
         "squat/segmented_reps",
     ]
+    # Only remove visualization directories if visualization was not requested
+    if not generate_viz:
+        subdirs_to_remove.extend([
+            "squat/visualized_segmentation",
+            "squat/visualized_poses_clean",
+        ])
+    
     for rel in subdirs_to_remove:
         target = workspace_root / rel
         if target.exists():
@@ -485,6 +501,66 @@ def _build_feedback_fallback(merged_reps: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
+def _upload_visualization_to_supabase(
+    viz_path: Path,
+    job_id: str,
+) -> str | None:
+    """
+    Upload annotated video to Supabase Storage and return relative bucket path.
+
+    Frontend generates signed URLs via /api/inference/visualization/[jobId].
+    Backend only handles upload and returns the relative path.
+
+    Args:
+        viz_path: Path to the annotated MP4 video file
+        job_id: Job/inference ID (used in Supabase path)
+
+    Returns:
+        Relative path "inference-results/{job_id}/with_landmarks.mp4" if successful, or None.
+    """
+    if not viz_path.exists():
+        logger.warning(f"Visualization file not found: {viz_path}")
+        return None
+
+    supabase_url = os.environ.get("SUPABASE_URL", "").strip()
+    supabase_key = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+
+    if not supabase_url or not supabase_key:
+        logger.error(
+            "SUPABASE_URL and SUPABASE_SERVICE_KEY environment variables are required. "
+            "See apps/api/.env.example for setup instructions."
+        )
+        return None
+
+    try:
+        from supabase import create_client, Client
+
+        supabase: Client = create_client(supabase_url, supabase_key)
+        bucket = "inference-results"
+        file_path = f"{job_id}/with_landmarks.mp4"
+
+        logger.info(f"Uploading visualization to Supabase: {bucket}/{file_path}")
+
+        with open(viz_path, "rb") as f:
+            supabase.storage.from_(bucket).upload(
+                path=file_path,
+                file=f,
+                file_options={
+                    "content-type": "video/mp4",
+                    "x-upsert": "true",
+                },
+            )
+
+        # Return relative path for frontend to generate signed URL
+        relative_path = f"{bucket}/{file_path}"
+        logger.info(f"Visualization uploaded successfully: {relative_path}")
+        return relative_path
+
+    except Exception as e:
+        logger.error(f"Failed to upload visualization to Supabase: {e}", exc_info=True)
+        return None
+
+
 def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
     """
     Locate Stage 8 (heuristic), Stage 9 (neural), and Stage 5 (segmentation) output
@@ -743,6 +819,52 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
         if not merged_reps:
             print(f"[DIAGNOSTIC] Skipping feedback: no merged_reps to process (count={merged_reps_count})", flush=True)
 
+    base_url = os.environ.get("API_PUBLIC_URL", "http://localhost:8000").rstrip("/")
+    job_id = workspace_root.parent.name
+
+    logger.info(f"collect_results: workspace_root={workspace_root}, video_id={video_id}")
+    logger.info(f"workspace_root exists: {workspace_root.exists()}")
+    logger.info(f"workspace_root type: {type(workspace_root)}")
+
+    # Check if these directories exist
+    dataset_dir = workspace_root / "squat" / "dataset_videos_all"
+    logger.info(f"dataset_dir={dataset_dir}, exists={dataset_dir.exists()}")
+
+    viz_dir = workspace_root / "squat" / "visualized_poses_clean"
+    logger.info(f"viz_dir={viz_dir}, exists={viz_dir.exists()}")
+
+    # Safe lookups
+    videos_dict = {}
+
+    try:
+        if dataset_dir.exists():
+            raw_matches = sorted(dataset_dir.glob(f"{video_id}.*"))
+            logger.info(f"raw_matches: {raw_matches}")
+            if raw_matches:
+                videos_dict["raw"] = f"{base_url}/results/{job_id}/workspace/{raw_matches[0].relative_to(workspace_root).as_posix()}"
+    except Exception as e:
+        logger.error(f"Error finding raw video: {e}")
+
+    try:
+        
+        if viz_dir.exists():
+            viz_matches = sorted(viz_dir.rglob(f"{video_id}_annotated.mp4"))
+            logger.info(f"viz_matches: {viz_matches}")
+            logger.info(f"viz_dir exists: {viz_dir}, files: {[p.name for p in sorted(viz_dir.iterdir())]}")
+            if viz_matches:
+                viz_file = viz_matches[0]
+                # Upload to Supabase (required for both local and production)
+                viz_path = _upload_visualization_to_supabase(viz_file, job_id)
+                if viz_path:
+                    videos_dict["with_landmarks"] = viz_path
+                    logger.info(f"Using uploaded visualization: {viz_path}")
+                else:
+                    logger.warning("Visualization upload failed; will not include in result")
+    except Exception as e:
+        logger.error(f"Error finding/uploading annotated video: {e}")
+
+    logger.info(f"videos_dict: {videos_dict}")
+
     result = {
         "video_id": video_id,
         "view": aqa.get("view"),
@@ -756,6 +878,9 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
         "any_anchor_corrections": any_corrections,
         "reps": merged_reps,
         "feedback": feedback_payload,
+        "videos": videos_dict,
+        "visualization_available": bool(videos_dict.get("with_landmarks")),
+        "visualization_url": videos_dict.get("with_landmarks"),
     }
     
     has_feedback = feedback_payload is not None and "error" not in (feedback_payload or {})
@@ -789,6 +914,7 @@ def run_pipeline_sync(
     video_path: Path,
     stages: list[str] | None = None,
     mode: str = "filtered",
+    generate_viz: bool = True,
 ) -> dict[str, Any]:
     """
     Run the full pipeline synchronously for a single video.
@@ -818,12 +944,12 @@ def run_pipeline_sync(
         if key == "extract_selected_features":
             # Run filtered first — may produce no output for Poor quality videos (not a fatal error)
             try:
-                _run_stage(key, spec.script, video_id, workspace_root, logs_root, "filtered")
+                _run_stage(key, spec.script, video_id, workspace_root, logs_root, "filtered", generate_viz)
                 logger.info("Stage extract_selected_features (filtered) completed.")
             except RuntimeError as e:
                 logger.warning(f"Filtered extraction failed (likely Poor quality): {e}")
             # Run unfiltered unconditionally — always produces output
-            _run_stage(key, spec.script, video_id, workspace_root, logs_root, "unfiltered")
+            _run_stage(key, spec.script, video_id, workspace_root, logs_root, "unfiltered", generate_viz)
             logger.info("Stage extract_selected_features (unfiltered) completed.")
             # Validate that at least one of the two produced the expected artifact
             _validate_stage_output(key, workspace_root, video_id)
@@ -831,7 +957,7 @@ def run_pipeline_sync(
             # Neural fusion is optional: if it fails, we still return feedback based on heuristic scores.
             # All other stages are mandatory: failure propagates.
             try:
-                _run_stage(key, spec.script, video_id, workspace_root, logs_root, mode)
+                _run_stage(key, spec.script, video_id, workspace_root, logs_root, mode, generate_viz)
                 _validate_stage_output(key, workspace_root, video_id)
             except RuntimeError as exc:
                 if key == "neural_fusion":
@@ -844,8 +970,8 @@ def run_pipeline_sync(
         # After extraction completes, remove the input video copy — it is no longer
         # needed (stage 2.5 has already produced the feature JSON) and accounts for
         # ~15% of workspace disk usage.
-        if key == "extract_selected_features":
-            _delete_input_video(workspace_root, video_path.name)
+        # if key == "extract_selected_features":
+        #     _delete_input_video(workspace_root, video_path.name)
 
     result = collect_results(workspace_root, video_id)
 
@@ -861,7 +987,8 @@ def run_pipeline_sync(
     # output (2 KB of JSON) is returned in-memory; the workspace is ~5–7 MB of
     # intermediate files that are not needed after this point.
     # Logs are retained for debugging; only the heavy intermediate files are removed.
-    _cleanup_workspace(workspace_root)
+    # Visualization directories are retained if generate_viz=True so frontend can serve them.
+    _cleanup_workspace(workspace_root, generate_viz=generate_viz)
 
     print(f"[DIAGNOSTIC] run_pipeline_sync END: job_id={job_id}, rep_count={result['rep_count']}, has_feedback={result['feedback'] is not None}, neural_available={result['neural_available']}", flush=True)
     return result

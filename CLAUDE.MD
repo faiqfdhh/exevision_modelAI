@@ -1,6 +1,6 @@
 # CLAUDE.MD — ExeVision AI Project Knowledge Base
 
-_Last updated: 2026-03-30 (GCR deployment live; feedback fallback + config guardrails; neural fusion non-fatal fallback policy; OpenGL ES Dockerfile fix; json discovery fixes in stages 2.5, 8, and 9; web layout/schema contract updates)_
+_Last updated: 2026-03-31 (Visualization upload to Supabase; local file-serving fallback for testing; .env.example added)_
 
 ---
 
@@ -41,6 +41,8 @@ ExeVision AI remains in **late prototyping / early pre-production** for squat an
 
 **API schema extension (2026-03-30):** `apps/api/pipeline.py` now emits optional rep-level charting fields from Stage 5 alongside existing scores: `phase_timeline` (phase spans + tempo summary) and `kinematic_data` (ROM time-series as `{time, rom}` points). Frontend rendering should be conditional when these fields are absent.
 
+**Visualization upload (2026-03-31):** Annotated/visualized videos (with pose landmarks and phase overlays) are now uploaded to Supabase Storage after pipeline completion. Results include `videos.with_landmarks` URL (signed, 1 hour expiry). Local development falls back to file serving via FastAPI `/results/{job_id}/workspace/...` endpoint when Supabase credentials are not configured. Cloud Run deployments require `SUPABASE_URL` + `SUPABASE_SERVICE_KEY` env vars set; see `apps/api/.env.example`.
+
 ---
 
 ## Quick Start
@@ -56,6 +58,7 @@ python -m pip install -r apps/api/requirements.txt
 
 # PowerShell (Windows):
 $env:INFERENCE_API_SECRET="your-secret"; python -m uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
+
 # bash/Linux:
 INFERENCE_API_SECRET=your-secret python -m uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
 
@@ -63,6 +66,15 @@ INFERENCE_API_SECRET=your-secret python -m uvicorn apps.api.main:app --host 0.0.
 # Submit job:   curl -X POST http://localhost:8000/infer -H "Authorization: Bearer your-secret" \
 #               -d '{"video_url":"<url>","job_id":"<uuid>"}'
 ```
+
+**Visualization Setup:**
+- **Local testing (recommended):** Leave `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` unset. Annotated videos will be served locally via `/results/{job_id}/workspace/...` and included in results as `videos.with_landmarks` URLs.
+- **Production on Cloud Run:** Set both Supabase env vars to upload visualizations to Supabase Storage. See `apps/api/.env.example` for details.
+  ```bash
+  export SUPABASE_URL="https://your-project.supabase.co"
+  export SUPABASE_SERVICE_KEY="your-service-role-key"
+  # Then deploy with --set-env-vars="${SUPABASE_URL},${SUPABASE_SERVICE_KEY}"
+  ```
 
 ### Deploy to Google Cloud Run
 ```bash
@@ -75,16 +87,23 @@ export REGISTRY="${GCR_REGION}-docker.pkg.dev/${GCP_PROJECT}/${IMAGE_NAME}"
 # Build and push via Cloud Build (builds on GCP — no local upload of model files)
 gcloud builds submit --tag "${REGISTRY}/${IMAGE_NAME}:latest" --project=$GCP_PROJECT .
 
-# Deploy
+# Deploy with Supabase credentials for visualization upload
 gcloud run deploy $IMAGE_NAME \
   --image="${REGISTRY}/${IMAGE_NAME}:latest" \
   --region=$GCR_REGION --memory=4Gi --cpu=2 --timeout=600 \
   --concurrency=1 --min-instances=0 --max-instances=3 \
-  --set-env-vars="INFERENCE_API_SECRET=<secret>,CORS_ORIGINS=https://your-app.vercel.app"
+  --set-env-vars="INFERENCE_API_SECRET=<secret>,CORS_ORIGINS=https://your-app.vercel.app,SUPABASE_URL=https://your-project.supabase.co,SUPABASE_SERVICE_KEY=<service-role-key>"
 
-# Local Docker test
+# Local Docker test (without Supabase — uses local file serving)
 docker build -t exevision-modelai:local .
 docker run --rm -p 8000:8000 -e INFERENCE_API_SECRET=test-secret exevision-modelai:local
+
+# Docker test with Supabase (if you want to test upload)
+docker run --rm -p 8000:8000 \
+  -e INFERENCE_API_SECRET=test-secret \
+  -e SUPABASE_URL=https://your-project.supabase.co \
+  -e SUPABASE_SERVICE_KEY=your-key \
+  exevision-modelai:local
 ```
 
 ### Run Training (Step 2 Neural)
@@ -105,6 +124,19 @@ python core/exevision/analysis/analyze_annotations.py
 - **Key packages:** `mediapipe`, `torch`, `torchvision`, `opencv-python`, `numpy`, `scipy` (no `requirements.txt` yet — see §9)
 - **MediaPipe model:** `models/pose_landmarker_heavy.task` must be present before running Stage 2.5
 - **Dataset videos:** `squat/dataset_videos_all/` (not tracked in git; required for pipeline runs)
+
+**API Server Environment Variables (see `apps/api/.env.example`):**
+- `INFERENCE_API_SECRET` — Shared secret between API and Next.js app (required)
+- `API_PUBLIC_URL` — Public URL of the API, defaults to `http://localhost:8000`
+- `CORS_ORIGINS` — Comma-separated list of allowed origins, defaults to `*` (unsafe in production)
+- `SUPABASE_URL` — Supabase project URL (optional; if unset, visualizations are served locally)
+- `SUPABASE_SERVICE_KEY` — Supabase service role key (optional; required only if `SUPABASE_URL` is set)
+
+**Getting Supabase credentials:**
+1. Go to Supabase Dashboard → Settings → API → Keys and URLs
+2. Copy `Project URL` → `SUPABASE_URL`
+3. Copy `Service Role` key → `SUPABASE_SERVICE_KEY` (⚠️ server-only, never expose to browser)
+4. Ensure bucket `inference-results` exists in Supabase Storage (create if missing)
 
 > **Note:** `adapters/legacy-cli/run_stage.py` is currently broken post-migration (points to deleted `scripts/` paths — see §9 issue #8). Use `apps/desktop-ui/app.py` or invoke stage scripts from `core/exevision/stages/` directly.
 
@@ -362,6 +394,7 @@ Master index: `training_dataset/annotations/index.json`
 17. **Type/validation pattern for results pages:** Normalize payload shape before reads (`result_json?.result ?? result_json`), validate feedback (`schema_version`, array shape), and only evaluate no-feedback fallback when `status === "done"`.
 18. **Conditional rendering (single vs multi-rep):** For `rep_count == 1`, bypass rep tabs and render one card directly; for `rep_count > 1`, show selector tabs and rep-specific narratives.
 19. **Do not over-interpret fallback copy:** If `feedback` is missing, do not assume neural was skipped unless `neural_available === false` is explicitly confirmed.
+20. **Visualization upload behavior (2026-03-31):** Annotated videos are uploaded to Supabase Storage after pipeline completes. When `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` are unset, the API falls back to local file serving via `/results/{job_id}/workspace/...` (works only on localhost). On production Cloud Run without Supabase creds, visualizations will not be included in results (`videos.with_landmarks` will be null). Ensure `inference-results` bucket exists in Supabase Storage before deploying.
 
 ### Recently Resolved (✓ Fixed)
 
@@ -378,8 +411,9 @@ Master index: `training_dataset/annotations/index.json`
 | **Stage json file discovery path assumption** | **2026-03-29** | **`extract_selected_features.py` and `scoring.py` had hardcoded path assumptions that broke in containerized CWD. Fixed by making json discovery search the full `aqa_analysis_simple/` subtree rather than a specific nested path.** |
 | **Neural fusion failure policy update** | **2026-03-29** | **`pipeline.py` now treats neural fusion failure as non-fatal, logs warning, and continues returning result payloads. Neural unavailability is surfaced via `result.neural_available`.** |
 | **Feedback null-on-GCR hotfix** | **2026-03-29** | **When feedback config files are missing, `pipeline.py` now emits a schema-compatible fallback `feedback` payload instead of `null`. Dockerfile also asserts required config files exist during image build.** |
+| **Visualization upload to Supabase** | **2026-03-31** | **Annotated videos now uploaded to Supabase Storage (requires `SUPABASE_URL` + `SUPABASE_SERVICE_KEY` env vars). Falls back to local file serving when creds unset (localhost only). Results include `videos.with_landmarks` signed URL (1 hour expiry). Added `apps/api/.env.example` with setup instructions.** |
 
-### Maturity by Layer (as of 2026-03-29)
+### Maturity by Layer (as of 2026-03-31)
 
 - **Data processing pipeline:** Strongly progressed (end-to-end stages fully integrated)
 - **Stage 4 (view classification):** Robust (visibility-based + nose-vs-hip Z-depth)
@@ -390,7 +424,7 @@ Master index: `training_dataset/annotations/index.json`
 - **Step 2 training/evaluation tooling:** Improved — fusion architecture fixed, per-rep corrections working, beats linear baseline
 - **Step 2 production integration:** API pipeline live (Stage 9 in `DEFAULT_STAGES`); desktop UI still heuristic-only
 - **Modular package (`src`):** Medium (clean stages 1–3; later placeholders)
-- **Ops/productization:** Good (API server containerized + deployed to GCR; `requirements-runtime.txt` created; CI/CD via `cloudbuild.yaml`)
+- **Ops/productization:** Good (API server containerized + deployed to GCR; `requirements-runtime.txt` created; CI/CD via `cloudbuild.yaml`; visualization upload to Supabase with local fallback)
 - **Roadmap completion:** Partial (symbolic active; dataset collection in progress; neural inference live in API; GCR deployed; web app toggle integration pending)
 
 ### Run History Evidence

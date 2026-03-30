@@ -26,6 +26,8 @@ RUN pip install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cpu
 
 # Install remaining runtime deps (requirements-runtime.txt excludes torch/torchvision)
+# NOTE: requirements-runtime.txt includes `supabase` so containerized Cloud Run deployments
+# have the Supabase Python client available for visualization uploads.
 RUN pip install --no-cache-dir -r requirements-runtime.txt
 
 # ── Application source ────────────────────────────────────────────────────────

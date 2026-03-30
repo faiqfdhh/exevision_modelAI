@@ -23,7 +23,8 @@ Usage
 """
 
 from __future__ import annotations
-
+from dotenv import load_dotenv
+load_dotenv()  # Load .env.local and .env
 import logging
 import sys
 from pathlib import Path
@@ -45,6 +46,7 @@ from typing import Any, Literal
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Security, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
 
 from pipeline import (
@@ -57,7 +59,9 @@ from pipeline import (
     DEFAULT_STAGES,
     download_video,
     run_pipeline_sync,
+    RUNS_ROOT,
 )
+
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 # Shared secret between this server and the Next.js app.
@@ -140,6 +144,8 @@ app = FastAPI(
     version="1.0.0",
 )
 
+app.mount("/results", StaticFiles(directory=str(RUNS_ROOT)), name="results")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
@@ -154,6 +160,7 @@ class InferRequest(BaseModel):
     job_id: str | None = None               # Optional; generated if not provided
     stages: list[str] | None = None         # Subset of DEFAULT_STAGES; None = run all
     mode: Literal["filtered", "unfiltered"] = "filtered"
+    generate_viz: bool = True               # Generate visuals (annotated video outputs from MediaPipe)
     callback_url: str | None = None         # Optional: POST result here when done
 
 
@@ -201,7 +208,7 @@ def _fire_callback(callback_url: str, payload: dict[str, Any]) -> None:
 
 
 # ── Background task ────────────────────────────────────────────────────────────
-def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, callback_url: str | None) -> None:
+def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, callback_url: str | None, generate_viz: bool) -> None:
     """Downloads the video and runs the full pipeline. Runs in a background thread."""
     import asyncio
     import httpx
@@ -226,6 +233,7 @@ def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, ca
                 video_path=video_path,
                 stages=stages,
                 mode=mode,
+                generate_viz=generate_viz,
             )
 
         completed_at = datetime.now(timezone.utc).isoformat()
@@ -233,7 +241,14 @@ def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, ca
 
         # Fire-and-forget callback to Next.js / Supabase if requested
         if callback_url:
-            _fire_callback(callback_url, {"job_id": job_id, "status": "done", "result": result})
+            callback_payload = {
+                "job_id": job_id,
+                "status": "done",
+                "result": result,
+                "visualization_url": result.get("visualization_url"),
+                "visualization_available": result.get("visualization_available", False),
+            }
+            _fire_callback(callback_url, callback_payload)
 
     except Exception as exc:
         completed_at = datetime.now(timezone.utc).isoformat()
@@ -244,7 +259,14 @@ def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, ca
             completed_at=completed_at,
         )
         if callback_url:
-            _fire_callback(callback_url, {"job_id": job_id, "status": "failed", "error": str(exc)})
+            callback_payload = {
+                "job_id": job_id,
+                "status": "failed",
+                "error": str(exc),
+                "visualization_url": None,
+                "visualization_available": False,
+            }
+            _fire_callback(callback_url, callback_payload)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -279,6 +301,7 @@ def submit_inference(req: InferRequest, background_tasks: BackgroundTasks) -> di
         stages=stages,
         mode=req.mode,
         callback_url=req.callback_url,
+        generate_viz=req.generate_viz,
     )
     return {"job_id": job_id, "status": "queued"}
 

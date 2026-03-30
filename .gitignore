@@ -18,3 +18,5 @@ pipeline_ui_runs/
 CLAUDE.md
 CHANGELOG.md
 Faiqs SRD.md
+*.env.local
+*.env
