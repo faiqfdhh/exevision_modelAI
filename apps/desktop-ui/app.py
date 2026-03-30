@@ -38,6 +38,7 @@ STAGES_DIR = WORKSPACE_ROOT / "core" / "exevision" / "stages"
 # Legacy root: still used for dataset_videos_all default and analyze_results script
 RUNTIME_ROOT = WORKSPACE_ROOT / "_hidden_legacy"
 RUNS_ROOT = WORKSPACE_ROOT / "pipeline_ui_runs"
+LEGACY_RUNS_ROOT = RUNTIME_ROOT / "pipeline_ui_runs"
 SHARED_MODEL_PATH = WORKSPACE_ROOT / "models" / "pose_landmarker_heavy.task"
 SHARED_FACE_MODEL_PATH = WORKSPACE_ROOT / "models" / "blaze_face_short_range.tflite"
 
@@ -2215,22 +2216,25 @@ class AnnotationToolUI:
         # 1. Quickly find all processed videos by scanning RUNS_ROOT once
         processed_vids = set()
         self.video_scores = {}
-        if RUNS_ROOT.exists():
-            for run_dir in list(RUNS_ROOT.iterdir()):
-                if not run_dir.is_dir(): continue
+        for runs_root in (RUNS_ROOT, LEGACY_RUNS_ROOT):
+            if not runs_root.exists():
+                continue
+            for run_dir in list(runs_root.iterdir()):
+                if not run_dir.is_dir():
+                    continue
                 # Fix: Check for both segmentation and scores
                 seg_root = run_dir / "workspace" / "squat" / "segmented_reps"
                 if seg_root.exists():
                     for f in seg_root.rglob("*_segmented.json"):
                         vid_id = f.stem.replace("_segmented", "")
                         processed_vids.add(vid_id)
-                
+
                 score_root = run_dir / "workspace" / "squat" / "aqa_analysis_simple"
                 if score_root.exists():
                     for f in score_root.rglob("*_aqa_simple.json"):
                         vid_id = f.stem.replace("_aqa_simple", "")
                         try:
-                            with open(f, "r") as json_f:
+                            with open(f, "r", encoding="utf-8") as json_f:
                                 score_data = json.load(json_f)
                                 if "overall_score" in score_data:
                                     self.video_scores[vid_id] = float(score_data["overall_score"])
@@ -2570,15 +2574,17 @@ class AnnotationToolUI:
         segmented + scored output for this video_id.
         Returns (run_workspace_path, run_name) or (None, "").
         """
-        if not RUNS_ROOT.exists():
+        candidate_run_dirs: list[Path] = []
+        for runs_root in (RUNS_ROOT, LEGACY_RUNS_ROOT):
+            if not runs_root.exists():
+                continue
+            candidate_run_dirs.extend([d for d in runs_root.iterdir() if d.is_dir()])
+
+        if not candidate_run_dirs:
             return None, ""
 
         # Check runs in reverse chronological order (newest first)
-        run_dirs = sorted(
-            [d for d in RUNS_ROOT.iterdir() if d.is_dir()],
-            key=lambda d: d.name,
-            reverse=True,
-        )
+        run_dirs = sorted(candidate_run_dirs, key=lambda d: d.name, reverse=True)
 
         for run_dir in run_dirs:
             workspace = run_dir / "workspace"
@@ -3286,7 +3292,19 @@ class AnnotationToolUI:
             p = Path(path_text)
             if not p.is_absolute():
                 p = PROJECT_ROOT / p
-            return str(p) if p.exists() else ""
+            if p.exists():
+                return str(p)
+
+            # Migration compatibility: historical pipeline outputs may have moved
+            # from pipeline_ui_runs/ to _hidden_legacy/pipeline_ui_runs/.
+            normalized = path_text.replace("\\", "/")
+            if normalized.startswith("pipeline_ui_runs/"):
+                legacy_rel = normalized.replace("pipeline_ui_runs/", "", 1)
+                legacy_path = LEGACY_RUNS_ROOT / legacy_rel
+                if legacy_path.exists():
+                    return str(legacy_path)
+
+            return ""
 
         def _find_overlay_from_pipeline_outputs(video_id: str, quality: str) -> str:
             outputs = self.current_annotation.get("pipeline_outputs", {}) if self.current_annotation else {}
