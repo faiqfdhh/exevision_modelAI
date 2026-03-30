@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import random
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -13,6 +14,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+
+# Add neural/ directory to path so nn_models and nn_utils can be imported
+_NEURAL_DIR = Path(__file__).resolve().parent.parent / "neural"
+if str(_NEURAL_DIR) not in sys.path:
+    sys.path.insert(0, str(_NEURAL_DIR))
 
 from nn_models import BiLSTMScorer, HeuristicGuidedFusion, STGCNScorer, build_heuristic_vector
 from nn_utils import _extract_stgcn_rep, build_adjacency_matrix, pad_or_truncate
@@ -97,6 +103,13 @@ def resolve_feature_path(root: Path, annotation_data: dict, video_id: str) -> Op
         candidates.append(root / raw)
         candidates.append(root / raw.replace("\\", "/"))
 
+        # Migration compatibility: many historical annotations reference
+        # pipeline_ui_runs/... paths that were moved under _hidden_legacy/.
+        normalized_raw = raw.replace("\\", "/")
+        if normalized_raw.startswith("pipeline_ui_runs/"):
+            legacy_rel = normalized_raw.replace("pipeline_ui_runs/", "", 1)
+            candidates.append(root / "_hidden_legacy" / "pipeline_ui_runs" / legacy_rel)
+
     for c in candidates:
         if c.exists():
             return c
@@ -106,11 +119,25 @@ def resolve_feature_path(root: Path, annotation_data: dict, video_id: str) -> Op
         root / "squat" / "extracted_features_clean" / "good",
         root / "squat" / "extracted_features_clean" / "fair",
         root / "squat" / "extracted_features_clean" / "raw_unfiltered",
+        # Also check training_dataset/squat paths (for training_dataset as root)
+        root / "training_dataset" / "squat" / "extracted_features_clean" / "excellent",
+        root / "training_dataset" / "squat" / "extracted_features_clean" / "good",
+        root / "training_dataset" / "squat" / "extracted_features_clean" / "fair",
+        root / "training_dataset" / "squat" / "extracted_features_clean" / "raw_unfiltered",
     ]
     for base in fallback_roots:
         p = base / f"{video_id}.json"
         if p.exists():
             return p
+
+    # Last-resort compatibility search for migrated historical runs.
+    pipeline_run = annotation_data.get("pipeline_run")
+    if pipeline_run:
+        legacy_glob = root / "_hidden_legacy" / "pipeline_ui_runs" / str(pipeline_run) / "workspace" / "squat" / "extracted_features_clean"
+        matches = sorted(legacy_glob.glob(f"**/{video_id}.json"))
+        if matches:
+            return matches[0]
+
     return None
 
 
@@ -288,7 +315,12 @@ def build_records(root: Path, index_path: Path) -> Tuple[List[RepRecord], Dict[s
     video_scores: Dict[str, float] = {}
 
     for video_id in video_ids:
-        anno_path = root / "dataset" / "annotations" / "videos" / f"{video_id}.json"
+        # Try multiple possible paths for annotations
+        anno_path = root / "training_dataset" / "annotations" / "videos" / f"{video_id}.json"
+        if not anno_path.exists():
+            anno_path = root / "annotations" / "videos" / f"{video_id}.json"
+        if not anno_path.exists():
+            anno_path = root / "dataset" / "annotations" / "videos" / f"{video_id}.json"
         if not anno_path.exists():
             continue
 
@@ -714,6 +746,14 @@ def train_phase_fusion(
     epochs_no_improve = 0
     early_stop_patience = 25
 
+    # SWA: collect snapshots from the plateau region and average them.
+    # On small datasets the single best-val checkpoint is a noisy snapshot;
+    # weight averaging smooths the loss surface and finds flatter minima.
+    swa_start_epoch = max(1, epochs // 3)  # Start collecting after first third
+    swa_snapshots: List[Dict[str, torch.Tensor]] = []
+    swa_encoder_snapshots_bilstm: List[Dict[str, torch.Tensor]] = []
+    swa_encoder_snapshots_stgcn: List[Dict[str, torch.Tensor]] = []
+
     for epoch in range(1, epochs + 1):
         bilstm.train()
         stgcn.train()
@@ -766,9 +806,65 @@ def train_phase_fusion(
         else:
             epochs_no_improve += 1
 
+        # Collect SWA snapshots once training enters the plateau region
+        if epoch >= swa_start_epoch:
+            swa_snapshots.append({k: v.clone().cpu() for k, v in fusion.state_dict().items()})
+            swa_encoder_snapshots_bilstm.append({k: v.clone().cpu() for k, v in bilstm.state_dict().items()})
+            swa_encoder_snapshots_stgcn.append({k: v.clone().cpu() for k, v in stgcn.state_dict().items()})
+
         if epochs_no_improve >= early_stop_patience:
             print(f"[Phase3] Early stopping: no improvement for {early_stop_patience} epochs. Stopping at epoch {epoch}.")
             break
+
+    # Apply SWA: average collected snapshots and evaluate
+    if len(swa_snapshots) >= 5:
+        print(f"[Phase3-SWA] Averaging {len(swa_snapshots)} snapshots (epochs {swa_start_epoch}–{epoch})...")
+        avg_fusion = {}
+        for key in swa_snapshots[0]:
+            # Only average floating-point tensors (skip buffers like running_mean/var)
+            if swa_snapshots[0][key].dtype.is_floating_point:
+                avg_fusion[key] = torch.stack([s[key] for s in swa_snapshots]).mean(dim=0)
+            else:
+                avg_fusion[key] = swa_snapshots[0][key]  # Use first snapshot for non-float buffers
+        avg_bilstm = {}
+        for key in swa_encoder_snapshots_bilstm[0]:
+            if swa_encoder_snapshots_bilstm[0][key].dtype.is_floating_point:
+                avg_bilstm[key] = torch.stack([s[key] for s in swa_encoder_snapshots_bilstm]).mean(dim=0)
+            else:
+                avg_bilstm[key] = swa_encoder_snapshots_bilstm[0][key]
+        avg_stgcn = {}
+        for key in swa_encoder_snapshots_stgcn[0]:
+            if swa_encoder_snapshots_stgcn[0][key].dtype.is_floating_point:
+                avg_stgcn[key] = torch.stack([s[key] for s in swa_encoder_snapshots_stgcn]).mean(dim=0)
+            else:
+                avg_stgcn[key] = swa_encoder_snapshots_stgcn[0][key]
+
+        # Evaluate SWA average
+        fusion.load_state_dict(avg_fusion)
+        bilstm.load_state_dict(avg_bilstm)
+        stgcn.load_state_dict(avg_stgcn)
+        fusion.to(device)
+        bilstm.to(device)
+        stgcn.to(device)
+
+        swa_val_loss, swa_abs_res, swa_std_res = evaluate_fusion(bilstm, stgcn, fusion, val_loader, device)
+        print(
+            f"[Phase3-SWA] val={swa_val_loss:.5f} |res|={swa_abs_res:.3f} res_std={swa_std_res:.3f} "
+            f"(best single={best:.5f})"
+        )
+
+        # Save SWA model if it beats the best single checkpoint
+        if swa_val_loss < best:
+            print(f"[Phase3-SWA] SWA beats best checkpoint ({swa_val_loss:.2f} < {best:.2f}). Saving SWA model.")
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(fusion.state_dict(), save_path)
+            # Also save the averaged encoders since they were part of the SWA
+            bilstm_path = save_path.parent / "bilstm_finetuned.pt"
+            stgcn_path = save_path.parent / "stgcn_finetuned.pt"
+            torch.save(bilstm.state_dict(), bilstm_path)
+            torch.save(stgcn.state_dict(), stgcn_path)
+        else:
+            print(f"[Phase3-SWA] SWA did not beat best checkpoint ({swa_val_loss:.2f} >= {best:.2f}). Keeping best.")
 
 
 def train_optional_joint(
@@ -872,9 +968,11 @@ def train_optional_joint(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ExeVision Step 2 supervised fine-tuning")
-    parser.add_argument("--root", type=str, default=str(Path(__file__).resolve().parents[1]))
-    parser.add_argument("--index-json", type=str, default="dataset/annotations/index.json")
-    parser.add_argument("--splits-json", type=str, default="dataset/splits.json")
+    # Default root should be repository root so relative defaults resolve correctly
+    # when this script is launched from core/exevision/training.
+    parser.add_argument("--root", type=str, default=str(Path(__file__).resolve().parents[3]))
+    parser.add_argument("--index-json", type=str, default="training_dataset/annotations/index.json")
+    parser.add_argument("--splits-json", type=str, default="training_dataset/splits.json")
 
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=SEED)

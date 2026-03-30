@@ -193,11 +193,12 @@ def infer_rep(
             # Extract scalars
             neural_score_pre = float(pred[0].cpu().numpy())
             residual_val = float(residual[0].cpu().numpy())
-            smoothness = float(bo["smoothness"][0].cpu().numpy()) * 100.0
-            control = float(bo["control"][0].cpu().numpy()) * 100.0
-            depth = float(so["depth"][0].cpu().numpy()) * 100.0
-            forward_lean = float(so["forward_lean"][0].cpu().numpy()) * 100.0
-            knee_tracking = float(so["knee_tracking"][0].cpu().numpy()) * 100.0
+            smoothness = max(0.0, min(100.0, float(bo["smoothness"][0].cpu().numpy()) * 100.0))
+            control = max(0.0, min(100.0, float(bo["control"][0].cpu().numpy()) * 100.0))
+            # ST-GCN spatial head outputs are unbounded; clamp to [0, 100] after scaling
+            depth = max(0.0, min(100.0, float(so["depth"][0].cpu().numpy()) * 100.0))
+            forward_lean = max(0.0, min(100.0, float(so["forward_lean"][0].cpu().numpy()) * 100.0))
+            knee_tracking = max(0.0, min(100.0, float(so["knee_tracking"][0].cpu().numpy()) * 100.0))
 
         # Apply safety clamps
         flags = rep_data.get("heuristic_flags", {}) or {}

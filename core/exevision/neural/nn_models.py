@@ -92,6 +92,7 @@ class STGCNScorer(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(64, 3),
+            nn.Sigmoid(),  # Force outputs to [0, 1]; will be scaled to [0, 100] at inference
         )
 
         self.auxiliary_heuristic_head = nn.Sequential(
