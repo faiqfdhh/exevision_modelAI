@@ -943,11 +943,14 @@ def get_face_detector_options(use_gpu=True):
     )
 
 def find_video_path(video_id):
+    allowed_exts = {".mp4", ".mov", ".avi", ".mkv", ".flv"}
+    target_id = str(video_id)
+
     for root, dirs, files in os.walk(DATASET_ROOT):
-        for ext in (".mp4", ".mov", ".avi", ".mkv", ".flv"):
-            filename = f"{video_id}{ext}"
-            if filename in files:
-                return os.path.join(root, filename)
+        for file_name in files:
+            stem, ext = os.path.splitext(file_name)
+            if stem == target_id and ext.lower() in allowed_exts:
+                return os.path.join(root, file_name)
     return None
 
 
