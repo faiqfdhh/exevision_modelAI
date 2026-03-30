@@ -103,40 +103,40 @@ def get_view_thresholds(view: str) -> dict[str, dict[str, float | bool]]:
 
     default_thresholds = {
         "knee_valgus": {"good": 0.95, "bad": 0.75, "higher_is_better": True},
-        "forward_lean": {"good": 20.0, "bad": 45.0, "higher_is_better": False},
-        "depth": {"good": 95.0, "bad": 125.0, "higher_is_better": False},
+        "forward_lean": {"good": 30.0, "bad": 55.0, "higher_is_better": False},
+        "depth": {"good": 85.0, "bad": 125.0, "higher_is_better": False},
         "squat_depth": {"good": 0.1, "bad": -0.1, "higher_is_better": True},
     }
 
     if "side" in view_lower and "front" not in view_lower and "back" not in view_lower:
         return {
             "knee_valgus": {"good": 0.95, "bad": 0.70, "higher_is_better": True},
-            "forward_lean": {"good": 30.0, "bad": 60.0, "higher_is_better": False},
-            "depth": {"good": 70.0, "bad": 120.0, "higher_is_better": False},
+            "forward_lean": {"good": 40.0, "bad": 70.0, "higher_is_better": False},
+            "depth": {"good": 60.0, "bad": 120.0, "higher_is_better": False},
             "squat_depth": {"good": 0.15, "bad": -0.05, "higher_is_better": True},
         }
 
     if view_lower in ["front", "back"]:
         return {
             "knee_valgus": {"good": 0.97, "bad": 0.80, "higher_is_better": True},
-            "forward_lean": {"good": 25.0, "bad": 50.0, "higher_is_better": False},
-            "depth": {"good": 100.0, "bad": 130.0, "higher_is_better": False},
+            "forward_lean": {"good": 35.0, "bad": 60.0, "higher_is_better": False},
+            "depth": {"good": 90.0, "bad": 130.0, "higher_is_better": False},
             "squat_depth": {"good": 0.08, "bad": -0.08, "higher_is_better": True},
         }
 
     if "front_side" in view_lower or "front-side" in view_lower:
         return {
             "knee_valgus": {"good": 0.95, "bad": 0.78, "higher_is_better": True},
-            "forward_lean": {"good": 18.0, "bad": 40.0, "higher_is_better": False},
-            "depth": {"good": 95.0, "bad": 122.0, "higher_is_better": False},
+            "forward_lean": {"good": 28.0, "bad": 50.0, "higher_is_better": False},
+            "depth": {"good": 85.0, "bad": 122.0, "higher_is_better": False},
             "squat_depth": {"good": 0.1, "bad": -0.05, "higher_is_better": True},
         }
 
     if "back_side" in view_lower or "back-side" in view_lower:
         return {
             "knee_valgus": {"good": 1.2, "bad": 0.78, "higher_is_better": True},
-            "forward_lean": {"good": 35.0, "bad": 50.0, "higher_is_better": False},
-            "depth": {"good": 95.0, "bad": 122.0, "higher_is_better": False},
+            "forward_lean": {"good": 45.0, "bad": 65.0, "higher_is_better": False},
+            "depth": {"good": 85.0, "bad": 132.0, "higher_is_better": False},
             "squat_depth": {"good": 0.1, "bad": -0.05, "higher_is_better": True},
         }
 
