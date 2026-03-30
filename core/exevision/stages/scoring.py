@@ -476,8 +476,8 @@ def get_view_weights_and_thresholds(view: str) -> Tuple[Dict[str, float], Dict[s
     # Default thresholds
     default_thresholds = {
         "knee_valgus": {"good": 0.95, "bad": 0.75, "higher_is_better": True},
-        "forward_lean": {"good": 35.0, "bad": 65.0, "higher_is_better": False},
-        "depth": {"good": 85.0, "bad": 125.0, "higher_is_better": False},
+        "forward_lean": {"good": 25.0, "bad": 50.0, "higher_is_better": False},
+        "depth": {"good": 75.0, "bad": 110.0, "higher_is_better": False},
         "squat_depth": {"good": 0.1, "bad": -0.1, "higher_is_better": True},
     }
     
@@ -491,8 +491,8 @@ def get_view_weights_and_thresholds(view: str) -> Tuple[Dict[str, float], Dict[s
         }
         thresholds = {
             "knee_valgus": {"good": 0.95, "bad": 0.70, "higher_is_better": True},  # Less strict (unreliable)
-            "forward_lean": {"good": 45.0, "bad": 80.0, "higher_is_better": False},  # More forgiving
-            "depth": {"good": 60.0, "bad": 120.0, "higher_is_better": False},  # Stricter (clear view)
+            "forward_lean": {"good": 35.0, "bad": 60.0, "higher_is_better": False},
+            "depth": {"good": 50.0, "bad": 100.0, "higher_is_better": False},
             "squat_depth": {"good": 0.15, "bad": -0.05, "higher_is_better": True},  # Excellent visibility
         }
     
@@ -506,8 +506,8 @@ def get_view_weights_and_thresholds(view: str) -> Tuple[Dict[str, float], Dict[s
         }
         thresholds = {
             "knee_valgus": {"good": 0.97, "bad": 0.80, "higher_is_better": True},  # Stricter (clear view)
-            "forward_lean": {"good": 40.0, "bad": 70.0, "higher_is_better": False},  # More forgiving
-            "depth": {"good": 90.0, "bad": 130.0, "higher_is_better": False},  # Moderate
+            "forward_lean": {"good": 30.0, "bad": 55.0, "higher_is_better": False},
+            "depth": {"good": 80.0, "bad": 120.0, "higher_is_better": False},
             "squat_depth": {"good": 0.08, "bad": -0.08, "higher_is_better": True},  # Moderate visibility
         }
     
@@ -521,8 +521,8 @@ def get_view_weights_and_thresholds(view: str) -> Tuple[Dict[str, float], Dict[s
         }
         thresholds = {
             "knee_valgus": {"good": 0.95, "bad": 0.78, "higher_is_better": True},
-            "forward_lean": {"good": 35.0, "bad": 60.0, "higher_is_better": False},
-            "depth": {"good": 85.0, "bad": 122.0, "higher_is_better": False},
+            "forward_lean": {"good": 22.0, "bad": 45.0, "higher_is_better": False},
+            "depth": {"good": 75.0, "bad": 112.0, "higher_is_better": False},
             "squat_depth": {"good": 0.1, "bad": -0.05, "higher_is_better": True},
         }
     
@@ -536,8 +536,8 @@ def get_view_weights_and_thresholds(view: str) -> Tuple[Dict[str, float], Dict[s
         }
         thresholds = {
             "knee_valgus": {"good": 1.2, "bad": 0.78, "higher_is_better": True},
-            "forward_lean": {"good": 50.0, "bad": 75.0, "higher_is_better": False},
-            "depth": {"good": 85.0, "bad": 132.0, "higher_is_better": False},
+            "forward_lean": {"good": 35.0, "bad": 55.0, "higher_is_better": False},
+            "depth": {"good": 75.0, "bad": 115.0, "higher_is_better": False},
             "squat_depth": {"good": 0.1, "bad": -0.05, "higher_is_better": True},
         }
     
