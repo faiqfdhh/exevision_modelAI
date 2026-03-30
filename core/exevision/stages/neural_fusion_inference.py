@@ -362,9 +362,12 @@ def process_video(
     }
 
 
-def discover_videos(workspace_root: Path) -> List[tuple[str, str]]:
+def discover_videos(workspace_root: Path, quality_tier_filter: Optional[str] = None) -> List[tuple[str, str]]:
     """
     Discover all processed videos across quality tiers.
+    
+    If quality_tier_filter is set (e.g. 'raw_unfiltered'), only scan that subdirectory.
+    Otherwise scan all subdirectories.
 
     Returns list of (video_id, quality_tier) tuples.
     """
@@ -373,13 +376,22 @@ def discover_videos(workspace_root: Path) -> List[tuple[str, str]]:
     if not features_dir.exists():
         return videos
 
-    for quality_dir in features_dir.iterdir():
-        if not quality_dir.is_dir():
-            continue
-        quality_tier = quality_dir.name
-        for feature_json in quality_dir.glob("*.json"):
-            video_id = feature_json.stem
-            videos.append((video_id, quality_tier))
+    if quality_tier_filter:
+        # Only scan the specified quality tier
+        quality_dir = features_dir / quality_tier_filter
+        if quality_dir.is_dir():
+            for feature_json in quality_dir.glob("*.json"):
+                video_id = feature_json.stem
+                videos.append((video_id, quality_tier_filter))
+    else:
+        # Scan all quality tiers
+        for quality_dir in features_dir.iterdir():
+            if not quality_dir.is_dir():
+                continue
+            quality_tier = quality_dir.name
+            for feature_json in quality_dir.glob("*.json"):
+                video_id = feature_json.stem
+                videos.append((video_id, quality_tier))
 
     return videos
 
@@ -455,6 +467,13 @@ def parse_args() -> argparse.Namespace:
         help="Path to fusion checkpoint",
     )
     parser.add_argument("--video-id", type=str, default="", help="Process only one video id")
+    parser.add_argument(
+        "--quality-tier",
+        type=str,
+        default=None,
+        help="Restrict neural inference to one quality tier (e.g. raw_unfiltered). "
+             "When omitted, all tiers are processed.",
+    )
     parser.add_argument("--cpu", action="store_true", help="Force CPU inference")
     return parser.parse_args()
 
@@ -474,10 +493,12 @@ def main() -> int:
         return 1
 
     # Discover videos
-    videos = discover_videos(workspace_root)
+    videos = discover_videos(workspace_root, quality_tier_filter=args.quality_tier)
     if args.video_id:
         videos = [(video_id, q) for video_id, q in videos if video_id == args.video_id]
         logger.info(f"Video filter enabled: {args.video_id}")
+    if args.quality_tier:
+        logger.info(f"Quality tier filter enabled: {args.quality_tier}")
     logger.info(f"Discovered {len(videos)} videos across quality tiers")
     if not videos:
         logger.warning("No videos found in extracted_features_clean. This usually means Stage 2.5 (extract_selected_features) failed or was not run.")

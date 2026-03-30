@@ -115,6 +115,7 @@ def _build_stage_cmd(key: str, script: Path, video_id: str, mode: str) -> list[s
             "--bilstm-ckpt", str(BILSTM_CKPT),
             "--stgcn-ckpt", str(STGCN_CKPT),
             "--fusion-ckpt", str(FUSION_CKPT),
+            "--quality-tier", "raw_unfiltered",
         ]
     return base
 
@@ -813,18 +814,32 @@ def run_pipeline_sync(
         if not spec.script.exists():
             raise FileNotFoundError(f"Stage script not found: {spec.script}")
 
-        # Neural fusion is optional: if it fails, we still return feedback based on heuristic scores.
-        # All other stages are mandatory: failure propagates.
-        try:
-            _run_stage(key, spec.script, video_id, workspace_root, logs_root, mode)
+        # Special handling for dual extraction: run both filtered and unfiltered
+        if key == "extract_selected_features":
+            # Run filtered first — may produce no output for Poor quality videos (not a fatal error)
+            try:
+                _run_stage(key, spec.script, video_id, workspace_root, logs_root, "filtered")
+                logger.info("Stage extract_selected_features (filtered) completed.")
+            except RuntimeError as e:
+                logger.warning(f"Filtered extraction failed (likely Poor quality): {e}")
+            # Run unfiltered unconditionally — always produces output
+            _run_stage(key, spec.script, video_id, workspace_root, logs_root, "unfiltered")
+            logger.info("Stage extract_selected_features (unfiltered) completed.")
+            # Validate that at least one of the two produced the expected artifact
             _validate_stage_output(key, workspace_root, video_id)
-        except RuntimeError as exc:
-            if key == "neural_fusion":
-                # Neural fusion failure is non-fatal. Log and continue.
-                # Feedback will be generated from heuristic scores instead.
-                logger.warning(f"Neural fusion stage failed (non-fatal): {exc}")
-            else:
-                raise
+        else:
+            # Neural fusion is optional: if it fails, we still return feedback based on heuristic scores.
+            # All other stages are mandatory: failure propagates.
+            try:
+                _run_stage(key, spec.script, video_id, workspace_root, logs_root, mode)
+                _validate_stage_output(key, workspace_root, video_id)
+            except RuntimeError as exc:
+                if key == "neural_fusion":
+                    # Neural fusion failure is non-fatal. Log and continue.
+                    # Feedback will be generated from heuristic scores instead.
+                    logger.warning(f"Neural fusion stage failed (non-fatal): {exc}")
+                else:
+                    raise
 
         # After extraction completes, remove the input video copy — it is no longer
         # needed (stage 2.5 has already produced the feature JSON) and accounts for

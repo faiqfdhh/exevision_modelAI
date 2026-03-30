@@ -307,6 +307,7 @@ class PipelineRunnerUI:
         processing_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Radiobutton(processing_frame, text="Filtered (default)", variable=self.processing_mode_var, value="filtered").grid(row=0, column=0, sticky="w")
         ttk.Radiobutton(processing_frame, text="Unfiltered (raw)", variable=self.processing_mode_var, value="unfiltered").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Radiobutton(processing_frame, text="Dual (Filtered + Neural on Raw)", variable=self.processing_mode_var, value="dual").grid(row=2, column=0, sticky="w", pady=(4, 0))
         ttk.Checkbutton(
             processing_frame,
             text="Use GPU when available",
@@ -756,15 +757,58 @@ class PipelineRunnerUI:
         if not script_to_run.exists():
             raise RuntimeError(f"Script not found for stage '{stage.label}': {script_to_run}")
 
+        # Setup environment early (needed for subprocess calls)
+        env = os.environ.copy()
+        env["EXEVISION_MODEL_PATH"] = str(SHARED_MODEL_PATH)
+        env["EXEVISION_FACE_MODEL_PATH"] = str(SHARED_FACE_MODEL_PATH)
+
         # Add processing mode for extraction stage
         stage_args = list(stage.args)
         if stage.key == "extract_selected_features":
             processing_mode = self.processing_mode_var.get()
-            stage_args = [processing_mode] + stage_args
-            if self.use_gpu_var.get():
-                stage_args.append("--gpu")
-            if video_path is not None:
-                stage_args.extend(["--video-id", video_path.stem])
+            
+            # Handle dual mode: run filtered first (with failure handling), then unfiltered
+            if processing_mode == "dual":
+                # Run filtered first (may fail for Poor quality videos)
+                try:
+                    filtered_args = ["filtered"] + stage_args
+                    if self.use_gpu_var.get():
+                        filtered_args.append("--gpu")
+                    if video_path is not None:
+                        filtered_args.extend(["--video-id", video_path.stem])
+                    filtered_cmd = [sys.executable, str(script_to_run), *filtered_args]
+                    
+                    # Run filtered extraction silently
+                    self._log("[Dual Mode] Running filtered extraction (may skip for Poor quality)...")
+                    result_filtered = subprocess.run(
+                        filtered_cmd,
+                        cwd=str(workspace_root),
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=600,
+                    )
+                    if result_filtered.returncode == 0:
+                        self._log("[Dual Mode] Filtered extraction succeeded.")
+                    else:
+                        self._log("[Dual Mode] Filtered extraction skipped (likely Poor quality - continuing with unfiltered).")
+                except Exception as e:
+                    self._log(f"[Dual Mode] Filtered extraction failed: {e}. Continuing with unfiltered.")
+                
+                # Always run unfiltered (unconditional)
+                unfiltered_args = ["unfiltered"] + stage_args
+                if self.use_gpu_var.get():
+                    unfiltered_args.append("--gpu")
+                if video_path is not None:
+                    unfiltered_args.extend(["--video-id", video_path.stem])
+                stage_args = unfiltered_args
+            else:
+                # Single mode (either filtered or unfiltered)
+                stage_args = [processing_mode] + stage_args
+                if self.use_gpu_var.get():
+                    stage_args.append("--gpu")
+                if video_path is not None:
+                    stage_args.extend(["--video-id", video_path.stem])
         elif stage.key == "classify_views" and video_path is not None:
             stage_args = ["--video-id", video_path.stem]
         elif stage.key == "temporal_segmentation" and video_path is not None:
@@ -773,12 +817,13 @@ class PipelineRunnerUI:
             stage_args = [video_path.stem]
         elif stage.key == "neural_fusion" and video_path is not None:
             stage_args = ["--video-id", video_path.stem]
+            # If in dual mode, restrict neural to raw_unfiltered
+            processing_mode = self.processing_mode_var.get()
+            if processing_mode == "dual":
+                stage_args.extend(["--quality-tier", "raw_unfiltered"])
 
         cmd = [sys.executable, str(script_to_run), *stage_args]
         log_file = logs_root / f"{stage.key}.log"
-        env = os.environ.copy()
-        env["EXEVISION_MODEL_PATH"] = str(SHARED_MODEL_PATH)
-        env["EXEVISION_FACE_MODEL_PATH"] = str(SHARED_FACE_MODEL_PATH)
 
         with open(log_file, "w", encoding="utf-8") as f:
             process = subprocess.Popen(
@@ -1799,6 +1844,7 @@ class AnnotationToolUI:
         self._annotation_extraction_mode_map = {
             "Filtered": "filtered",
             "Unfiltered (raw)": "unfiltered",
+            "Dual (Filtered + Neural on Raw)": "dual",
         }
 
         # Video playback
@@ -1944,7 +1990,7 @@ class AnnotationToolUI:
             textvariable=self.annotation_extraction_mode_var,
             state="readonly",
             width=18,
-            values=("Filtered", "Unfiltered (raw)"),
+            values=("Filtered", "Unfiltered (raw)", "Dual (Filtered + Neural on Raw)"),
         )
         self.annotation_mode_combo.pack(side=tk.LEFT, padx=(6, 0))
         
@@ -2900,7 +2946,36 @@ class AnnotationToolUI:
 
         stage_args = list(stage.args)
         if stage.key == "extract_selected_features":
-            stage_args = [self._get_selected_annotation_extraction_mode()] + stage_args
+            extraction_mode = self._get_selected_annotation_extraction_mode()
+            
+            # Handle dual mode: run filtered first (silently fail if Poor quality), then unfiltered
+            if extraction_mode == "dual":
+                # Run filtered first (may fail for Poor quality videos)
+                try:
+                    filtered_args = ["filtered"] + stage_args
+                    filtered_cmd = [sys.executable, str(stage.script_path), *filtered_args]
+                    
+                    self._pipeline_log("[Dual Mode] Running filtered extraction (may skip for Poor quality)...")
+                    result_filtered = subprocess.run(
+                        filtered_cmd,
+                        cwd=str(workspace),
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=180,
+                    )
+                    if result_filtered.returncode == 0:
+                        self._pipeline_log("[Dual Mode] Filtered extraction succeeded.")
+                    else:
+                        self._pipeline_log("[Dual Mode] Filtered extraction skipped (likely Poor quality - continuing with unfiltered).")
+                except Exception as e:
+                    self._pipeline_log(f"[Dual Mode] Filtered extraction failed: {e}. Continuing with unfiltered.")
+                
+                # Always run unfiltered (unconditional)
+                stage_args = ["unfiltered"] + stage_args
+            else:
+                # Single mode (either filtered or unfiltered)
+                stage_args = [extraction_mode] + stage_args
         elif stage.key == "scoring":
             stage_args = [video_stem]
 
