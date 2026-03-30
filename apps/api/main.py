@@ -144,6 +144,8 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# Create results directory if it doesn't exist (for local dev static file serving)
+RUNS_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/results", StaticFiles(directory=str(RUNS_ROOT)), name="results")
 
 app.add_middleware(
