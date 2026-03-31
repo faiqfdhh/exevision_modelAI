@@ -478,7 +478,7 @@ def get_view_weights_and_thresholds(view: str) -> Tuple[Dict[str, float], Dict[s
         "knee_valgus": {"good": 0.95, "bad": 0.75, "higher_is_better": True},
         "forward_lean": {"good": 25.0, "bad": 50.0, "higher_is_better": False},
         "depth": {"good": 75.0, "bad": 110.0, "higher_is_better": False},
-        "squat_depth": {"good": 0.1, "bad": -0.1, "higher_is_better": True},
+        "squat_depth": {"good": 0.1, "bad": -0.5, "higher_is_better": True},
     }
     
     # SIDE VIEW: Best for forward lean and depth; poor for valgus and lateral shift
@@ -493,7 +493,7 @@ def get_view_weights_and_thresholds(view: str) -> Tuple[Dict[str, float], Dict[s
             "knee_valgus": {"good": 0.95, "bad": 0.70, "higher_is_better": True},  # Less strict (unreliable)
             "forward_lean": {"good": 35.0, "bad": 60.0, "higher_is_better": False},
             "depth": {"good": 50.0, "bad": 100.0, "higher_is_better": False},
-            "squat_depth": {"good": 0.15, "bad": -0.05, "higher_is_better": True},  # Excellent visibility
+            "squat_depth": {"good": 0.15, "bad": -0.5, "higher_is_better": True},  # Excellent visibility
         }
     
     # FRONT/BACK VIEW: Best for valgus and hip shift; moderate depth; poor lean
@@ -508,7 +508,7 @@ def get_view_weights_and_thresholds(view: str) -> Tuple[Dict[str, float], Dict[s
             "knee_valgus": {"good": 0.97, "bad": 0.80, "higher_is_better": True},  # Stricter (clear view)
             "forward_lean": {"good": 30.0, "bad": 55.0, "higher_is_better": False},
             "depth": {"good": 80.0, "bad": 120.0, "higher_is_better": False},
-            "squat_depth": {"good": 0.08, "bad": -0.08, "higher_is_better": True},  # Moderate visibility
+            "squat_depth": {"good": 0.08, "bad": -0.5, "higher_is_better": True},  # Moderate visibility
         }
     
     # FRONT_SIDE (diagonal front): Balanced view, all metrics moderately visible
@@ -523,9 +523,9 @@ def get_view_weights_and_thresholds(view: str) -> Tuple[Dict[str, float], Dict[s
             "knee_valgus": {"good": 0.95, "bad": 0.78, "higher_is_better": True},
             "forward_lean": {"good": 22.0, "bad": 45.0, "higher_is_better": False},
             "depth": {"good": 75.0, "bad": 112.0, "higher_is_better": False},
-            "squat_depth": {"good": 0.1, "bad": -0.05, "higher_is_better": True},
+            "squat_depth": {"good": 0.1, "bad": -0.5, "higher_is_better": True},
         }
-    
+
     # BACK_SIDE (diagonal back): Similar to front_side
     elif "back_side" in view_lower or "back-side" in view_lower:
         weights = {
@@ -538,9 +538,9 @@ def get_view_weights_and_thresholds(view: str) -> Tuple[Dict[str, float], Dict[s
             "knee_valgus": {"good": 1.2, "bad": 0.78, "higher_is_better": True},
             "forward_lean": {"good": 35.0, "bad": 55.0, "higher_is_better": False},
             "depth": {"good": 75.0, "bad": 115.0, "higher_is_better": False},
-            "squat_depth": {"good": 0.1, "bad": -0.05, "higher_is_better": True},
+            "squat_depth": {"good": 0.1, "bad": -0.5, "higher_is_better": True},
         }
-    
+
     # DEFAULT: Balanced weights (unknown view)
     else:
         weights = {
@@ -596,12 +596,13 @@ def score_rep_simple(metrics: Dict[str, Optional[float]], view: str = "unknown")
     
     if metrics.get("squat_depth") is not None:
         t = thresholds["squat_depth"]
-        scores["squat_depth"] = score_metric_linear(
-            metrics["squat_depth"], 
-            good=t["good"], 
-            bad=t["bad"], 
+        # Floor at 20: even the shallowest squat gets at least 20% credit instead of 0
+        scores["squat_depth"] = max(20.0, score_metric_linear(
+            metrics["squat_depth"],
+            good=t["good"],
+            bad=t["bad"],
             higher_is_better=t["higher_is_better"]
-        )
+        ))
     
     # Normalize weights to sum to 1.0
     total_weight = sum(w for k, w in weights.items() if k in scores)

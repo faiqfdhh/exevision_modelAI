@@ -2728,14 +2728,18 @@ class AnnotationToolUI:
         view = seg_data.get("info", {}).get("view", "unknown")
         fps = seg_data.get("info", {}).get("fps", 30.0)
 
-        # Find visualization video path
+        # Find visualization video path (prefer raw_unfiltered over quality folder)
         vis_root = workspace / "squat" / "visualized_segmentation"
         vis_video = ""
-        for suffix in ("_phases.mp4", "_segmented.mp4", "_phases.avi", "_segmented.avi"):
-            candidate = vis_root / quality / f"{video_id}{suffix}"
-            if candidate.exists():
-                vis_video = str(candidate)
+        for viz_q in ("raw_unfiltered", quality):
+            if vis_video:
                 break
+            for suffix in ("_phases.mp4", "_segmented.mp4", "_phases.avi", "_segmented.avi"):
+                candidate = vis_root / viz_q / f"{video_id}{suffix}"
+                if candidate.exists():
+                    vis_video = str(candidate)
+                    break
+
         if not vis_video:
             # Fallback to raw video
             raw = workspace / "squat" / "dataset_videos_all" / f"{video_id}.mp4"
@@ -3390,17 +3394,13 @@ class AnnotationToolUI:
             if seg_path and seg_path.exists():
                 # .../workspace/squat/segmented_reps/<quality>/<video>_segmented.json
                 squat_root = seg_path.parent.parent.parent
-                vis_dir = squat_root / "visualized_segmentation" / quality
-                candidates.extend([
-                    vis_dir / f"{video_id}_phases.mp4",
-                    vis_dir / f"{video_id}_segmented.mp4",
-                    vis_dir / f"{video_id}_phases.avi",
-                    vis_dir / f"{video_id}_segmented.avi",
-                ])
+                for viz_q in ("raw_unfiltered", quality):
+                    vis_dir = squat_root / "visualized_segmentation" / viz_q
+                    for suffix in ("_phases.mp4", "_segmented.mp4", "_phases.avi", "_segmented.avi"):
+                        candidate = vis_dir / f"{video_id}{suffix}"
+                        if candidate.exists():
+                            return str(candidate)
 
-            for candidate in candidates:
-                if candidate.exists():
-                    return str(candidate)
             return ""
 
         # 1. Load Raw

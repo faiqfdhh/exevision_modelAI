@@ -848,7 +848,13 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
     try:
         
         if viz_dir.exists():
-            viz_matches = sorted(viz_dir.rglob(f"{video_id}_annotated.mp4"))
+            # Prefer raw_unfiltered annotated video; fall back to any match
+            _unfiltered_viz = viz_dir / "raw_unfiltered" / f"{video_id}_annotated.mp4"
+            if _unfiltered_viz.exists():
+                viz_matches = [_unfiltered_viz]
+            else:
+                viz_matches = sorted(viz_dir.rglob(f"{video_id}_annotated.mp4"))
+
             logger.info(f"viz_matches: {viz_matches}")
             logger.info(f"viz_dir exists: {viz_dir}, files: {[p.name for p in sorted(viz_dir.iterdir())]}")
             if viz_matches:

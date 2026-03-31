@@ -29,7 +29,7 @@ if str(_NEURAL_DIR) not in sys.path:
 if str(_TRAINING_DIR) not in sys.path:
     sys.path.insert(0, str(_TRAINING_DIR))
 
-from nn_models import BiLSTMScorer, HeuristicGuidedFusion, STGCNScorer, apply_safety_clamps, build_heuristic_vector
+from nn_models import BiLSTMScorer, HeuristicGuidedFusion, STGCNScorer, _safe_score, apply_safety_clamps, build_heuristic_vector
 from nn_utils import _extract_stgcn_rep, build_adjacency_matrix, pad_or_truncate
 
 
@@ -163,6 +163,15 @@ def infer_rep(
     Infer one rep.
 
     Returns dict with neural_score, residual, and sub-metrics, or None on failure.
+
+    **Hard Patch (2026-03-31): ST-GCN Depth Reliability Gating**
+
+    ST-GCN's spatial signal is noisy on diagonal views, especially for depth.
+    When |ST-GCN_depth - heuristic_depth| > 30, the residual correction is dampened
+    by 0.6x (reducing ±40 point range to ±24), suppressing ST-GCN's unreliable influence.
+
+    This prevents neural scores from being inflated when ST-GCN depth conflicts with
+    the more reliable heuristic depth measurement.
     """
     try:
         # Extract sequences
@@ -200,6 +209,25 @@ def infer_rep(
             forward_lean = max(0.0, min(100.0, float(so["forward_lean"][0].cpu().numpy()) * 100.0))
             knee_tracking = max(0.0, min(100.0, float(so["knee_tracking"][0].cpu().numpy()) * 100.0))
 
+        # ========== HARD PATCH: ST-GCN Depth Reliability Gating ==========
+        # ST-GCN's spatial signal is noisy on diagonal views, especially for depth.
+        # When ST-GCN depth disagrees sharply with heuristic depth, suppress its influence
+        # on the final neural score by dampening the residual correction.
+        #
+        # Threshold: if |ST-GCN_depth - heuristic_depth*100| > 30, mark depth unreliable
+        # Effect: scale the residual by 0.6, reducing neural_score correction from ±40 to ±24 pts
+
+        heuristic_metric_scores = rep_data.get("heuristic_metric_scores", {}) or {}
+        heuristic_depth = _safe_score(heuristic_metric_scores.get("depth", 0.0))  # 0-100
+
+        depth_disagreement = abs(depth - heuristic_depth)
+        depth_unreliable = depth_disagreement > 30.0
+        residual_dampening = 0.6 if depth_unreliable else 1.0
+
+        # Apply dampening to residual before recomputing neural_score
+        dampened_residual = residual_val * residual_dampening
+        neural_score_pre = float(heuristic_vec[0]) * 100.0 + dampened_residual
+
         # Apply safety clamps
         flags = rep_data.get("heuristic_flags", {}) or {}
         flag_severities = rep_data.get("flag_severities", {}) or {}
@@ -207,6 +235,8 @@ def infer_rep(
 
         # Determine which clamps were applied
         clamp_reasons = []
+        if depth_unreliable:
+            clamp_reasons.append(f"st_gcn_depth_unreliable(heuristic={heuristic_depth:.0f},st_gcn={depth:.0f},dampening=0.6)")
         if bool(flags.get("knee_valgus", False)) and int(flag_severities.get("knee_valgus", 0)) >= 2:
             if neural_score_clamped < neural_score_pre:
                 clamp_reasons.append("knee_valgus_severity>=2")
@@ -219,10 +249,32 @@ def infer_rep(
             if neural_score_clamped < neural_score_pre:
                 clamp_reasons.append("insufficient_squat_depth_severity>=3")
 
+        # ========== HARD PATCH: Neural Sub-Score Ceiling ==========
+        # Enforce that no single sub-score with issues can allow neural_score to reach 100.
+        # Worst subscore drives a monotonic ceiling.
+        all_subscores = [forward_lean, knee_tracking, smoothness, control]
+        if not depth_unreliable:
+            all_subscores.append(depth)
+
+        subscore_worst = min(all_subscores) if all_subscores else 100.0
+
+        if subscore_worst >= 100.0:
+            subscore_ceiling = 100.0
+        else:
+            subscore_ceiling = min(99.0, subscore_worst * 0.5 + 50.0)
+
+        if neural_score_clamped > subscore_ceiling:
+            neural_score_clamped = subscore_ceiling
+            clamp_reasons.append(
+                f"subscore_ceiling(worst={subscore_worst:.1f},ceiling={subscore_ceiling:.1f})"
+            )
+
         return {
             "neural_score": float(neural_score_clamped),
             "neural_score_pre_clamp": float(neural_score_pre),
             "residual": float(residual_val),
+            "residual_dampening": float(residual_dampening),
+            "residual_dampened": float(dampened_residual),
             "smoothness": float(smoothness),
             "control": float(control),
             "depth": float(depth),
