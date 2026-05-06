@@ -5,6 +5,75 @@
 
 ---
 
+## Session 2026-05-06 (2) — Stage 8 OHP Scoring: 5 Biomechanical Metrics
+
+**Focus:** Implement view-independent overhead press scoring in `scoring.py` with 5 biomechanical metrics computed in a body-local 3D coordinate frame. Support both `overhead_press` and `seated_overhead_press` variants with no shared logic with squat scoring.
+
+**Architecture:** Complete separation from squat. All OHP metric functions are standalone. Body-local coordinate frame built per-frame from shoulder/hip landmarks, making all metrics camera-agnostic. Exercise string flows as explicit parameter through every function into output payload. Config thresholds live in `overhead_press.json` — no magic numbers in code.
+
+**What was done:**
+
+**1. Updated `overhead_press.json` (config):**
+- Added `metric_weights`: all 5 metrics at 0.20 (equal importance)
+- Replaced stub `metrics` with complete thresholds:
+  - `grip_ratio`: ideal 5-25% wider than shoulders (perfect: 0.15, tolerance: 0.30)
+  - `bar_path_deviation`: horizontal XZ drift normalized by shoulder width (good ≤0.05, bad ≥0.25)
+  - `min_elbow_angle`: ROM — full ≤75°, partial 75-90°, insufficient ≥90°
+  - `max_elbow_angle`: lockout extension ≥165° good, ≤145° bad (sustained ≥0.5s)
+  - `elbow_flare`: shoulder abduction during concentric 30-60° ideal, asymmetry penalty >15°
+- Updated `field_mapping`, `annotation_flags`, `annotation_metrics`
+
+**2. Added 3D geometry helpers to `scoring.py` (lines ~240-380):**
+- `_xyz(frame, idx, min_conf=0.4)` → Returns (x,y,z) as numpy array
+- `_angle_3d(a, b, c)` → True 3D angle in degrees at vertex b (not 2D projected)
+- `_build_body_frame(frame)` → Orthonormal frame from shoulder/hip with: `v_right`, `v_up`, `v_forward`, `mid_shoulder`, `mid_hip`
+- `_to_body_local(p, bf)` → Projects world point to body-local axes (x_right, y_up, z_forward)
+
+**3. Implemented 5 OHP metric functions (lines ~385-880):**
+- `_ohp_grip_width(rep_frames)` → Grip width ratio (measured at bottom of rep, first 5 frames)
+- `_ohp_bar_path_deviation(rep_frames)` → Horizontal drift from start to finish normalized by shoulder width
+- `_ohp_rom(rep_frames)` → Minimum 3D elbow angle across rep (flexion depth)
+- `_ohp_lockout(rep_frames, fps)` → Max elbow angle sustained ≥0.5s (or peak if no sustained window)
+- `_ohp_elbow_flare(rep_frames, rep_phases)` → Mean shoulder abduction during concentric → Returns (left, right, both)
+
+**4. Added OHP scoring dispatcher (lines ~880-1000):**
+- `_score_ohp_grip()` → Scores against ideal range with tolerance
+- `_score_ohp_bar_path()` → Linear score (lower is better)
+- `_score_ohp_rom()` → Threshold-based score (full/partial/no credit)
+- `_score_ohp_lockout()` → Linear score (higher is better)
+- `_score_ohp_flare()` → Scores abduction with asymmetry penalty (deduct 2% per degree >15° asymmetry)
+- `_score_overhead_press(rep_frames, rep_phases, fps, exercise, config)` → Main dispatcher
+  - Returns: `overall_score, metric_scores, raw_metrics, exercise, weights_used`
+  - Identical scoring logic for both `overhead_press` and `seated_overhead_press`
+
+**5. Wired OHP dispatch into `process_single_video()` (function signature + rep loop):**
+- Added `exercise: str = "squat"` parameter to function signature
+- Load `overhead_press.json` config if exercise is OHP variant
+- Extract `frame_phases_all` from segmented JSON
+- **Rep processing:** If OHP + config available, call `_score_overhead_press()`; else use squat logic
+- Updated both `main()` calls (batch and single video) to pass `exercise=args.exercise`
+
+**6. Created comprehensive test suite (`tests/test_ohp_scoring.py`):**
+- 24+ unit tests covering geometry helpers, metrics, and scorer
+- No pytest dependency — tests can be run standalone; uses numpy assertions
+- Synthetic frame builders for controlled geometry testing
+
+**Tested:**
+- Single video (80690_2, overhead_press): ✅ 1 rep detected, score 19.1/100
+- All functions import successfully ✅
+- Config parses with all 5 metric keys ✅
+
+**Files Modified:**
+1. `core/exevision/config/exercises/overhead_press.json` — Complete metric config
+2. `core/exevision/stages/scoring.py` — All geometry, metrics, scorer, dispatch (853 new lines)
+3. `tests/test_ohp_scoring.py` — New test suite (NEW FILE)
+
+**Backward Compatibility:** ✅ Squat scoring untouched; OHP only activates with `--exercise overhead_press`
+
+**Status:** Code implementation COMPLETE. Ready for batch Stage 8 scoring on 2,804 OHP videos in FitnessAQA dataset.
+
+---
+
 ## Session 2026-05-06 — Stage 5 Custom Video Directory Support (`--video-dir`)
 
 **Focus:** Add `--video-dir` parameter to temporal_segmentation.py to support FitnessAQA dataset structure where videos are stored outside the workspace.

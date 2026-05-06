@@ -253,8 +253,10 @@ $env:EXEVISION_FACE_MODEL_PATH = "C:\Users\faiqf\Documents\Faiq's FYP\exevision_
 **Core pipeline stages:**
 - `core/exevision/stages/extract_selected_features.py` — MediaPipe pose extraction + quality gating
 - `core/exevision/stages/classify_views.py` — Visibility-based view classification
-- `core/exevision/stages/temporal_segmentation.py` — FSM phase segmentation with strict legal sequences
+- `core/exevision/stages/temporal_segmentation.py` — FSM phase segmentation with strict legal sequences (squat + OHP paths)
 - `core/exevision/stages/scoring.py` — Rule-based AQA scoring and metrics
+  - **Squat scoring:** View-dependent weights, 4 metrics (knee valgus, forward lean, depth, below_parallel)
+  - **OHP scoring (NEW):** View-independent, 5 biomechanical metrics in body-local 3D frame (grip_ratio, bar_path_deviation, ROM, lockout, elbow_flare); supports `overhead_press` and `seated_overhead_press` with identical metric logic
 - `core/exevision/stages/neural_fusion_inference.py` — Neural fusion stage (Step 9)
 
 **UI & Orchestration:**
