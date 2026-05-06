@@ -2,29 +2,81 @@
   "schema_version": "1.0",
   "exercise": "overhead_press",
   "score_brackets": {
-    "90-100": {
-      "tier": "excellent",
-      "opener": "Excellent pressing form!"
-    },
-    "75-89": {
-      "tier": "good",
-      "opener": "Good press overall."
-    },
-    "60-74": {
-      "tier": "fair",
-      "opener": "Decent effort, but a few things to address."
-    },
-    "40-59": {
-      "tier": "poor",
-      "opener": "Your pressing form needs significant attention."
-    },
-    "0-39": {
-      "tier": "critical",
-      "opener": "Let's work on the fundamentals."
-    }
+    "90-100": { "tier": "excellent", "opener": "Excellent pressing form!" },
+    "75-89":  { "tier": "good",      "opener": "Good press overall." },
+    "60-74":  { "tier": "fair",      "opener": "Decent effort, but a few things to address." },
+    "40-59":  { "tier": "poor",      "opener": "Your pressing form needs significant attention." },
+    "0-39":   { "tier": "critical",  "opener": "Let's work on the fundamentals." }
   },
   "improvement_threshold": 75,
   "severity_band": 5,
+  "metric_weights": {
+    "grip_ratio":        0.20,
+    "bar_path_deviation": 0.20,
+    "rom":               0.20,
+    "lockout":           0.20,
+    "elbow_flare":       0.20
+  },
+  "metrics": {
+    "grip_ratio": {
+      "ideal_low":  0.05,
+      "ideal_high": 0.25,
+      "perfect":    0.15,
+      "tolerance":  0.30,
+      "unit": "ratio",
+      "note": "grip_ratio=(grip_width - shoulder_width)/shoulder_width; ideal 5-25% wider than shoulders"
+    },
+    "bar_path_deviation": {
+      "good_threshold": 0.05,
+      "bad_threshold":  0.25,
+      "unit": "normalized",
+      "note": "horizontal XZ drift from bottom to top / shoulder_width; body-local frame"
+    },
+    "min_elbow_angle": {
+      "full_rom_threshold":    75.0,
+      "partial_rom_threshold": 90.0,
+      "unit": "degrees",
+      "note": "3D elbow angle at maximum flexion; <= 75 = full ROM, > 90 = no credit"
+    },
+    "max_elbow_angle": {
+      "good_threshold": 165.0,
+      "bad_threshold":  145.0,
+      "unit": "degrees",
+      "note": "3D elbow angle at lockout, sustained >= 0.5 s"
+    },
+    "elbow_flare": {
+      "ideal_low":          30.0,
+      "ideal_high":         60.0,
+      "bad_low":            20.0,
+      "bad_high":           70.0,
+      "asymmetry_threshold": 15.0,
+      "unit": "degrees",
+      "note": "mean shoulder abduction during concentric phase; 0 = arm along torso, 90 = horizontal out"
+    }
+  },
+  "field_mapping": {
+    "metrics_to_feedback": {
+      "grip_ratio":         "grip_ratio",
+      "bar_path_deviation": "bar_path_deviation",
+      "min_elbow_angle":    "rom",
+      "max_elbow_angle":    "lockout",
+      "elbow_flare_mean":   "elbow_flare"
+    }
+  },
+  "annotation_flags": {
+    "incomplete_lockout": "Incomplete Lockout",
+    "elbow_flare":        "Elbow Flare / Winging",
+    "forward_lean":       "Excessive Layback",
+    "bar_drift":          "Bar Path Drift",
+    "wrist_deviation":    "Wrist Bent Back",
+    "knee_instability":   "Knee Instability (standing only)"
+  },
+  "annotation_metrics": {
+    "lockout":   "Lockout Quality",
+    "bar_path":  "Bar Path Straightness",
+    "smoothness": "Smoothness",
+    "control":   "Control"
+  },
   "issue_groups": {
     "lockout_quality": {
       "metrics": ["shoulder_elevation", "elbow_extension"],
@@ -62,40 +114,5 @@
         "focus_here": "Bar path and body lean both need attention — brace hard and press straight."
       }
     }
-  },
-  "metrics": {
-    "shoulder_elevation": {
-      "good_threshold": 170,
-      "bad_threshold": 150,
-      "unit": "degrees"
-    },
-    "elbow_extension": {
-      "good_threshold": 170,
-      "bad_threshold": 145,
-      "unit": "degrees"
-    },
-    "bar_path_deviation": {
-      "good_threshold": 0.05,
-      "bad_threshold": 0.15,
-      "unit": "normalized"
-    },
-    "forward_lean": {
-      "good_threshold": 10,
-      "bad_threshold": 25,
-      "unit": "degrees"
-    },
-    "smoothness": {
-      "good_threshold": 75,
-      "bad_threshold": 50,
-      "unit": "score"
-    },
-    "control": {
-      "good_threshold": 75,
-      "bad_threshold": 50,
-      "unit": "score"
-    }
-  },
-  "field_mapping": {
-    "metrics_to_feedback": {}
   }
 }

@@ -67,6 +67,10 @@ L_ANKLE, R_ANKLE = 27, 28
 L_HEEL, R_HEEL = 29, 30
 L_TOE, R_TOE = 31, 32
 
+# OHP landmark aliases (upper body only)
+L_ELBOW, R_ELBOW = 13, 14
+L_WRIST, R_WRIST = 15, 16
+
 
 # --------------------------
 # Helpers: landmarks + geometry
@@ -229,6 +233,97 @@ def calculate_torso_tibia_offset(frame: Any, min_conf: float = 0.4) -> Optional[
     
         # Return absolute difference
         return float(abs(torso_angle - tibia_angle))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OHP 3D GEOMETRY HELPERS  (overhead_press + seated_overhead_press)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _xyz(frame: Any, idx: int, min_conf: float = 0.4) -> Optional[np.ndarray]:
+    """Return (x, y, z) of landmark as float64 array, or None if below min_conf."""
+    lm = _lm(frame, idx)
+    if lm is None or len(lm) < 3:
+        return None
+    if len(lm) >= 4 and float(lm[3]) < min_conf:
+        return None
+    return np.array(lm[:3], dtype=np.float64)
+
+
+def _angle_3d(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> Optional[float]:
+    """True 3D angle in degrees at vertex b formed by vectors b→a and b→c."""
+    v1 = a - b
+    v2 = c - b
+    n1 = np.linalg.norm(v1)
+    n2 = np.linalg.norm(v2)
+    if n1 < 1e-6 or n2 < 1e-6:
+        return None
+    cos_a = float(np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0))
+    return float(np.degrees(np.arccos(cos_a)))
+
+
+def _build_body_frame(frame: Any) -> Optional[Dict[str, Any]]:
+    """
+    Build an orthonormal body-local coordinate frame from shoulder/hip landmarks.
+
+    Returns a dict with keys: v_right, v_up, v_forward, mid_shoulder, mid_hip
+    Returns None if any of the four required landmarks are below confidence threshold.
+
+    Frame convention (body-local):
+      +Y = upward along torso
+      +X = rightward (right shoulder direction)
+      +Z = forward out of chest
+    """
+    ls = _xyz(frame, L_SHOULDER)
+    rs = _xyz(frame, R_SHOULDER)
+    lh = _xyz(frame, L_HIP)
+    rh = _xyz(frame, R_HIP)
+    if any(x is None for x in (ls, rs, lh, rh)):
+        return None
+
+    mid_shoulder = (ls + rs) / 2.0
+    mid_hip = (lh + rh) / 2.0
+
+    v_up_raw = mid_shoulder - mid_hip
+    v_right_raw = rs - ls
+
+    up_norm = np.linalg.norm(v_up_raw)
+    right_norm = np.linalg.norm(v_right_raw)
+    if up_norm < 1e-6 or right_norm < 1e-6:
+        return None
+
+    v_up = v_up_raw / up_norm
+    v_right = v_right_raw / right_norm
+
+    # Forward = right × up; then re-orthogonalise right so frame is truly orthonormal
+    v_forward = np.cross(v_right, v_up)
+    fwd_norm = np.linalg.norm(v_forward)
+    if fwd_norm < 1e-6:
+        return None
+    v_forward = v_forward / fwd_norm
+    v_right = np.cross(v_up, v_forward)
+    v_right /= np.linalg.norm(v_right)
+
+    return {
+        "v_right": v_right,
+        "v_up": v_up,
+        "v_forward": v_forward,
+        "mid_shoulder": mid_shoulder,
+        "mid_hip": mid_hip,
+    }
+
+
+def _to_body_local(p: np.ndarray, bf: Dict[str, Any]) -> np.ndarray:
+    """
+    Project world-space point p into body-local axes.
+    Origin is mid_shoulder.
+    Returns (x_right, y_up, z_forward).
+    """
+    delta = p - bf["mid_shoulder"]
+    return np.array([
+        np.dot(delta, bf["v_right"]),
+        np.dot(delta, bf["v_up"]),
+        np.dot(delta, bf["v_forward"]),
+    ], dtype=np.float64)
 
 
 # --------------------------
@@ -563,6 +658,204 @@ def get_view_weights_and_thresholds(view: str) -> Tuple[Dict[str, float], Dict[s
     return weights, thresholds
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# OHP METRICS  (overhead_press + seated_overhead_press)
+# All functions operate on rep_frames: List[frame] where frame = List[[x,y,z,conf]]
+# All angles are 3D true angles using body-local coordinate frame.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _ohp_grip_width(rep_frames: List) -> Optional[float]:
+    """
+    Grip width ratio measured at the bottom of the rep (first 5 frames).
+    grip_ratio = (grip_width - shoulder_width) / shoulder_width
+    Ideal: 0.05 – 0.25 (5-25% wider than shoulders).
+    Returns float or None if landmarks unavailable.
+    """
+    bottom_frames = rep_frames[:5]
+    ratios: List[float] = []
+    for frame in bottom_frames:
+        bf = _build_body_frame(frame)
+        if bf is None:
+            continue
+        ls = _xyz(frame, L_SHOULDER)
+        rs = _xyz(frame, R_SHOULDER)
+        lw = _xyz(frame, L_WRIST)
+        rw = _xyz(frame, R_WRIST)
+        if any(x is None for x in (ls, rs, lw, rw)):
+            continue
+        ls_l = _to_body_local(ls, bf)
+        rs_l = _to_body_local(rs, bf)
+        lw_l = _to_body_local(lw, bf)
+        rw_l = _to_body_local(rw, bf)
+        sh_w = abs(rs_l[0] - ls_l[0])
+        gr_w = abs(rw_l[0] - lw_l[0])
+        if sh_w < 1e-3:
+            continue
+        ratios.append((gr_w - sh_w) / sh_w)
+    return float(np.mean(ratios)) if ratios else None
+
+
+def _ohp_bar_path_deviation(rep_frames: List) -> Optional[float]:
+    """
+    Horizontal (XZ body-local) drift of wrist midpoint from first to last frame,
+    normalised by shoulder width. Ideal ≤ 0.05; bad ≥ 0.25.
+    """
+    if len(rep_frames) < 2:
+        return None
+
+    def _bar_local(frame):
+        bf = _build_body_frame(frame)
+        if bf is None:
+            return None, None
+        lw = _xyz(frame, L_WRIST)
+        rw = _xyz(frame, R_WRIST)
+        ls = _xyz(frame, L_SHOULDER)
+        rs = _xyz(frame, R_SHOULDER)
+        if any(x is None for x in (lw, rw, ls, rs)):
+            return None, None
+        bar = _to_body_local((lw + rw) / 2.0, bf)
+        ls_l = _to_body_local(ls, bf)
+        rs_l = _to_body_local(rs, bf)
+        sh_w = abs(rs_l[0] - ls_l[0])
+        return bar, sh_w
+
+    bar_bottom, sh_w = _bar_local(rep_frames[0])
+    bar_top, _ = _bar_local(rep_frames[-1])
+    if bar_bottom is None or bar_top is None or sh_w < 1e-3:
+        return None
+
+    d_horiz = math.sqrt((bar_top[0] - bar_bottom[0])**2 + (bar_top[2] - bar_bottom[2])**2)
+    return float(d_horiz / sh_w)
+
+
+def _ohp_rom(rep_frames: List) -> Optional[float]:
+    """
+    Minimum 3D elbow angle (average of L and R) across all rep frames.
+    Represents how much the elbows flexed at the bottom of the rep.
+    Full ROM: ≤ 75°; partial: 75-90°; insufficient: > 90°.
+    """
+    min_angle = 180.0
+    found = False
+    for frame in rep_frames:
+        frame_angles: List[float] = []
+        for sh_idx, el_idx, wr_idx in (
+            (L_SHOULDER, L_ELBOW, L_WRIST),
+            (R_SHOULDER, R_ELBOW, R_WRIST),
+        ):
+            sh = _xyz(frame, sh_idx)
+            el = _xyz(frame, el_idx)
+            wr = _xyz(frame, wr_idx)
+            if any(x is None for x in (sh, el, wr)):
+                continue
+            a = _angle_3d(sh, el, wr)
+            if a is not None:
+                frame_angles.append(a)
+        if frame_angles:
+            min_angle = min(min_angle, float(np.mean(frame_angles)))
+            found = True
+    return float(min_angle) if found else None
+
+
+def _ohp_lockout(rep_frames: List, fps: float) -> Optional[float]:
+    """
+    Maximum 3D elbow extension angle (average L+R) sustained for ≥ 0.5 s.
+    If no 0.5 s window is found, returns the peak angle (partial lockout credit).
+    Ideal: ≥ 165°; bad: ≤ 145°.
+    """
+    LOCKOUT_THRESH = 165.0
+    MIN_SUSTAIN = max(1, int(0.5 * fps))
+
+    per_frame: List[Optional[float]] = []
+    for frame in rep_frames:
+        angles: List[float] = []
+        for sh_idx, el_idx, wr_idx in (
+            (L_SHOULDER, L_ELBOW, L_WRIST),
+            (R_SHOULDER, R_ELBOW, R_WRIST),
+        ):
+            sh = _xyz(frame, sh_idx)
+            el = _xyz(frame, el_idx)
+            wr = _xyz(frame, wr_idx)
+            if any(x is None for x in (sh, el, wr)):
+                continue
+            a = _angle_3d(sh, el, wr)
+            if a is not None:
+                angles.append(a)
+        per_frame.append(float(np.mean(angles)) if angles else None)
+
+    best_sustained = 0.0
+    run_count = 0
+    run_max = 0.0
+    for a in per_frame:
+        if a is not None and a >= LOCKOUT_THRESH:
+            run_count += 1
+            run_max = max(run_max, a)
+            if run_count >= MIN_SUSTAIN:
+                best_sustained = run_max
+        else:
+            run_count = 0
+            run_max = 0.0
+
+    if best_sustained > 0.0:
+        return float(best_sustained)
+    # Fallback: return peak angle for partial credit
+    peak = max((a for a in per_frame if a is not None), default=None)
+    return float(peak) if peak is not None else None
+
+
+def _ohp_elbow_flare(
+    rep_frames: List,
+    rep_phases: List[str],
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Mean shoulder abduction angle during the concentric (press-up) phase.
+    Abduction is measured as the angle between the upper arm vector (elbow-shoulder)
+    and the torso-downward vector (hip-shoulder).  0° = arm along torso; 90° = horizontal.
+
+    Ideal: 30-60°.  < 20° = too tucked.  > 70° = excessive flare.
+    Asymmetry > 15° incurs an additional penalty in the scorer.
+
+    Returns: (mean_left_deg, mean_right_deg, mean_both_deg)
+             Any can be None if landmarks unavailable.
+    """
+    # Filter to concentric frames only; fall back to all frames if no phase info
+    if rep_phases:
+        conc_frames = [f for f, p in zip(rep_frames, rep_phases) if p == "concentric"]
+    else:
+        conc_frames = []
+    if not conc_frames:
+        conc_frames = rep_frames
+
+    left_abd: List[float] = []
+    right_abd: List[float] = []
+
+    for frame in conc_frames:
+        for sh_idx, el_idx, hi_idx, side_list in (
+            (L_SHOULDER, L_ELBOW, L_HIP,   left_abd),
+            (R_SHOULDER, R_ELBOW, R_HIP,   right_abd),
+        ):
+            sh = _xyz(frame, sh_idx)
+            el = _xyz(frame, el_idx)
+            hi = _xyz(frame, hi_idx)
+            if any(x is None for x in (sh, el, hi)):
+                continue
+            upper_arm = el - sh        # direction: shoulder → elbow
+            torso_down = hi - sh       # direction: shoulder → hip (downward)
+            n_ua = np.linalg.norm(upper_arm)
+            n_td = np.linalg.norm(torso_down)
+            if n_ua < 1e-6 or n_td < 1e-6:
+                continue
+            cos_a = float(np.clip(
+                np.dot(upper_arm, torso_down) / (n_ua * n_td), -1.0, 1.0
+            ))
+            side_list.append(float(np.degrees(np.arccos(cos_a))))
+
+    mean_left = float(np.mean(left_abd)) if left_abd else None
+    mean_right = float(np.mean(right_abd)) if right_abd else None
+    both = left_abd + right_abd
+    mean_both = float(np.mean(both)) if both else None
+    return mean_left, mean_right, mean_both
+
+
 def score_rep_simple(metrics: Dict[str, Optional[float]], view: str = "unknown") -> Dict[str, Any]:
     """
     Score a rep based on metrics, with view-specific weights and thresholds.
@@ -633,6 +926,135 @@ def score_rep_simple(metrics: Dict[str, Optional[float]], view: str = "unknown")
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# OHP SCORING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _score_ohp_grip(ratio: float, cfg: Dict) -> float:
+    """Score grip_ratio against ideal range [ideal_low, ideal_high]."""
+    c = cfg["metrics"]["grip_ratio"]
+    ideal_low, ideal_high = c["ideal_low"], c["ideal_high"]
+    perfect, tolerance = c["perfect"], c["tolerance"]
+    if ideal_low <= ratio <= ideal_high:
+        return 100.0
+    return max(0.0, 100.0 * (1.0 - abs(ratio - perfect) / tolerance))
+
+
+def _score_ohp_bar_path(deviation: float, cfg: Dict) -> float:
+    c = cfg["metrics"]["bar_path_deviation"]
+    return score_metric_linear(deviation, good=c["good_threshold"], bad=c["bad_threshold"], higher_is_better=False)
+
+
+def _score_ohp_rom(min_angle: float, cfg: Dict) -> float:
+    c = cfg["metrics"]["min_elbow_angle"]
+    full, partial = c["full_rom_threshold"], c["partial_rom_threshold"]
+    if min_angle <= full:
+        return 100.0
+    if min_angle >= partial:
+        return 0.0
+    return 100.0 * (partial - min_angle) / (partial - full)
+
+
+def _score_ohp_lockout(max_angle: float, cfg: Dict) -> float:
+    c = cfg["metrics"]["max_elbow_angle"]
+    return score_metric_linear(max_angle, good=c["good_threshold"], bad=c["bad_threshold"], higher_is_better=True)
+
+
+def _score_ohp_flare(
+    mean_left: Optional[float],
+    mean_right: Optional[float],
+    mean_both: Optional[float],
+    cfg: Dict,
+) -> float:
+    if mean_both is None:
+        return 50.0  # neutral when not computable
+    c = cfg["metrics"]["elbow_flare"]
+    ideal_low, ideal_high = c["ideal_low"], c["ideal_high"]
+    bad_low, bad_high = c["bad_low"], c["bad_high"]
+    asym_thresh = c["asymmetry_threshold"]
+
+    if ideal_low <= mean_both <= ideal_high:
+        base = 100.0
+    elif mean_both < ideal_low:
+        base = score_metric_linear(mean_both, good=ideal_low, bad=bad_low, higher_is_better=True)
+    else:
+        base = score_metric_linear(mean_both, good=ideal_high, bad=bad_high, higher_is_better=False)
+
+    if mean_left is not None and mean_right is not None:
+        asym = abs(mean_left - mean_right)
+        if asym > asym_thresh:
+            base = max(0.0, base - min(20.0, (asym - asym_thresh) * 2.0))
+    return base
+
+
+def _score_overhead_press(
+    rep_frames: List,
+    rep_phases: List[str],
+    fps: float,
+    exercise: str,
+    config: Dict,
+) -> Dict[str, Any]:
+    """
+    Compute all 5 OHP metrics, score them, and return a result dict.
+
+    Works identically for 'overhead_press' and 'seated_overhead_press'.
+    The exercise parameter is only used to label the output — metric logic
+    is identical for both variants (seated has zeroed leg landmarks which
+    are never read by any OHP metric function).
+
+    Output schema matches score_rep_simple() for pipeline compatibility:
+      overall_score, metric_scores, raw_metrics, exercise, weights_used
+    """
+    weights: Dict[str, float] = config.get("metric_weights", {
+        "grip_ratio": 0.20, "bar_path_deviation": 0.20,
+        "rom": 0.20, "lockout": 0.20, "elbow_flare": 0.20,
+    })
+
+    # ── Raw measurements ──
+    grip_ratio = _ohp_grip_width(rep_frames)
+    bar_path   = _ohp_bar_path_deviation(rep_frames)
+    min_elbow  = _ohp_rom(rep_frames)
+    max_elbow  = _ohp_lockout(rep_frames, fps)
+    fl_left, fl_right, fl_both = _ohp_elbow_flare(rep_frames, rep_phases)
+
+    raw_metrics: Dict[str, Any] = {
+        "grip_ratio":         round(float(grip_ratio), 4) if grip_ratio is not None else None,
+        "bar_path_deviation": round(float(bar_path),   4) if bar_path   is not None else None,
+        "min_elbow_angle":    round(float(min_elbow),  2) if min_elbow  is not None else None,
+        "max_elbow_angle":    round(float(max_elbow),  2) if max_elbow  is not None else None,
+        "elbow_flare_left":   round(float(fl_left),    2) if fl_left    is not None else None,
+        "elbow_flare_right":  round(float(fl_right),   2) if fl_right   is not None else None,
+        "elbow_flare_mean":   round(float(fl_both),    2) if fl_both    is not None else None,
+    }
+
+    # ── Per-metric scores ──
+    metric_scores: Dict[str, float] = {}
+    if grip_ratio is not None:
+        metric_scores["grip_ratio"]        = _score_ohp_grip(grip_ratio, config)
+    if bar_path is not None:
+        metric_scores["bar_path_deviation"] = _score_ohp_bar_path(bar_path, config)
+    if min_elbow is not None:
+        metric_scores["rom"]               = _score_ohp_rom(min_elbow, config)
+    if max_elbow is not None:
+        metric_scores["lockout"]           = _score_ohp_lockout(max_elbow, config)
+    if fl_both is not None or fl_left is not None or fl_right is not None:
+        metric_scores["elbow_flare"]       = _score_ohp_flare(fl_left, fl_right, fl_both, config)
+
+    # ── Weighted overall ──
+    avail_w = {k: weights[k] for k in metric_scores if k in weights}
+    total_w = sum(avail_w.values())
+    norm_w  = {k: v / total_w for k, v in avail_w.items()} if total_w > 0 else {}
+    overall = sum(metric_scores[k] * norm_w.get(k, 0.0) for k in metric_scores)
+
+    return {
+        "overall_score":  round(float(overall), 1),
+        "metric_scores":  {k: round(float(v), 1) for k, v in metric_scores.items()},
+        "raw_metrics":    raw_metrics,
+        "exercise":       exercise,
+        "weights_used":   {k: round(v, 2) for k, v in norm_w.items()},
+    }
+
+
 # --------------------------
 # Main
 # --------------------------
@@ -671,7 +1093,7 @@ def main() -> int:
         failed = 0
         
         for video_id, source_quality in video_list:
-            result = process_single_video(video_id, source_quality, save_output=not args.no_save)
+            result = process_single_video(video_id, source_quality, save_output=not args.no_save, exercise=args.exercise)
             if result is not None:
                 processed += 1
                 print(f"✓ [{processed}/{len(video_list)}] {video_id} ({source_quality}) → Score: {result['overall_score']}/100")
@@ -699,7 +1121,7 @@ def main() -> int:
     else:
         source_quality = "unknown"
     
-    result = process_single_video(video_id, source_quality, save_output=not args.no_save)
+    result = process_single_video(video_id, source_quality, save_output=not args.no_save, exercise=args.exercise)
     if result is None:
         return 1
     
@@ -713,13 +1135,14 @@ def main() -> int:
     return 0
 
 
-def process_single_video(video_id: str, source_quality: str, save_output: bool = True) -> Optional[Dict[str, Any]]:
+def process_single_video(video_id: str, source_quality: str, save_output: bool = True, exercise: str = "squat") -> Optional[Dict[str, Any]]:
     """Process a single video and return the result.
     
     Args:
         video_id: Video identifier
         source_quality: Source quality folder (excellent, good, fair, unknown)
         save_output: Whether to save JSON output
+        exercise: Exercise type (default: squat)
     
     Returns:
         Result dictionary or None if processing failed
@@ -741,6 +1164,16 @@ def process_single_video(video_id: str, source_quality: str, save_output: bool =
     fps = float(info.get("fps", 30.0))
     view = info.get("view", "unknown")
 
+    # Load per-exercise config for OHP scoring
+    _ohp_config: Optional[Dict] = None
+    if exercise in ("overhead_press", "seated_overhead_press"):
+        _ohp_cfg_path = Path(__file__).resolve().parent.parent / "config" / "exercises" / "overhead_press.json"
+        if _ohp_cfg_path.exists():
+            with open(_ohp_cfg_path) as _f:
+                _ohp_config = json.load(_f)
+        else:
+            print(f"⚠️  overhead_press.json not found at {_ohp_cfg_path}; OHP scoring disabled")
+
     # Load segmented reps (5_temporal_segmentation output) - REQUIRED
     seg_path = find_segmented_json(video_id)
     if not seg_path or not os.path.exists(seg_path):
@@ -755,6 +1188,7 @@ def process_single_video(video_id: str, source_quality: str, save_output: bool =
         seg = json.load(f)
 
     reps_from_seg = seg.get("repetitions", [])
+    frame_phases_all: List[str] = seg.get("frame_phases", [])
     if not reps_from_seg:
         print(f"⚠️  No repetitions found in segmented JSON")
         result = {
@@ -785,55 +1219,55 @@ def process_single_video(video_id: str, source_quality: str, save_output: bool =
         rep_id = rep_dict.get("rep_id", len(rep_outputs) + 1)
         start = rep_dict.get("start_frame")
         end = rep_dict.get("end_frame")
-        bottom = rep_dict.get("bottom_frame", (start + end) // 2)
+        bottom = rep_dict.get("bottom_frame", (start + end) // 2 if start is not None and end is not None else 0)
 
         if start is None or end is None:
             continue
 
         frames = keypoints[start:end + 1]
 
-        # compute metrics: average over rep + min knee angle
-        valgus_vals = []
-        lean_vals = []
-        knee_vals = []
-        for fr in frames:
-            v = knee_valgus_ratio(fr)
-            if v is not None:
-                valgus_vals.append(v)
-            fl = forward_lean_deg(fr)
-            if fl is not None:
-                lean_vals.append(fl)
-            ka = knee_angle(fr)
-            if ka is not None:
-                knee_vals.append(ka)
-
-        min_knee = float(np.min(knee_vals)) if knee_vals else None
-
-        # Calculate squat depth at the bottom frame
-        depth_val = None
-        if 0 <= bottom - start < len(frames):
-            depth_val = calculate_vertical_depth(frames[bottom - start])
-        below_parallel = depth_val is not None and depth_val > 0.0
-
-        metrics = {
-            "knee_valgus": float(np.mean(valgus_vals)) if valgus_vals else None,
-            "forward_lean": float(np.mean(lean_vals)) if lean_vals else None,
-            "min_knee_angle": min_knee,
-            "squat_depth": depth_val,
-            "below_parallel": below_parallel,
-        }
-
-        rep_score = score_rep_simple(metrics, view=view)
+        if exercise in ("overhead_press", "seated_overhead_press") and _ohp_config is not None:
+            rep_phases = frame_phases_all[start:end + 1] if frame_phases_all else []
+            rep_score = _score_overhead_press(
+                frames, rep_phases, fps=fps, exercise=exercise, config=_ohp_config
+            )
+            metrics = rep_score["raw_metrics"]
+        else:
+            # ── Squat scoring (unchanged) ──
+            valgus_vals, lean_vals, knee_vals = [], [], []
+            for fr in frames:
+                v = knee_valgus_ratio(fr)
+                if v is not None:
+                    valgus_vals.append(v)
+                fl = forward_lean_deg(fr)
+                if fl is not None:
+                    lean_vals.append(fl)
+                ka = knee_angle(fr)
+                if ka is not None:
+                    knee_vals.append(ka)
+            min_knee = float(np.min(knee_vals)) if knee_vals else None
+            depth_val = None
+            if 0 <= bottom - start < len(frames):
+                depth_val = calculate_vertical_depth(frames[bottom - start])
+            below_parallel = depth_val is not None and depth_val > 0.0
+            metrics = {
+                "knee_valgus":  float(np.mean(valgus_vals)) if valgus_vals else None,
+                "forward_lean": float(np.mean(lean_vals))   if lean_vals   else None,
+                "min_knee_angle": min_knee,
+                "squat_depth":  depth_val,
+                "below_parallel": below_parallel,
+            }
+            rep_score = score_rep_simple(metrics, view=view)
 
         rep_outputs.append({
-            "rep_id": int(rep_id),
-            "start_frame": int(start),
-            "end_frame": int(end),
-            "duration_frames": int(end - start + 1),
+            "rep_id":           int(rep_id),
+            "start_frame":      int(start),
+            "end_frame":        int(end),
+            "duration_frames":  int(end - start + 1),
             "duration_seconds": round((end - start + 1) / fps, 2),
-            "bottom_frame": int(bottom),
-            "metrics": metrics,
-            "score": rep_score,
+            "bottom_frame":     int(bottom),
+            "metrics":          metrics,
+            "score":            rep_score,
         })
 
     if rep_outputs:
