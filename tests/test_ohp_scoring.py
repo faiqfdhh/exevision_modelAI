@@ -170,19 +170,21 @@ def test_bar_path_forward_drift():
 # ── _ohp_rom ─────────────────────────────────────────────────────────────────
 
 def test_rom_full_flexion():
-    """Elbows at 60° (good ROM) → min_elbow_angle ≤ 75."""
-    # Construct a frame where elbow is bent at ~60°
-    # shoulder=(0,0.5,0), elbow=(0,0.3,-0.1), wrist=(0,0.1,0.05)
+    """Elbows at exactly 60° (good ROM) → min_elbow_angle ≤ 75.
+    Geometry: shoulder=(-.1,.5,0), elbow=(-.1,.3,0), wrist=(-.1,.4,0.1732)
+      v1 = shoulder-elbow = (0,0.2,0),  v2 = wrist-elbow = (0,0.1,0.1732)
+      |v1|=|v2|=0.2, dot=0.02 → cos=0.5 → angle=60° exactly.
+    """
     frame = _make_frame(
         ls=(-.1, .5, 0.), rs=(.1, .5, 0.),
-        le=(-.1, .3,-.1), re=(.1, .3,-.1),
-        lw=(-.1, .1, .05), rw=(.1, .1, .05),
+        le=(-.1, .3, 0.), re=(.1, .3, 0.),
+        lw=(-.1, .4, 0.1732), rw=(.1, .4, 0.1732),
         lh=(-.1, 0., 0.), rh=(.1, 0., 0.),
     )
     frames = [frame] * 20
     min_angle = scoring._ohp_rom(frames)
     assert min_angle is not None
-    assert min_angle < 90.0   # actual value depends on geometry; just check it's reasonable
+    assert abs(min_angle - 60.0) < 1.0   # should be ~60°, well inside full-ROM threshold of 75°
 
 
 def test_rom_no_flexion():

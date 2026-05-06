@@ -394,7 +394,8 @@ python "path\to\temporal_segmentation.py" `
 Key params: `DOWNWARD_VELOCITY_THRESHOLD=0.0015`, `UPWARD_VELOCITY_THRESHOLD=-0.0015`, `MOTION_CONFIRM_FRAMES=2`
 
 **Stage 8 — Scoring & AQA:** `core/exevision/stages/scoring.py`
-Metrics: knee_angle, knee_valgus_ratio, forward_lean_deg, squat_depth. Thresholds are view-dependent. Per-leg independent depth to avoid diagonal-view Z-drift. Output: `squat/aqa_analysis_simple/{quality}/{video_id}/aqa_simple.json`
+- **Squat:** knee_angle, knee_valgus_ratio, forward_lean_deg, squat_depth. Thresholds view-dependent. Per-leg independent depth to avoid diagonal-view Z-drift. Output: `squat/aqa_analysis_simple/{quality}/{video_id}/aqa_simple.json`
+- **OHP / Seated OHP:** 5 biomechanical metrics in body-local 3D frame (grip_ratio, bar_path_deviation, ROM, lockout, elbow_flare). View-independent; body frame built from shoulder/hip landmarks. Config-driven thresholds from `overhead_press.json`. Output: `{exercise}/aqa_analysis_simple/{quality}/{video_id}/aqa_simple.json`
 
 **Stage 9 — Neural Fusion:** `core/exevision/stages/neural_fusion_inference.py`
 `neural_score = clamp(heuristic + tanh(residual) × 40, 0, 100)`. Requires `bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt`. Output: merged AQA with neural scores + three-judge breakdown (BiLSTM/ST-GCN/Heuristic).
