@@ -160,6 +160,7 @@ app.add_middleware(
 class InferRequest(BaseModel):
     video_url: str                          # Supabase signed URL or any direct download URL
     job_id: str | None = None               # Optional; generated if not provided
+    exercise: str = "squat"                 # Exercise type; defaults to "squat" for backward compatibility
     stages: list[str] | None = None         # Subset of DEFAULT_STAGES; None = run all
     mode: Literal["filtered", "unfiltered"] = "filtered"
     generate_viz: bool = True               # Generate visuals (annotated video outputs from MediaPipe)
@@ -210,7 +211,7 @@ def _fire_callback(callback_url: str, payload: dict[str, Any]) -> None:
 
 
 # ── Background task ────────────────────────────────────────────────────────────
-def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, callback_url: str | None, generate_viz: bool) -> None:
+def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, callback_url: str | None, generate_viz: bool, exercise: str = "squat") -> None:
     """Downloads the video and runs the full pipeline. Runs in a background thread."""
     import asyncio
     import httpx
@@ -236,6 +237,7 @@ def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, ca
                 stages=stages,
                 mode=mode,
                 generate_viz=generate_viz,
+                exercise=exercise,
             )
 
         completed_at = datetime.now(timezone.utc).isoformat()
@@ -278,7 +280,19 @@ def submit_inference(req: InferRequest, background_tasks: BackgroundTasks) -> di
     Accept a video URL and enqueue a pipeline run.
     Returns immediately with a job_id; poll GET /jobs/{job_id} for results.
     """
+    from pipeline import EXERCISES_CONFIG_DIR
+    
     job_id = req.job_id or str(uuid.uuid4())
+    
+    # Validate exercise config exists
+    exercise_config = EXERCISES_CONFIG_DIR / f"{req.exercise}.json"
+    if not exercise_config.exists():
+        available = sorted(p.stem for p in EXERCISES_CONFIG_DIR.glob("*.json"))
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Unsupported exercise: '{req.exercise}'. Available: {available}"
+        )
+    
     try:
         stages = _normalize_stage_selection(req.stages)
     except ValueError as exc:
@@ -304,6 +318,7 @@ def submit_inference(req: InferRequest, background_tasks: BackgroundTasks) -> di
         mode=req.mode,
         callback_url=req.callback_url,
         generate_viz=req.generate_viz,
+        exercise=req.exercise,
     )
     return {"job_id": job_id, "status": "queued"}
 

@@ -47,6 +47,15 @@ SEGMENTED_ROOT = Path("./squat/segmented_reps")
 OUTPUT_DIR = "./squat/aqa_analysis_simple"
 
 
+def _build_scoring_paths(exercise: str):
+    """Compute path constants for the given exercise."""
+    return {
+        "features_root": Path(f"./{exercise}/extracted_features_clean"),
+        "segmented_root": Path(f"./{exercise}/segmented_reps"),
+        "output_dir": f"./{exercise}/aqa_analysis_simple",
+    }
+
+
 # --------------------------
 # MediaPipe indices
 # --------------------------
@@ -629,10 +638,19 @@ def score_rep_simple(metrics: Dict[str, Optional[float]], view: str = "unknown")
 # --------------------------
 
 def main() -> int:
+    global FEATURES_ROOT, SEGMENTED_ROOT, OUTPUT_DIR
+
     parser = argparse.ArgumentParser(description="Simple squat AQA (uses reps from 5_temporal_segmentation)")
     parser.add_argument("video_id", nargs="?", help="Video ID (e.g., 25713_3) or '*' to process all videos")
     parser.add_argument("--no-save", action="store_true", help="Do not save output")
+    parser.add_argument("--exercise", default="squat", help="Exercise type (default: squat)")
     args = parser.parse_args()
+
+    # Update paths based on exercise
+    paths = _build_scoring_paths(args.exercise)
+    FEATURES_ROOT = paths["features_root"]
+    SEGMENTED_ROOT = paths["segmented_root"]
+    OUTPUT_DIR = paths["output_dir"]
 
     if not args.video_id:
         parser.print_help()

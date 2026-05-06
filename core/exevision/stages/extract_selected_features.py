@@ -53,6 +53,16 @@ CREATE_VISUALIZATION = True
 CREATE_ANALYSIS_REPORT = True  # Generate detailed analysis report
 USE_GPU = False
 
+
+def _build_paths(exercise: str):
+    """Compute path constants for the given exercise."""
+    return {
+        "dataset": f"./{exercise}/dataset_videos_all",
+        "output": f"./{exercise}/extracted_features_clean",
+        "viz": f"./{exercise}/visualized_poses_clean",
+        "analysis": f"./{exercise}/analysis_reports",
+    }
+
 # Quality-based output organization
 QUALITY_FOLDERS = {
     'Excellent': os.path.join(OUTPUT_ROOT, 'excellent'),
@@ -64,6 +74,18 @@ QUALITY_FOLDERS = {
 # List of video IDs to process (without extension)
 # Use ["*"] to process ALL videos, or specific IDs like ["25713_3", "46315_6"]
 VIDEO_IDS = ["*"]
+MAX_VIDEOS = None  # None = process all
+INCLUDE_POOR = False  # When True, saves Poor-but-detectable videos to raw_unfiltered/
+
+# Seated OHP variant — parallel output root with leg landmarks zeroed
+SEATED_OHP_OUTPUT_ROOT = None        # Set at runtime from exercise root
+SEATED_OHP_VIZ_ROOT = None
+
+# Leg landmark indices (knees, ankles, heels, foot tips) — zeroed for seated variant
+LEG_LANDMARK_INDICES = set(range(25, 33))  # 25-32 inclusive
+
+# Skipped videos registry — persists rejections across runs
+SKIPPED_VIDEOS_REGISTRY = {}  # {video_id: {reason, timestamp, mode}}
 
 # Processing mode: "filtered" (default, with full processing) or
 # "unfiltered" (One Euro smoothing only, no stability filtering)
@@ -922,7 +944,7 @@ def get_mediapipe_options(use_gpu=True):
     return vision.PoseLandmarkerOptions(
         base_options=base_options,
         running_mode=vision.RunningMode.VIDEO,
-        num_poses=1,
+        num_poses=2,
         min_pose_detection_confidence=0.5,
         min_pose_presence_confidence=0.5,
         min_tracking_confidence=0.5,
@@ -954,13 +976,57 @@ def find_video_path(video_id):
     return None
 
 
+def _load_skipped_videos_registry():
+    """Load skipped videos registry from disk (persists across runs)."""
+    global SKIPPED_VIDEOS_REGISTRY
+    registry_path = os.path.join(OUTPUT_ROOT, "..", ".skipped_videos_registry.json")
+    try:
+        if os.path.exists(registry_path):
+            with open(registry_path, 'r') as f:
+                SKIPPED_VIDEOS_REGISTRY = json.load(f)
+    except Exception as e:
+        print(f"Warning: Could not load skipped videos registry: {e}")
+        SKIPPED_VIDEOS_REGISTRY = {}
+
+def _save_skipped_video(vid_id, reason, mode="filtered"):
+    """Record a skipped video to the registry (main process saves to disk after all workers complete)."""
+    global SKIPPED_VIDEOS_REGISTRY
+    # Just update in-memory; don't write from worker processes (race condition with multiprocessing)
+    SKIPPED_VIDEOS_REGISTRY[vid_id] = {
+        "reason": reason,
+        "timestamp": datetime.now().isoformat(),
+        "mode": mode
+    }
+
+def _persist_skipped_videos_registry():
+    """Save registry to disk (call ONLY from main process after workers finish)."""
+    global SKIPPED_VIDEOS_REGISTRY
+    registry_path = os.path.join(OUTPUT_ROOT, "..", ".skipped_videos_registry.json")
+    try:
+        os.makedirs(os.path.dirname(registry_path), exist_ok=True)
+        with open(registry_path, 'w') as f:
+            json.dump(SKIPPED_VIDEOS_REGISTRY, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not save skipped videos registry: {e}")
+
 def _already_processed_json_exists(vid_path, mode="filtered"):
-    """Return True when output JSON for this video already exists."""
+    """Return True when video was already processed or rejected (successful or skipped)."""
     vid_id = os.path.splitext(os.path.basename(vid_path))[0]
 
+    # Check if video was previously rejected/skipped
+    if vid_id in SKIPPED_VIDEOS_REGISTRY:
+        return True  # Already determined to skip; don't re-process
+
     if mode == "unfiltered":
-        out_path = os.path.join(OUTPUT_ROOT, "raw_unfiltered", f"{vid_id}.json")
-        return os.path.exists(out_path)
+        main_path = os.path.join(OUTPUT_ROOT, "raw_unfiltered", f"{vid_id}.json")
+        main_done = os.path.exists(main_path)
+        # If a seated mirror is expected, both must exist to consider it fully processed
+        if SEATED_OHP_OUTPUT_ROOT is not None:
+            seated_path = os.path.join(SEATED_OHP_OUTPUT_ROOT, "raw_unfiltered", f"{vid_id}.json")
+            seated_done = os.path.exists(seated_path)
+            fully_done = main_done and seated_done
+            return fully_done
+        return main_done
 
     candidate_paths = [
         os.path.join(QUALITY_FOLDERS['Excellent'], f"{vid_id}.json"),
@@ -980,7 +1046,7 @@ def create_visualization_report(video_id, analysis, visibility_scores, key_joint
     # Plot 1: Overall visibility trend
     axes[0, 0].plot(visibility_scores, label='Overall', color='blue', alpha=0.7)
     axes[0, 0].plot(key_joint_scores, label='Key Joints', color='red', alpha=0.7)
-    axes[0, 0].axhline(y=0.6, color='green', linestyle='--', alpha=0.5, label='Good threshold')
+    axes[0, 0].axhline(y=0.5, color='orange', linestyle='--', alpha=0.5, label='Min threshold (0.50)')
     axes[0, 0].axhline(y=0.4, color='orange', linestyle='--', alpha=0.5, label='Fair threshold')
     axes[0, 0].set_xlabel('Frame')
     axes[0, 0].set_ylabel('Visibility Score')
@@ -1098,6 +1164,7 @@ def process_single_video(vid_path, mode="filtered"):
         frame_metrics = []
         mandatory_chain_flags = []
         face_detected_per_frame = []
+        multi_person_frame_count = 0
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         frame_timestamp_step_ms = 1000.0 / fps if fps > 0 else 1000.0 / 30.0
 
@@ -1158,6 +1225,9 @@ def process_single_video(vid_path, mode="filtered"):
 
                     # Pose Landmarking
                     detection_result = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
+
+                    if len(detection_result.pose_landmarks) >= 2:
+                        multi_person_frame_count += 1
 
                     if detection_result.pose_landmarks:
                         frame_img = [[lm.x, lm.y, lm.z, lm.visibility]
@@ -1318,14 +1388,35 @@ def process_single_video(vid_path, mode="filtered"):
         
         if mode == "unfiltered":
             quality_rating = "Raw"
-        
-        # Skip poor videos - don't save anything (unless in unfiltered mode)
-        if quality_rating == 'Poor':
+
+        # Skip if two people detected in >10% of frames
+        total_frames = max(len(visibility_scores), 1)
+        if multi_person_frame_count / total_frames > 0.10:
             cap.release()
-            return vid_id, "Skipped", f"Poor quality: {avg_overall:.2f}", analysis, avg_overall
-        
+            reason = f"Multiple people detected ({multi_person_frame_count}/{total_frames} frames)"
+            _save_skipped_video(vid_id, reason, mode=mode)
+            return vid_id, "Skipped", reason, analysis, avg_overall
+
+        # Skip if any frame dips below 0.50 overall visibility
+        min_overall = min(visibility_scores) if visibility_scores else 0.0
+        if min_overall < 0.50:
+            cap.release()
+            reason = f"Min overall {min_overall:.2f} dips below 0.50"
+            _save_skipped_video(vid_id, reason, mode=mode)
+            return vid_id, "Skipped", reason, analysis, avg_overall
+
+        # Skip poor videos unless --include-poor is set; always skip truly undetectable ones
+        if quality_rating == 'Poor':
+            if not INCLUDE_POOR or avg_overall < 0.15:
+                cap.release()
+                reason = f"Poor quality: {avg_overall:.2f}"
+                _save_skipped_video(vid_id, reason, mode=mode)
+                return vid_id, "Skipped", reason, analysis, avg_overall
+            # Redirect poor-but-detectable videos to raw_unfiltered/
+            quality_rating = "Raw"
+
         # Determine output folder based on quality
-        if mode == "unfiltered":
+        if mode == "unfiltered" or quality_rating == "Raw":
             quality_output_root = os.path.join(OUTPUT_ROOT, "raw_unfiltered")
         else:
             quality_output_root = QUALITY_FOLDERS[quality_rating]
@@ -1406,6 +1497,59 @@ def process_single_video(vid_path, mode="filtered"):
             except Exception as viz_error:
                 print(f"  Warning: Visualization failed for {vid_id}: {viz_error}")
         
+        # ── Seated OHP variant: zero leg landmarks, save parallel outputs ──
+        if SEATED_OHP_OUTPUT_ROOT is not None:
+            seated_data_img   = [_zero_leg_landmarks(f) for f in data_img_space]
+            seated_data_world = [_zero_leg_landmarks(f) for f in data_world_space]
+
+            seated_quality_root = os.path.join(SEATED_OHP_OUTPUT_ROOT, "raw_unfiltered")
+            os.makedirs(seated_quality_root, exist_ok=True)
+            seated_save_path = os.path.join(seated_quality_root, f"{vid_id}.json")
+            with open(seated_save_path, 'w') as f:
+                json.dump({
+                    "info": {
+                        "fps": fps,
+                        "frame_count": len(seated_data_img),
+                        "resolution": f"{w}x{h}",
+                        "model": "PoseLandmarker_Heavy",
+                        "processed_on": delegate_used,
+                        "timestamp": datetime.now().isoformat(),
+                        "quality_rating": quality_rating,
+                        "variant": "seated",
+                        "zeroed_landmarks": sorted(LEG_LANDMARK_INDICES),
+                        "smoothing_method": "one_euro_filter" if mode == "unfiltered" else "savgol_plus_stability",
+                    },
+                    "visibility_metrics": {
+                        "overall_avg": float(avg_overall),
+                        "key_joints_avg": float(avg_key),
+                        "overall_min": float(np.min(visibility_scores)),
+                        "overall_max": float(np.max(visibility_scores)),
+                    },
+                    "face_detected": face_detected_per_frame,
+                    "keypoints_img": seated_data_img,
+                    "keypoints_world": seated_data_world,
+                }, f, indent=None, separators=(',', ':'))
+
+            if CREATE_VISUALIZATION and frames_for_viz:
+                try:
+                    seated_viz_root = os.path.join(SEATED_OHP_VIZ_ROOT, quality_rating.lower())
+                    os.makedirs(seated_viz_root, exist_ok=True)
+                    seated_viz_path = os.path.join(seated_viz_root, f"{vid_id}_annotated.mp4")
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    seated_out = cv2.VideoWriter(seated_viz_path, fourcc, fps, (w, h))
+                    if not seated_out.isOpened():
+                        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+                        seated_out = cv2.VideoWriter(seated_viz_path, fourcc, fps, (w, h))
+                    if seated_out.isOpened():
+                        visibility_data = {'frame_metrics': frame_metrics, 'overall_avg': avg_overall, 'key_joints_avg': avg_key}
+                        for frame_idx, frame in enumerate(frames_for_viz):
+                            if frame_idx < len(seated_data_img):
+                                annotated = draw_landmarks_enhanced(frame, seated_data_img[frame_idx], h, w, frame_idx, visibility_data)
+                                seated_out.write(annotated)
+                        seated_out.release()
+                except Exception as seated_viz_err:
+                    print(f"  Warning: Seated visualization failed for {vid_id}: {seated_viz_err}")
+
         # Create analysis report
         if CREATE_ANALYSIS_REPORT and visibility_scores:
             plot_path, report_path = create_visualization_report(
@@ -1432,10 +1576,41 @@ def process_single_video(vid_path, mode="filtered"):
         error_details = f"{str(e)}\n{traceback.format_exc()}"
         return vid_path, "Error", error_details, None, None
 
+def _zero_leg_landmarks(frame_data):
+    """Return a copy of frame_data with leg landmarks (indices 25-32) zeroed out."""
+    result = []
+    for i, lm in enumerate(frame_data):
+        if i in LEG_LANDMARK_INDICES:
+            result.append([0.0, 0.0, 0.0, 0.0])
+        else:
+            result.append(list(lm))
+    return result
+
+
 def signal_handler(sig, frame):
-    """Handle Ctrl+C gracefully"""
-    print("\n\n⚠️  Received interrupt signal. Shutting down gracefully...")
-    sys.exit(0)
+    """Handle Ctrl+C — let the pool's KeyboardInterrupt handler manage cleanup"""
+    # Don't exit immediately; let the KeyboardInterrupt handler in run_extraction() do the cleanup
+    raise KeyboardInterrupt()
+
+
+def _init_worker(dataset_root, output_root, viz_root, analysis_root, quality_folders,
+                 create_viz, create_report, use_gpu, include_poor,
+                 seated_output_root, seated_viz_root):
+    """Initializer for multiprocessing Pool — propagates updated globals to each worker process."""
+    global DATASET_ROOT, OUTPUT_ROOT, VISUALIZATION_OUTPUT_ROOT, ANALYSIS_OUTPUT_ROOT
+    global QUALITY_FOLDERS, CREATE_VISUALIZATION, CREATE_ANALYSIS_REPORT, USE_GPU, INCLUDE_POOR
+    global SEATED_OHP_OUTPUT_ROOT, SEATED_OHP_VIZ_ROOT
+    DATASET_ROOT = dataset_root
+    OUTPUT_ROOT = output_root
+    VISUALIZATION_OUTPUT_ROOT = viz_root
+    ANALYSIS_OUTPUT_ROOT = analysis_root
+    QUALITY_FOLDERS.update(quality_folders)
+    CREATE_VISUALIZATION = create_viz
+    CREATE_ANALYSIS_REPORT = create_report
+    USE_GPU = use_gpu
+    INCLUDE_POOR = include_poor
+    SEATED_OHP_OUTPUT_ROOT = seated_output_root
+    SEATED_OHP_VIZ_ROOT = seated_viz_root
 
 def run_extraction(mode="filtered", workers=None):
     # Register signal handler for Ctrl+C
@@ -1447,7 +1622,10 @@ def run_extraction(mode="filtered", workers=None):
     
     for directory in [OUTPUT_ROOT, VISUALIZATION_OUTPUT_ROOT, ANALYSIS_OUTPUT_ROOT]:
         os.makedirs(directory, exist_ok=True)
-    
+
+    # Load registry of previously skipped videos (to avoid re-processing)
+    _load_skipped_videos_registry()
+
     # Handle wildcard - find ALL videos
     if VIDEO_IDS == ["*"]:
         video_paths = []
@@ -1487,6 +1665,9 @@ def run_extraction(mode="filtered", workers=None):
         print(f"ℹ️  Skipping already processed videos: {len(already_processed)}")
 
     video_paths = pending_video_paths
+    if MAX_VIDEOS is not None:
+        video_paths = video_paths[:MAX_VIDEOS]
+        print(f"ℹ️  Capped to {MAX_VIDEOS} unprocessed videos (--max-videos)")
 
     if not video_paths:
         print("All discovered videos are already processed. Nothing to do.")
@@ -1515,7 +1696,13 @@ def run_extraction(mode="filtered", workers=None):
             from functools import partial
             worker = partial(process_single_video, mode=mode)
             # Create pool explicitly (not with context manager) for better Ctrl+C handling
-            pool = Pool(workers, maxtasksperchild=1)
+            pool = Pool(workers, initializer=_init_worker,
+                        initargs=(DATASET_ROOT, OUTPUT_ROOT, VISUALIZATION_OUTPUT_ROOT,
+                                  ANALYSIS_OUTPUT_ROOT, dict(QUALITY_FOLDERS),
+                                  CREATE_VISUALIZATION, CREATE_ANALYSIS_REPORT,
+                                  USE_GPU, INCLUDE_POOR,
+                                  SEATED_OHP_OUTPUT_ROOT, SEATED_OHP_VIZ_ROOT),
+                        maxtasksperchild=1)
             try:
                 results = list(tqdm(
                     pool.imap_unordered(worker, video_paths),
@@ -1530,8 +1717,20 @@ def run_extraction(mode="filtered", workers=None):
         print("\n\n⚠️  Interrupt received. Terminating workers...")
         if pool is not None:
             pool.terminate()
-            pool.join()
-        print("✓ Cleanup complete.")
+            # Force close without waiting for workers to finish (aggressive cleanup)
+            try:
+                # Give workers 5 seconds to finish gracefully
+                pool.join(timeout=5)
+            except:
+                pass
+            try:
+                # Hard kill any remaining processes
+                for proc in pool._pool:
+                    if proc.is_alive():
+                        proc.terminate()
+            except:
+                pass
+        print("✓ Workers terminated. Exiting.\n")
         sys.exit(0)
     
     # Process results (may be partial if interrupted)
@@ -1543,12 +1742,25 @@ def run_extraction(mode="filtered", workers=None):
     skipped = [r for r in results if r[1] == "Skipped"]
     warnings = [r for r in successes if r[2] is not None]
     
+    # Merge skipped videos from this run into the registry (workers can't safely save to shared registry)
+    for vid_id, status, reason, analysis, avg_overall in skipped:
+        if vid_id not in SKIPPED_VIDEOS_REGISTRY:
+            SKIPPED_VIDEOS_REGISTRY[vid_id] = {
+                "reason": reason,
+                "timestamp": datetime.now().isoformat(),
+                "mode": mode
+            }
+
+    # Save registry to disk (after all workers finish)
+    _persist_skipped_videos_registry()
+
     print(f"\n{'='*60}")
     print("PROCESSING SUMMARY")
     print('='*60)
     print(f"⏭ Already processed (pre-skip): {len(already_processed)}")
+    print(f"↷ Registry entries (cumulative): {len(SKIPPED_VIDEOS_REGISTRY)}")
     print(f"✓ Successfully processed: {len(successes)}")
-    print(f"⊘ Skipped (Poor quality): {len(skipped)}")
+    print(f"⊘ Skipped (this run): {len(skipped)}")
     print(f"✗ Failed: {len(errors)}")
     
     if successes:
@@ -1591,12 +1803,12 @@ def run_extraction(mode="filtered", workers=None):
     print("OUTPUT FILES")
     print('='*60)
     print(f"1. Pose landmarks (by quality):")
-    print(f"   - Excellent: {QUALITY_FOLDERS['Excellent']}/")
-    print(f"   - Good: {QUALITY_FOLDERS['Good']}/")
-    print(f"   - Fair: {QUALITY_FOLDERS['Fair']}/")
+    print(f"   - Excellent: {os.path.abspath(os.path.join(OUTPUT_ROOT, 'excellent'))}/")
+    print(f"   - Good: {os.path.abspath(os.path.join(OUTPUT_ROOT, 'good'))}/")
+    print(f"   - Fair: {os.path.abspath(os.path.join(OUTPUT_ROOT, 'fair'))}/")
     print(f"   - Poor: (not saved)")
-    print(f"2. Annotated videos (by quality): {VISUALIZATION_OUTPUT_ROOT}/{{excellent|good|fair}}/")
-    print(f"3. Analysis reports: {ANALYSIS_OUTPUT_ROOT}/")
+    print(f"2. Annotated videos (by quality): {os.path.abspath(VISUALIZATION_OUTPUT_ROOT)}/{{excellent|good|fair}}/")
+    print(f"3. Analysis reports: {os.path.abspath(ANALYSIS_OUTPUT_ROOT)}/")
     print('='*60)
 
 if __name__ == "__main__":
@@ -1608,7 +1820,33 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", action="store_true", help="Try GPU delegate first, then fallback to CPU on failure")
     parser.add_argument("--video-id", help="Process only one video id (e.g., 25709_1)")
     parser.add_argument("--workers", type=int, default=0, help="Number of workers (default: max available; use 1 for sequential)")
+    parser.add_argument("--exercise", default="squat", help="Exercise type (default: squat)")
+    parser.add_argument("--video-dir", default=None, help="Override video input directory (useful when videos are on a non-NTFS drive)")
+    parser.add_argument("--max-videos", type=int, default=None, help="Cap number of videos to process (for testing)")
+    parser.add_argument("--include-poor", action="store_true", help="Save Poor-but-detectable videos to raw_unfiltered/ instead of skipping")
     args = parser.parse_args()
+
+    # Update paths based on exercise
+    paths = _build_paths(args.exercise)
+    DATASET_ROOT = args.video_dir if args.video_dir else paths["dataset"]
+    OUTPUT_ROOT = paths["output"]
+    VISUALIZATION_OUTPUT_ROOT = paths["viz"]
+    ANALYSIS_OUTPUT_ROOT = paths["analysis"]
+
+    # Seated OHP parallel output — only for overhead_press
+    if args.exercise == "overhead_press":
+        exercise_root = os.path.dirname(OUTPUT_ROOT)  # e.g. ./overhead_press
+        seated_root = os.path.join(os.path.dirname(exercise_root), "seated_overhead_press")
+        SEATED_OHP_OUTPUT_ROOT = os.path.join(seated_root, "extracted_features_clean")
+        SEATED_OHP_VIZ_ROOT    = os.path.join(seated_root, "visualized_poses_clean")
+        print(f"ℹ️  Seated variant enabled for overhead_press")
+        print(f"   Main output:   {os.path.abspath(OUTPUT_ROOT)}")
+        print(f"   Seated output: {os.path.abspath(SEATED_OHP_OUTPUT_ROOT)}")
+
+    # Rebuild QUALITY_FOLDERS so actual save paths use the correct exercise root
+    QUALITY_FOLDERS['Excellent'] = os.path.join(OUTPUT_ROOT, 'excellent')
+    QUALITY_FOLDERS['Good']      = os.path.join(OUTPUT_ROOT, 'good')
+    QUALITY_FOLDERS['Fair']      = os.path.join(OUTPUT_ROOT, 'fair')
 
     if args.no_viz:
         CREATE_VISUALIZATION = False
@@ -1627,5 +1865,10 @@ if __name__ == "__main__":
     if args.video_id:
         VIDEO_IDS[:] = [args.video_id]
         print(f"ℹ️  Video filter enabled: {args.video_id}")
+
+    if args.max_videos is not None:
+        MAX_VIDEOS = args.max_videos
+    if args.include_poor:
+        INCLUDE_POOR = True
 
     run_extraction(mode=args.mode, workers=args.workers)

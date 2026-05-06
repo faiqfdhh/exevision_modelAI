@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -11,6 +12,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+
+_NEURAL_DIR = Path(__file__).resolve().parent.parent / "neural"
+if str(_NEURAL_DIR) not in sys.path:
+    sys.path.insert(0, str(_NEURAL_DIR))
 
 from nn_utils import (
     FIXED_SEQ_LEN,
@@ -149,36 +154,16 @@ class MaskedRepDataset(Dataset):
 
 def apply_joint_masking(batch, mask_ratio=0.25):
     """
-    batch: (batch, 7, 128, 11)
-    Randomly mask joint positions across frames.
-
-    Returns: masked_input, targets, mask
-    mask: (batch, 128, 11) boolean -- True where masked
+    batch: (B, C, T, J) — mask random valid (frame, joint) positions via Bernoulli sampling.
+    Returns: masked_input, targets, mask  — mask is (B, T, J) bool, True where zeroed.
+    Fully vectorized: no Python loops over batch or positions.
     """
     targets = batch.clone()
-    mask = torch.zeros(batch.shape[0], batch.shape[2], batch.shape[3], dtype=torch.bool, device=batch.device)
-
-    for i in range(batch.shape[0]):
-        valid = (batch[i].abs().sum(dim=0) > 0)
-        valid_count = int(valid.sum().item())
-        if valid_count == 0:
-            continue
-
-        num_mask = max(1, int(valid_count * mask_ratio))
-        valid_indices = valid.nonzero(as_tuple=False)
-        if valid_indices.numel() == 0:
-            continue
-
-        perm = torch.randperm(len(valid_indices), device=batch.device)[:num_mask]
-        selected = valid_indices[perm]
-
-        for frame_idx, joint_idx in selected:
-            frame_idx = int(frame_idx.item())
-            joint_idx = int(joint_idx.item())
-            mask[i, frame_idx, joint_idx] = True
-            batch[i, :, frame_idx, joint_idx] = 0.0
-
-    return batch, targets, mask
+    valid = batch.abs().sum(dim=1) > 0  # (B, T, J)
+    rand = torch.rand(batch.shape[0], batch.shape[2], batch.shape[3], device=batch.device)
+    mask = (rand < mask_ratio) & valid
+    masked_batch = batch.masked_fill(mask.unsqueeze(1).expand_as(batch), 0.0)
+    return masked_batch, targets, mask
 
 
 def build_dataloader(dataset, batch_size):

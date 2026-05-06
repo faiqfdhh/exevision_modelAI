@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -11,6 +12,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+
+_NEURAL_DIR = Path(__file__).resolve().parent.parent / "neural"
+if str(_NEURAL_DIR) not in sys.path:
+    sys.path.insert(0, str(_NEURAL_DIR))
 
 from nn_utils import (
     FIXED_SEQ_LEN,

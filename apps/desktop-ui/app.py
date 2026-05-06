@@ -30,6 +30,58 @@ class Stage:
     output_paths: tuple[str, ...]
 
 
+def _build_stages(exercise: str = "squat") -> tuple[Stage, ...]:
+    """Build stage definitions with exercise-specific paths."""
+    return (
+        Stage(
+            key="extract_selected_features",
+            label="2.5 Extract Selected Features",
+            script_path=STAGES_DIR / "extract_selected_features.py",
+            args=(),
+            output_paths=(
+                f"{exercise}/extracted_features_clean",
+                f"{exercise}/visualized_poses_clean",
+                f"{exercise}/analysis_reports",
+            ),
+        ),
+        Stage(
+            key="classify_views",
+            label="4 Classify Views",
+            script_path=STAGES_DIR / "classify_views.py",
+            args=(),
+            output_paths=(f"{exercise}/extracted_features_clean",),
+        ),
+        Stage(
+            key="temporal_segmentation",
+            label="5 Temporal Segmentation",
+            script_path=STAGES_DIR / "temporal_segmentation.py",
+            args=(),
+            output_paths=(f"{exercise}/segmented_reps", f"{exercise}/visualized_segmentation"),
+        ),
+        Stage(
+            key="scoring",
+            label="8 Scoring",
+            script_path=STAGES_DIR / "scoring.py",
+            args=("*",),
+            output_paths=(f"{exercise}/aqa_analysis_simple",),
+        ),
+        Stage(
+            key="analyze_results",
+            label="9 Analyze Results",
+            script_path=RUNTIME_ROOT / "squat" / "aqa_analysis_simple" / "analyze_results.py",
+            args=(),
+            output_paths=(f"{exercise}/aqa_analysis_simple/analysis_visualizations",),
+        ),
+        Stage(
+            key="neural_fusion",
+            label="9 Neural Fusion Scoring",
+            script_path=STAGES_DIR / "neural_fusion_inference.py",
+            args=(),
+            output_paths=(f"{exercise}/neural_analysis",),
+        ),
+    )
+
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
@@ -43,54 +95,8 @@ SHARED_MODEL_PATH = WORKSPACE_ROOT / "models" / "pose_landmarker_heavy.task"
 SHARED_FACE_MODEL_PATH = WORKSPACE_ROOT / "models" / "blaze_face_short_range.tflite"
 
 
-STAGES: tuple[Stage, ...] = (
-    Stage(
-        key="extract_selected_features",
-        label="2.5 Extract Selected Features",
-        script_path=STAGES_DIR / "extract_selected_features.py",
-        args=(),
-        output_paths=(
-            "squat/extracted_features_clean",
-            "squat/visualized_poses_clean",
-            "squat/analysis_reports",
-        ),
-    ),
-    Stage(
-        key="classify_views",
-        label="4 Classify Views",
-        script_path=STAGES_DIR / "classify_views.py",
-        args=(),
-        output_paths=("squat/extracted_features_clean",),
-    ),
-    Stage(
-        key="temporal_segmentation",
-        label="5 Temporal Segmentation",
-        script_path=STAGES_DIR / "temporal_segmentation.py",
-        args=(),
-        output_paths=("squat/segmented_reps", "squat/visualized_segmentation"),
-    ),
-    Stage(
-        key="scoring",
-        label="8 Scoring",
-        script_path=STAGES_DIR / "scoring.py",
-        args=("*",),
-        output_paths=("squat/aqa_analysis_simple",),
-    ),
-    Stage(
-        key="analyze_results",
-        label="9 Analyze Results",
-        script_path=RUNTIME_ROOT / "squat" / "aqa_analysis_simple" / "analyze_results.py",
-        args=(),
-        output_paths=("squat/aqa_analysis_simple/analysis_visualizations",),
-    ),
-    Stage(
-        key="neural_fusion",
-        label="9 Neural Fusion Scoring",
-        script_path=STAGES_DIR / "neural_fusion_inference.py",
-        args=(),
-        output_paths=("squat/neural_analysis",),
-    ),
-)
+# Default stages for squat (backward compatibility); can be overridden by exercise selector
+STAGES: tuple[Stage, ...] = _build_stages("squat")
 
 
 def ordered_stages(stage_keys: list[str]) -> list[Stage]:
@@ -162,6 +168,7 @@ class PipelineRunnerUI:
         self.root.geometry("1400x900")
         self.root.resizable(True, True)
 
+        self.exercise_var = tk.StringVar(value="squat")  # Exercise selector
         self.input_mode_var = tk.StringVar(value="video")
         self.mode_var = tk.StringVar(value="full")
         self.processing_mode_var = tk.StringVar(value="filtered")
@@ -209,6 +216,18 @@ class PipelineRunnerUI:
         RUNS_ROOT.mkdir(parents=True, exist_ok=True)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _on_exercise_changed(self) -> None:
+        """Update STAGES when exercise selection changes."""
+        global STAGES
+        STAGES = _build_stages(self.exercise_var.get())
+        self._log(f"Exercise changed to: {self.exercise_var.get()}")
+        # Update custom stage checkboxes
+        for key in self.stage_checks:
+            self.stage_checks[key].set(False)
+        for stage in STAGES if STAGES else []:
+            if stage.key in self.stage_checks:
+                self.stage_checks[stage.key].set(True)
+
     def _build_layout(self) -> None:
         # Top bar with window controls
         title_bar = ttk.Frame(self.root)
@@ -238,10 +257,27 @@ class PipelineRunnerUI:
         ttk.Label(left_panel, text="Run Name").grid(row=0, column=0, sticky="w")
         ttk.Entry(left_panel, textvariable=self.run_name_var, width=30).grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
+        # Exercise Selection
+        ttk.Label(left_panel, text="Exercise").grid(row=0, column=0, sticky="w", pady=(8, 0))
+        row_offset = 1
+        exercise_frame = ttk.Frame(left_panel)
+        exercise_frame.grid(row=row_offset, column=0, columnspan=2, sticky="ew", padx=(0, 0), pady=(8, 0))
+        exercise_frame.columnconfigure(1, weight=1)
+        ttk.Label(exercise_frame, text="Exercise:").pack(side=tk.LEFT, padx=(0, 4))
+        exercise_combo = ttk.Combobox(
+            exercise_frame,
+            textvariable=self.exercise_var,
+            values=["squat", "overhead_press"],
+            state="readonly",
+            width=16
+        )
+        exercise_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        exercise_combo.bind("<<ComboboxSelected>>", lambda e: self._on_exercise_changed())
+
         # Dataset Input Folder
-        ttk.Label(left_panel, text="Dataset Input").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(left_panel, text="Dataset Input").grid(row=2, column=0, sticky="w", pady=(8, 0))
         dataset_frame = ttk.Frame(left_panel)
-        dataset_frame.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=(8, 0))
+        dataset_frame.grid(row=2, column=1, sticky="ew", padx=(6, 0), pady=(8, 0))
         dataset_frame.columnconfigure(0, weight=1)
         self.dataset_entry = ttk.Entry(dataset_frame, textvariable=self.dataset_var, width=20)
         self.dataset_entry.grid(row=0, column=0, sticky="ew")
@@ -676,11 +712,12 @@ class PipelineRunnerUI:
         dataset_path: Path | None,
         video_path: Path | None,
     ) -> None:
-        squat_dir = workspace_root / "squat"
+        exercise = self.exercise_var.get()
+        exercise_dir = workspace_root / exercise
 
-        (workspace_root / "squat").mkdir(parents=True, exist_ok=True)
+        (workspace_root / exercise).mkdir(parents=True, exist_ok=True)
 
-        dataset_target = squat_dir / "dataset_videos_all"
+        dataset_target = exercise_dir / "dataset_videos_all"
         if dataset_target.exists() or dataset_target.is_symlink():
             try:
                 dataset_target.unlink()
@@ -710,8 +747,9 @@ class PipelineRunnerUI:
         self._log(f"Using shared face model: {SHARED_FACE_MODEL_PATH}")
 
         # Ensure local copy of analyze_results.py exists inside workspace
+        exercise = self.exercise_var.get()
         analyze_src = RUNTIME_ROOT / "squat" / "aqa_analysis_simple" / "analyze_results.py"
-        analyze_dst = workspace_root / "squat" / "aqa_analysis_simple" / "analyze_results.py"
+        analyze_dst = workspace_root / exercise / "aqa_analysis_simple" / "analyze_results.py"
         analyze_dst.parent.mkdir(parents=True, exist_ok=True)
         if analyze_src.exists():
             shutil.copy2(analyze_src, analyze_dst)
@@ -751,8 +789,9 @@ class PipelineRunnerUI:
         video_path: Path | None = None,
     ) -> None:
         script_to_run = stage.script_path
+        exercise = self.exercise_var.get()
         if stage.key == "analyze_results":
-            script_to_run = workspace_root / "squat" / "aqa_analysis_simple" / "analyze_results.py"
+            script_to_run = workspace_root / exercise / "aqa_analysis_simple" / "analyze_results.py"
 
         if not script_to_run.exists():
             raise RuntimeError(f"Script not found for stage '{stage.label}': {script_to_run}")
@@ -822,7 +861,9 @@ class PipelineRunnerUI:
             if processing_mode == "dual":
                 stage_args.extend(["--quality-tier", "raw_unfiltered"])
 
-        cmd = [sys.executable, str(script_to_run), *stage_args]
+        # Add exercise parameter to all stage invocations
+        exercise = self.exercise_var.get()
+        cmd = [sys.executable, str(script_to_run), "--exercise", exercise, *stage_args]
         log_file = logs_root / f"{stage.key}.log"
 
         with open(log_file, "w", encoding="utf-8") as f:
@@ -959,11 +1000,12 @@ class PipelineRunnerUI:
             self.preview_video_map[label] = (path, original)
 
         values = list(self.preview_video_map.keys())
-        # Sort to prioritize _phases, then _segmented, then _annotated
+        # Sort to prioritize _annotated (pose landmarks), then _segmented, then _phases.
+        # Within each type, prefer raw_unfiltered over filtered.
         def sort_key(name):
-            if "_phases" in name: return 0
-            if "_segmented" in name: return 1
-            return 2
+            type_rank = 0 if "_annotated" in name else (1 if "_segmented" in name else 2)
+            tier_rank = 0 if "raw_unfiltered" in name else 1
+            return (type_rank, tier_rank)
         values.sort(key=sort_key)
         run_root = Path(RUNS_ROOT) / self.run_name_var.get().strip()
         dataset_dir = run_root / "workspace" / "squat" / "dataset_videos_all"
@@ -2728,20 +2770,35 @@ class AnnotationToolUI:
         view = seg_data.get("info", {}).get("view", "unknown")
         fps = seg_data.get("info", {}).get("fps", 30.0)
 
-        # Find visualization video path (prefer raw_unfiltered over quality folder)
-        vis_root = workspace / "squat" / "visualized_segmentation"
+        # Find visualization video path.
+        # Priority: (1) pose-landmark annotated video (visualized_poses_clean, raw_unfiltered first)
+        #           (2) segmentation phase overlay (visualized_segmentation, raw_unfiltered first)
+        #           (3) raw video fallback
         vis_video = ""
+
+        # (1) Pose-landmark annotated video
+        poses_root = workspace / "squat" / "visualized_poses_clean"
         for viz_q in ("raw_unfiltered", quality):
             if vis_video:
                 break
-            for suffix in ("_phases.mp4", "_segmented.mp4", "_phases.avi", "_segmented.avi"):
-                candidate = vis_root / viz_q / f"{video_id}{suffix}"
-                if candidate.exists():
-                    vis_video = str(candidate)
-                    break
+            candidate = poses_root / viz_q / f"{video_id}_annotated.mp4"
+            if candidate.exists():
+                vis_video = str(candidate)
 
+        # (2) Segmentation phase overlay
         if not vis_video:
-            # Fallback to raw video
+            seg_vis_root = workspace / "squat" / "visualized_segmentation"
+            for viz_q in ("raw_unfiltered", quality):
+                if vis_video:
+                    break
+                for suffix in ("_phases.mp4", "_segmented.mp4", "_phases.avi", "_segmented.avi"):
+                    candidate = seg_vis_root / viz_q / f"{video_id}{suffix}"
+                    if candidate.exists():
+                        vis_video = str(candidate)
+                        break
+
+        # (3) Raw video fallback
+        if not vis_video:
             raw = workspace / "squat" / "dataset_videos_all" / f"{video_id}.mp4"
             if raw.exists():
                 vis_video = str(raw)
@@ -3390,16 +3447,26 @@ class AnnotationToolUI:
             seg_path_text = outputs.get("segmented_json", "")
             seg_path = Path(_resolve_existing_path(seg_path_text)) if seg_path_text else None
 
-            candidates = []
-            if seg_path and seg_path.exists():
-                # .../workspace/squat/segmented_reps/<quality>/<video>_segmented.json
-                squat_root = seg_path.parent.parent.parent
-                for viz_q in ("raw_unfiltered", quality):
-                    vis_dir = squat_root / "visualized_segmentation" / viz_q
-                    for suffix in ("_phases.mp4", "_segmented.mp4", "_phases.avi", "_segmented.avi"):
-                        candidate = vis_dir / f"{video_id}{suffix}"
-                        if candidate.exists():
-                            return str(candidate)
+            if not (seg_path and seg_path.exists()):
+                return ""
+
+            # .../workspace/squat/segmented_reps/<quality>/<video>_segmented.json
+            squat_root = seg_path.parent.parent.parent
+
+            # Priority 1: pose-landmark annotated video
+            poses_root = squat_root / "visualized_poses_clean"
+            for viz_q in ("raw_unfiltered", quality):
+                candidate = poses_root / viz_q / f"{video_id}_annotated.mp4"
+                if candidate.exists():
+                    return str(candidate)
+
+            # Priority 2: segmentation phase overlay
+            for viz_q in ("raw_unfiltered", quality):
+                vis_dir = squat_root / "visualized_segmentation" / viz_q
+                for suffix in ("_phases.mp4", "_segmented.mp4", "_phases.avi", "_segmented.avi"):
+                    candidate = vis_dir / f"{video_id}{suffix}"
+                    if candidate.exists():
+                        return str(candidate)
 
             return ""
 

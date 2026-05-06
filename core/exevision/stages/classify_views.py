@@ -16,6 +16,12 @@ FEATURES_RAW_UNFILTERED = "./squat/extracted_features_clean/raw_unfiltered"
 
 FEATURES_DIRS = [FEATURES_EXCELLENT, FEATURES_GOOD, FEATURES_FAIR, FEATURES_RAW_UNFILTERED]
 
+
+def _build_features_dirs(exercise: str):
+    """Build feature directories for the given exercise."""
+    tiers = ["excellent", "good", "fair", "raw_unfiltered"]
+    return [f"./{exercise}/extracted_features_clean/{tier}" for tier in tiers]
+
 # BlazePose landmark indices
 NOSE = 0
 L_EYE = 2
@@ -281,6 +287,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Classify views from extracted pose features.")
     parser.add_argument("--quality", choices=["excellent", "good", "fair", "raw_unfiltered"], help="Filter by quality")
     parser.add_argument("--video-id", help="Process only one video id (e.g., 25709_1)")
+    parser.add_argument("--exercise", default="squat", help="Exercise type (default: squat)")
     args = parser.parse_args()
+
+    # Update features dirs based on exercise
+    FEATURES_DIRS = _build_features_dirs(args.exercise)
 
     run_classification(quality_filter=args.quality, video_id_filter=args.video_id)

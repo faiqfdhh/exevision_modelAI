@@ -63,6 +63,24 @@ VISUALIZATION_DIRS = {
 
 VIDEO_DIR = "./squat/dataset_videos_all"
 
+
+def _build_temporal_paths(exercise: str):
+    """Build all path dictionaries for the given exercise."""
+    tiers = ["excellent", "good", "fair", "raw_unfiltered"]
+    features_dirs = [f"./{exercise}/extracted_features_clean/{tier}" for tier in tiers]
+    output_dirs = {tier: f"./{exercise}/segmented_reps/{tier}" for tier in tiers}
+    visualization_dirs = {tier: f"./{exercise}/visualized_segmentation/{tier}" for tier in tiers}
+    video_dir = f"./{exercise}/dataset_videos_all"
+    viz_poses_dir = f"./{exercise}/visualized_poses_clean"
+    
+    return {
+        "features_dirs": features_dirs,
+        "output_dirs": output_dirs,
+        "visualization_dirs": visualization_dirs,
+        "video_dir": video_dir,
+        "viz_poses_dir": viz_poses_dir,
+    }
+
 # --- Phase Colors (BGR for OpenCV) ---
 PHASE_COLORS = {
     "idle": (128, 128, 128),       # Gray
@@ -78,7 +96,232 @@ L_KNEE, R_KNEE = 25, 26
 L_ANKLE, R_ANKLE = 27, 28
 L_SHOULDER, R_SHOULDER = 11, 12
 L_HEEL, R_HEEL = 29, 30
+L_WRIST, R_WRIST = 15, 16
+L_ELBOW, R_ELBOW = 13, 14
 NOSE = 0
+
+# =============================================================================
+# EXERCISE-AWARE THRESHOLDS & CONFIGURATION
+# =============================================================================
+
+def _get_thresholds(exercise: str = "squat") -> dict:
+    """
+    Return exercise-specific thresholds for rep validation.
+    
+    Squat thresholds: based on hip displacement and knee angles
+    Overhead Press: based on wrist displacement and elbow extension
+    """
+    if exercise.lower() in ("overhead_press", "standing_overhead_press"):
+        return {
+            "MIN_REP_FRAMES": 20,
+            "MIN_DEPTH_RATIO": 0.05,  # TODO: tune from FitnessAQA distribution
+            "MIN_DEPTH_VALUE": 0.05,  # wrist displacement in normalized coords
+            "MIN_PHASE_DURATION": 12,
+            "PHASE_LOCKOUT": 6,
+            "VELOCITY_IDLE_THRESHOLD": 0.005,
+            "VELOCITY_MOVING_THRESHOLD": 0.010,
+            "DOWNWARD_VELOCITY_THRESHOLD": 0.0015,
+            "UPWARD_VELOCITY_THRESHOLD": -0.0015,
+            "POSITION_JITTER_THRESHOLD": 0.0003,
+            "MOTION_CONFIRM_FRAMES": 2,
+            "ISOMETRIC_MIN_DURATION": 10,
+            "ISOMETRIC_MAX_DURATION": 45,
+            "GLITCH_MERGE_FRAMES": 3,
+            "MIN_CONCENTRIC_DURATION": 20,
+            "HYSTERESIS_FRAMES": 8,
+            "IDLE_RETURN_MARGIN": 0.03,
+            "IDLE_HEIGHT_MARGIN": 0.02,
+            "CALIBRATION_FRAMES": 60,
+            "MIN_VALID_CALIBRATION_FRAMES": 20,
+        }
+    elif exercise.lower() in ("seated_overhead_press",):
+        # Seated OHP: same as standing, but may tune thresholds based on data
+        return _get_thresholds("overhead_press")
+    else:
+        # Default to squat
+        return {
+            "MIN_REP_FRAMES": 20,
+            "MIN_DEPTH_RATIO": 0.05,
+            "MIN_DEPTH_VALUE": 0.05,
+            "MIN_PHASE_DURATION": 12,
+            "PHASE_LOCKOUT": 6,
+            "VELOCITY_IDLE_THRESHOLD": 0.005,
+            "VELOCITY_MOVING_THRESHOLD": 0.010,
+            "DOWNWARD_VELOCITY_THRESHOLD": 0.0015,
+            "UPWARD_VELOCITY_THRESHOLD": -0.0015,
+            "POSITION_JITTER_THRESHOLD": 0.0003,
+            "MOTION_CONFIRM_FRAMES": 2,
+            "ISOMETRIC_MIN_DURATION": 10,
+            "ISOMETRIC_MAX_DURATION": 45,
+            "GLITCH_MERGE_FRAMES": 3,
+            "MIN_CONCENTRIC_DURATION": 20,
+            "HYSTERESIS_FRAMES": 8,
+            "IDLE_RETURN_MARGIN": 0.03,
+            "IDLE_HEIGHT_MARGIN": 0.02,
+            "CALIBRATION_FRAMES": 60,
+            "MIN_VALID_CALIBRATION_FRAMES": 20,
+        }
+
+
+# =============================================================================
+# DEBUG CONFIGURATION
+# =============================================================================
+
+def _debug_enabled() -> bool:
+    """Check if debug mode is enabled via environment variable."""
+    return _env_flag("DEBUG_PHASES", default=False)
+
+
+def _save_phase_debug_log(video_id: str, exercise: str, quality: str, debug_log: dict) -> None:
+    """
+    Save detailed phase detection debug log to JSON file.
+    
+    Output path: {exercise}/debug_phases/{quality}/{video_id}_phases.json
+    
+    Args:
+        video_id: Video identifier
+        exercise: Exercise type (squat, overhead_press, etc.)
+        quality: Quality tier (excellent, good, fair, raw_unfiltered)
+        debug_log: Dictionary with per-rep metadata and acceptance reasoning
+    """
+    debug_dir = f"./{exercise}/debug_phases/{quality}"
+    os.makedirs(debug_dir, exist_ok=True)
+    
+    debug_path = os.path.join(debug_dir, f"{video_id}_phases.json")
+    with open(debug_path, 'w') as f:
+        json.dump(debug_log, f, indent=2)
+
+
+def _hip_y_sequence(frames: list) -> np.ndarray:
+    """
+    Extract normalized hip Y-displacement for squat (control signal).
+    Positive = descending (toward squat depth)
+    
+    Args:
+        frames: List of keypoint frames from MediaPipe
+    
+    Returns:
+        Normalized displacement array (shape: frame_count,)
+    """
+    displacements = []
+    hip_heights = []
+    
+    # First pass: compute standing height from initial frames
+    standing_height = None
+    for frame in frames[:60]:
+        if frame is None or len(frame) < 25:
+            continue
+        l_hip = np.array(frame[L_HIP][:3])
+        r_hip = np.array(frame[R_HIP][:3])
+        hip_y = (l_hip[1] + r_hip[1]) / 2
+        hip_heights.append(hip_y)
+    
+    if hip_heights:
+        standing_height = np.percentile(hip_heights, 25)
+    else:
+        standing_height = 0.0
+    
+    # Second pass: compute per-frame displacement
+    for frame in frames:
+        if frame is None or len(frame) < 25:
+            displacements.append(np.nan)
+            continue
+        
+        l_hip = np.array(frame[L_HIP][:3])
+        r_hip = np.array(frame[R_HIP][:3])
+        hip_mid_y = (l_hip[1] + r_hip[1]) / 2
+        l_conf = frame[L_HIP][3]
+        r_conf = frame[R_HIP][3]
+        hip_conf = (l_conf + r_conf) / 2
+        
+        if hip_conf < MIN_LANDMARK_CONFIDENCE:
+            displacements.append(np.nan)
+            continue
+        
+        displacement = max(0, hip_mid_y - standing_height)
+        displacements.append(displacement)
+    
+    return np.array(displacements)
+
+
+def _wrist_y_sequence_ohp(frames: list) -> np.ndarray:
+    """
+    Extract inverted wrist Y-displacement for overhead press (control signal).
+    
+    **CRITICAL:** We invert the signal so that:
+    - Rising wrist = INCREASING signal (concentric phase)
+    - Falling wrist = DECREASING signal (eccentric phase)
+    
+    This keeps the FSM's "positive velocity = eccentric" semantics unchanged.
+    
+    Args:
+        frames: List of keypoint frames from MediaPipe
+    
+    Returns:
+        Inverted normalized displacement array (shape: frame_count,)
+    """
+    displacements = []
+    wrist_y_values = []
+    
+    # First pass: find standing wrist height (maximum Y = lowest position)
+    for frame in frames[:60]:
+        if frame is None or len(frame) < 17:
+            continue
+        l_wrist = np.array(frame[L_WRIST][:3])
+        r_wrist = np.array(frame[R_WRIST][:3])
+        wrist_y = (l_wrist[1] + r_wrist[1]) / 2
+        wrist_y_values.append(wrist_y)
+    
+    if wrist_y_values:
+        standing_wrist_y = np.percentile(wrist_y_values, 75)  # Use high percentile (low position)
+    else:
+        standing_wrist_y = 0.0
+    
+    # Second pass: compute per-frame displacement (inverted)
+    for frame in frames:
+        if frame is None or len(frame) < 17:
+            displacements.append(np.nan)
+            continue
+        
+        l_wrist = np.array(frame[L_WRIST][:3])
+        r_wrist = np.array(frame[R_WRIST][:3])
+        wrist_mid_y = (l_wrist[1] + r_wrist[1]) / 2
+        l_conf = frame[L_WRIST][3]
+        r_conf = frame[R_WRIST][3]
+        wrist_conf = (l_conf + r_conf) / 2
+        
+        if wrist_conf < MIN_LANDMARK_CONFIDENCE:
+            displacements.append(np.nan)
+            continue
+        
+        # ⭐ INVERT: standing_wrist_y - wrist_mid_y
+        # So rising wrist (smaller Y) = larger displacement value
+        displacement = max(0, standing_wrist_y - wrist_mid_y)
+        displacements.append(displacement)
+    
+    return np.array(displacements)
+
+
+def _get_control_signal(frames: list, exercise: str = "squat") -> np.ndarray:
+    """
+    Get the exercise-specific control signal for phase detection.
+    
+    Squat: normalized hip Y-displacement (positive = descending)
+    Overhead Press: inverted wrist Y-displacement (positive = ascending)
+    
+    Args:
+        frames: List of MediaPipe keypoint frames
+        exercise: Exercise type ("squat", "overhead_press", "seated_overhead_press")
+    
+    Returns:
+        1D control signal array (normalized coordinates)
+    """
+    if exercise.lower() in ("overhead_press", "standing_overhead_press", "seated_overhead_press"):
+        return _wrist_y_sequence_ohp(frames)
+    else:
+        return _hip_y_sequence(frames)
+
+
 
 # =============================================================================
 # WINDOW-BASED ANALYSIS PARAMETERS
@@ -170,32 +413,52 @@ VALID_TRANSITIONS = {
     SquatPhase.UNKNOWN: [SquatPhase.IDLE, SquatPhase.UNKNOWN],
 }
 
+# OHP FSM transitions: IDLE -> CONCENTRIC -> [ISOMETRIC] -> ECCENTRIC -> IDLE
+OHP_VALID_TRANSITIONS = {
+    SquatPhase.IDLE:       [SquatPhase.CONCENTRIC, SquatPhase.IDLE],
+    SquatPhase.CONCENTRIC: [SquatPhase.ISOMETRIC, SquatPhase.ECCENTRIC, SquatPhase.CONCENTRIC],
+    SquatPhase.ISOMETRIC:  [SquatPhase.ECCENTRIC, SquatPhase.ISOMETRIC],
+    SquatPhase.ECCENTRIC:  [SquatPhase.IDLE, SquatPhase.ECCENTRIC],
+    SquatPhase.UNKNOWN:    [SquatPhase.IDLE, SquatPhase.UNKNOWN],
+}
 
-def find_video_file(video_id: str, quality: Optional[str] = None) -> Optional[str]:
+
+def find_video_file(video_id: str, quality: Optional[str] = None, exercise: str = "squat", video_dir: Optional[str] = None) -> Optional[str]:
     """
     Find video file by ID.
     Priority:
     1. Annotated features visualization (step 2.5) if quality is provided
-    2. Original raw video
+    2. Custom video directory (if provided via --video-dir)
+    3. Original raw video
     """
     # 1. Try to find annotated video from step 2.5 first (to combine visualizations)
     if quality:
         # Map quality to directory name if needed, but usually it matches
         quality_lower = quality.lower()
-        annotated_dir = f"./squat/visualized_poses_clean/{quality_lower}"
+        annotated_dir = f"./{exercise}/visualized_poses_clean/{quality_lower}"
         annotated_path = os.path.join(annotated_dir, f"{video_id}_annotated.mp4")
         
         if os.path.exists(annotated_path):
             # print(f"   ℹ️  Using annotated video source: {annotated_path}")
             return annotated_path
 
-    # 2. Fallback to original video search
+    # 2. Search in custom directory if provided
     video_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.flv')
     
-    for root, dirs, files in os.walk(VIDEO_DIR):
-        for file in files:
-            if os.path.splitext(file)[0] == video_id and file.lower().endswith(video_extensions):
-                return os.path.join(root, file)
+    if video_dir and os.path.exists(video_dir):
+        for root, dirs, files in os.walk(video_dir):
+            for file in files:
+                if os.path.splitext(file)[0] == video_id and file.lower().endswith(video_extensions):
+                    return os.path.join(root, file)
+    
+    # 3. Fallback to original video search
+    video_search_dir = f"./{exercise}/dataset_videos_all"
+    
+    if os.path.exists(video_search_dir):
+        for root, dirs, files in os.walk(video_search_dir):
+            for file in files:
+                if os.path.splitext(file)[0] == video_id and file.lower().endswith(video_extensions):
+                    return os.path.join(root, file)
     
     return None
 
@@ -279,12 +542,17 @@ class BiomechanicalAnalyzer:
     """
     Calculates angle-invariant and view-invariant biomechanical metrics.
     Uses body-proportion normalization for consistency across subjects.
+    
+    Supports multiple exercises via exercise-specific control signals:
+    - Squat: hip Y-displacement
+    - Overhead Press: inverted wrist Y-displacement
     """
     
-    def __init__(self, keypoints: List, view: str, fps: float = 30.0):
+    def __init__(self, keypoints: List, view: str, fps: float = 30.0, exercise: str = "squat"):
         self.keypoints = keypoints
         self.view = view
         self.fps = fps
+        self.exercise = exercise
         self.frame_count = len(keypoints)
         
         # Calibrated anthropometrics (for normalization)
@@ -295,12 +563,13 @@ class BiomechanicalAnalyzer:
         self.body_scale = None  # Combined normalization factor
         
         # Primary control signals (view-invariant)
-        self.normalized_hip_displacement = None    # Main signal for phase detection
+        self.control_signal = None                 # Generic signal based on exercise
+        self.normalized_hip_displacement = None    # For backward compat (squat only)
         self.knee_angles = None                    # Secondary validation signal
         self.hip_heights_raw = None
         
         # Derived signals
-        self.velocity_signal = None                # Smoothed velocity of hip displacement
+        self.velocity_signal = None                # Smoothed velocity of control signal
         self.window_velocities = None              # Window-averaged velocities
         self.landmark_confidence = None
         self.valid_frame_mask = None
@@ -310,6 +579,7 @@ class BiomechanicalAnalyzer:
         
         # Use knee angle as primary signal for front/back views
         self.use_knee_angle_primary = view.lower() in {'front', 'back'}
+
     
     def calibrate_from_idle(self) -> bool:
         """
@@ -397,50 +667,53 @@ class BiomechanicalAnalyzer:
     
     def compute_normalized_hip_displacement(self) -> np.ndarray:
         """
-        Compute the primary control signal: normalized vertical hip displacement.
-        Enhanced to handle compressed signals better.
+        Compute the primary control signal based on exercise type.
         
-        Returns: Array where 0 = standing position, positive = squat depth
+        For Squat: normalized vertical hip displacement.
+        For OHP: inverted normalized wrist Y-displacement.
+        
+        For backward compatibility, also populates normalized_hip_displacement for squat.
+        
+        Returns: Array where positive values = progression toward deepest point of movement
         """
-        displacements = []
-        confidences = []
+        # Get exercise-specific control signal
+        self.control_signal = _get_control_signal(self.keypoints, exercise=self.exercise)
         
+        # For backward compatibility with existing squat code, mirror to normalized_hip_displacement
+        if self.exercise.lower() == "squat":
+            self.normalized_hip_displacement = self.control_signal
+        else:
+            # For OHP, normalized_hip_displacement is the inverted wrist signal
+            self.normalized_hip_displacement = self.control_signal
+        
+        # Extract confidence values for later use
+        confidences = []
         for frame in self.keypoints:
-            if frame is None or len(frame) < 24:
-                displacements.append(np.nan)
+            if frame is None:
                 confidences.append(0.0)
                 continue
             
-            # Get hip midpoint
-            l_hip = np.array(frame[L_HIP][:3])
-            r_hip = np.array(frame[R_HIP][:3])
-            hip_mid = (l_hip + r_hip) / 2
-            
-            # Get confidence
-            hip_conf = (frame[L_HIP][3] + frame[R_HIP][3]) / 2
-            confidences.append(hip_conf)
-            
-            if hip_conf < MIN_LANDMARK_CONFIDENCE:
-                displacements.append(np.nan)
-                continue
-            
-            # ⭐ KEY FIX: Displacement from standing (positive = lower = squatting)
-            # Use absolute Y difference, clipped to prevent negative depths
-            displacement = max(0, hip_mid[1] - self.standing_hip_height)
-            
-            # Normalize by body scale
-            normalized_disp = displacement / self.body_scale if self.body_scale > 0 else displacement
-            displacements.append(normalized_disp)
+            if self.exercise.lower() in ("overhead_press", "standing_overhead_press", "seated_overhead_press"):
+                # Wrist confidence for OHP
+                if len(frame) > R_WRIST:
+                    l_conf = frame[L_WRIST][3]
+                    r_conf = frame[R_WRIST][3]
+                    confidences.append((l_conf + r_conf) / 2)
+                else:
+                    confidences.append(0.0)
+            else:
+                # Hip confidence for squat
+                if len(frame) > R_HIP:
+                    l_conf = frame[L_HIP][3]
+                    r_conf = frame[R_HIP][3]
+                    confidences.append((l_conf + r_conf) / 2)
+                else:
+                    confidences.append(0.0)
         
-        self.hip_heights_raw = np.array([(frame[L_HIP][1] + frame[R_HIP][1]) / 2 
-                                         if frame is not None and len(frame) > R_HIP 
-                                         else np.nan for frame in self.keypoints])
         self.landmark_confidence = np.array(confidences)
-        self.normalized_hip_displacement = np.array(displacements)
         
         # Interpolate missing values
         self._interpolate_array(self.normalized_hip_displacement)
-        self._interpolate_array(self.hip_heights_raw)
         
         return self.normalized_hip_displacement
     
@@ -617,19 +890,30 @@ class SquatStateMachine:
         self.transition_log = []
         self.illegal_transition_repairs = 0
 
+    @property
+    def _is_ohp(self) -> bool:
+        return self.analyzer.exercise.lower() in (
+            "overhead_press", "standing_overhead_press", "seated_overhead_press"
+        )
+
+    def _get_valid_transitions(self) -> dict:
+        return OHP_VALID_TRANSITIONS if self._is_ohp else VALID_TRANSITIONS
+
     def _can_return_to_idle(self, frame_idx: int, pos: float) -> bool:
-        """Only allow IDLE once hips return near beginning-of-video standing position."""
-        hip_returned = pos <= (self.start_hip_position + IDLE_RETURN_MARGIN)
-        if not hip_returned:
+        """Allow IDLE once the control signal returns near the starting position."""
+        returned = pos <= (self.start_hip_position + IDLE_RETURN_MARGIN)
+        if not returned:
             return False
+
+        # OHP: wrist position alone is sufficient — no knee check
+        if self._is_ohp:
+            return True
 
         if self.knee_angles is None or frame_idx >= len(self.knee_angles):
             return True
-
         knee_angle = self.knee_angles[frame_idx]
         if np.isnan(knee_angle):
             return True
-
         return knee_angle >= IDLE_KNEE_EXTENSION_THRESHOLD
 
     def _knee_extended(self, frame_idx: int) -> bool:
@@ -652,7 +936,8 @@ class SquatStateMachine:
         return pos <= (self.start_hip_position + IDLE_HEIGHT_MARGIN)
 
     def _is_transition_allowed(self, from_phase: SquatPhase, to_phase: SquatPhase) -> bool:
-        return to_phase in VALID_TRANSITIONS.get(from_phase, [from_phase])
+        transitions = self._get_valid_transitions()
+        return to_phase in transitions.get(from_phase, [from_phase])
 
     def _sanitize_phase_sequence(self):
         """
@@ -698,6 +983,12 @@ class SquatStateMachine:
             self.illegal_transition_repairs += 1
     
     def detect_phases(self) -> np.ndarray:
+        """Route to exercise-specific phase detection."""
+        if self._is_ohp:
+            return self._detect_phases_ohp()
+        return self._detect_phases_squat()
+
+    def _detect_phases_squat(self) -> np.ndarray:
         """
         Simplified phase detection looping over all frames.
         Returns array of phase labels for each frame.
@@ -832,6 +1123,103 @@ class SquatStateMachine:
                     prev_phase = self.phase_labels[changes[i-1]]
                     self.phase_labels[start:end] = prev_phase
     
+    def _detect_phases_ohp(self) -> np.ndarray:
+        """
+        OHP phase detection. Control signal = inverted wrist Y (positive = wrists rising).
+
+        Cycle: IDLE -> CONCENTRIC (press up) -> [ISOMETRIC at top] -> ECCENTRIC (lower) -> IDLE
+
+        positive velocity (signal increasing) = wrists rising  = CONCENTRIC
+        negative velocity (signal decreasing) = wrists falling = ECCENTRIC
+        No knee checks — not applicable to overhead press.
+        """
+        positive_count = 0   # wrists rising  → CONCENTRIC
+        negative_count = 0   # wrists falling → ECCENTRIC
+        still_count = 0
+
+        for i in range(self.frame_count):
+            vel     = self.velocity[i]
+            pos     = self.position[i]
+            raw_vel = self.raw_velocity[i] if self.raw_velocity is not None else vel
+            eff_vel = 0.6 * float(vel) + 0.4 * float(raw_vel)
+            at_start = self._at_top_height(pos)   # pos ≈ 0  →  wrists at shoulder / start
+
+            suggested_phase = self.current_state
+
+            if eff_vel > DOWNWARD_VELOCITY_THRESHOLD and abs(pos - self.start_hip_position) > POSITION_JITTER_THRESHOLD:
+                positive_count += 1
+            else:
+                positive_count = 0
+
+            if eff_vel < UPWARD_VELOCITY_THRESHOLD:
+                negative_count += 1
+            else:
+                negative_count = 0
+
+            if abs(eff_vel) <= VELOCITY_IDLE_THRESHOLD:
+                still_count += 1
+            else:
+                still_count = 0
+
+            # 1) Wrists rising → CONCENTRIC
+            if positive_count >= MOTION_CONFIRM_FRAMES:
+                suggested_phase = SquatPhase.CONCENTRIC
+
+            # 2) Wrists falling from CONCENTRIC/ISOMETRIC → ECCENTRIC
+            elif (
+                negative_count >= MOTION_CONFIRM_FRAMES
+                and self.current_state in [SquatPhase.CONCENTRIC, SquatPhase.ISOMETRIC]
+            ):
+                suggested_phase = SquatPhase.ECCENTRIC
+
+            # 3) Still at top during CONCENTRIC → ISOMETRIC (hold overhead)
+            elif (
+                self.current_state == SquatPhase.CONCENTRIC
+                and still_count >= int(self.fps)
+            ):
+                suggested_phase = SquatPhase.ISOMETRIC
+
+            # 4) ECCENTRIC → IDLE when wrists return to starting position
+            elif self.current_state == SquatPhase.ECCENTRIC:
+                if at_start and self._can_return_to_idle(i, pos):
+                    suggested_phase = SquatPhase.IDLE
+                else:
+                    suggested_phase = SquatPhase.ECCENTRIC
+
+            # 5) Remain IDLE while at starting position
+            elif self.current_state == SquatPhase.IDLE and at_start:
+                suggested_phase = SquatPhase.IDLE
+
+            else:
+                if self.current_state == SquatPhase.ISOMETRIC:
+                    suggested_phase = SquatPhase.ISOMETRIC
+                elif self.current_state == SquatPhase.CONCENTRIC:
+                    suggested_phase = SquatPhase.CONCENTRIC
+                elif self.current_state == SquatPhase.ECCENTRIC:
+                    suggested_phase = SquatPhase.ECCENTRIC
+                else:
+                    suggested_phase = SquatPhase.IDLE
+
+            if suggested_phase != self.current_state:
+                self.transition_log.append({
+                    "frame": i,
+                    "from": self.current_state.name.lower(),
+                    "to": suggested_phase.name.lower(),
+                    "reason": (
+                        f"OHP: eff_vel={eff_vel:.4f}, pos={pos:.4f}, "
+                        f"pos_cnt={positive_count}, neg_cnt={negative_count}, still_cnt={still_count}"
+                    )
+                })
+                self.current_state = suggested_phase
+
+            self.phase_labels[i] = self.current_state
+
+        self._sanitize_phase_sequence()
+        self._enforce_minimum_durations()
+        self._sanitize_phase_sequence()
+
+        return np.array([p.value for p in self.phase_labels])
+
     def get_phase_name(self, phase_id: int) -> str:
         """Convert phase ID to name"""
         phase_names = {0: "idle", 1: "eccentric", 2: "isometric", 3: "concentric", 4: "unknown"}
@@ -842,16 +1230,19 @@ class TemporalSegmenter:
     """
     Advanced temporal segmentation with biomechanical rigor.
     
+    Supports multiple exercises via exercise-specific control signals.
+    
     Pipeline:
     1. View validation - reject unreliable views
     2. Anthropometric calibration from idle frames
-    3. Compute view-invariant control signals
+    3. Compute exercise-specific control signals
     4. Window-based FSM phase detection
     5. Repetition detection and validation
     """
     
-    def __init__(self, keypoints_data: dict, video_id: str):
+    def __init__(self, keypoints_data: dict, video_id: str, exercise: str = "squat"):
         self.video_id = video_id
+        self.exercise = exercise
         self.keypoints = keypoints_data.get('keypoints_img', [])
         self.info = keypoints_data.get('info', {})
         self.view = self.info.get('view', 'unknown')
@@ -863,9 +1254,10 @@ class TemporalSegmenter:
         self.view_valid = self._validate_view()
         
         # Analysis components
-        self.analyzer = BiomechanicalAnalyzer(self.keypoints, self.view, self.fps)
+        self.analyzer = BiomechanicalAnalyzer(self.keypoints, self.view, self.fps, exercise=exercise)
         self.state_machine = None
         self.phase_labels = None
+
     
     def _validate_view(self) -> bool:
         """
@@ -958,6 +1350,38 @@ class TemporalSegmenter:
                 }
             }
             
+            # Generate debug log if enabled
+            if _debug_enabled():
+                debug_log = {
+                    "video_id": self.video_id,
+                    "exercise": self.exercise,
+                    "frame_count": self.frame_count,
+                    "fps": float(self.fps),
+                    "control_signal_range": (
+                        float(np.nanmin(self.analyzer.normalized_hip_displacement)),
+                        float(np.nanmax(self.analyzer.normalized_hip_displacement))
+                    ),
+                    "reps": []
+                }
+                
+                for rep in reps:
+                    debug_log["reps"].append({
+                        "rep_id": rep.rep_id,
+                        "start_frame": rep.start_frame,
+                        "end_frame": rep.end_frame,
+                        "duration_frames": rep.end_frame - rep.start_frame + 1,
+                        "control_signal_max": float(rep.squat_depth_normalized),
+                        "phase_sequence": [p.phase_type for p in rep.phases],
+                        "accepted": True,
+                        "reasons": [
+                            f"Phase sequence: {' -> '.join([p.phase_type for p in rep.phases])}",
+                            f"Max displacement: {rep.squat_depth_normalized:.4f}",
+                            f"Duration: {rep.end_frame - rep.start_frame + 1} frames"
+                        ]
+                    })
+                
+                result["debug_log"] = debug_log
+            
             return convert_to_serializable(result)
 
         except Exception as e:
@@ -969,6 +1393,91 @@ class TemporalSegmenter:
             }
     
     def _detect_repetitions(self) -> List[Repetition]:
+        """Route to exercise-specific rep detection."""
+        if self.exercise.lower() in ("overhead_press", "standing_overhead_press", "seated_overhead_press"):
+            return self._detect_repetitions_ohp()
+        return self._detect_repetitions_squat()
+
+    def _detect_repetitions_ohp(self) -> List[Repetition]:
+        """
+        OHP rep detection: CONCENTRIC → [ISOMETRIC] → ECCENTRIC cycle.
+        Rep starts at first CONCENTRIC frame, ends when ECCENTRIC returns to IDLE.
+        `squat_depth_normalized` holds peak wrist displacement; `bottom_frame` holds top-of-press frame.
+        """
+        reps = []
+        i = 0
+        min_height = 0.02   # minimum wrist displacement to count as a real rep
+
+        while i < self.frame_count:
+            if self.phase_labels[i] == SquatPhase.IDLE.value:
+                i += 1
+                continue
+
+            if self.phase_labels[i] == SquatPhase.CONCENTRIC.value:
+                rep_start = i
+                top_frame = i
+                max_height = self.analyzer.normalized_hip_displacement[i]
+
+                has_isometric = False
+                has_eccentric = False
+
+                j = i + 1
+                while j < self.frame_count:
+                    phase  = self.phase_labels[j]
+                    height = self.analyzer.normalized_hip_displacement[j]
+
+                    if height > max_height:
+                        max_height = height
+                        top_frame = j
+
+                    if phase == SquatPhase.CONCENTRIC.value:
+                        pass
+                    elif phase == SquatPhase.ISOMETRIC.value:
+                        has_isometric = True
+                    elif phase == SquatPhase.ECCENTRIC.value:
+                        has_eccentric = True
+                    elif phase == SquatPhase.IDLE.value:
+                        if has_eccentric:
+                            rep_end = j - 1
+                            if (rep_end - rep_start + 1) >= MIN_REP_FRAMES and max_height >= min_height:
+                                phases = self._extract_rep_phases(rep_start, rep_end, top_frame)
+                                reps.append(Repetition(
+                                    rep_id=len(reps) + 1,
+                                    start_frame=rep_start,
+                                    end_frame=rep_end,
+                                    phases=phases,
+                                    squat_depth_normalized=max_height,
+                                    squat_depth_angle=0.0,
+                                    bottom_frame=top_frame,
+                                    bottom_knee_angle=0.0,
+                                ))
+                        i = j
+                        break
+                    j += 1
+
+                if j >= self.frame_count:
+                    if has_eccentric:
+                        rep_end = self.frame_count - 1
+                        if (rep_end - rep_start + 1) >= MIN_REP_FRAMES and max_height >= min_height:
+                            phases = self._extract_rep_phases(rep_start, rep_end, top_frame)
+                            reps.append(Repetition(
+                                rep_id=len(reps) + 1,
+                                start_frame=rep_start,
+                                end_frame=rep_end,
+                                phases=phases,
+                                squat_depth_normalized=max_height,
+                                squat_depth_angle=0.0,
+                                bottom_frame=top_frame,
+                                bottom_knee_angle=0.0,
+                            ))
+                    i = self.frame_count
+                    break
+            else:
+                i += 1
+
+        return reps
+
+    def _detect_repetitions_squat(self) -> List[Repetition]:
         """
         Detect repetitions from phase sequences.
         A rep = eccentric → [isometric] → concentric (cycle)
@@ -1099,6 +1608,103 @@ class TemporalSegmenter:
         return reps
     
     def _detect_repetitions_phase_only(self) -> List[Repetition]:
+        """Route to exercise-specific phase-only rep counting."""
+        if self.exercise.lower() in ("overhead_press", "standing_overhead_press", "seated_overhead_press"):
+            return self._detect_repetitions_phase_only_ohp()
+        return self._detect_repetitions_phase_only_squat()
+
+    def _detect_repetitions_phase_only_ohp(self) -> List[Repetition]:
+        """
+        OHP phase-only fallback: CONCENTRIC → [ISOMETRIC] → ECCENTRIC cycle.
+        Ignores displacement thresholds to avoid missing reps.
+        """
+        reps: List[Repetition] = []
+        if self.phase_labels is None or len(self.phase_labels) == 0:
+            return reps
+
+        phase_ids = self.phase_labels
+        n = self.frame_count
+
+        WAIT_CONC, IN_CONC, IN_ISO, IN_ECC = 0, 1, 2, 3
+        state = WAIT_CONC
+        rep_start: Optional[int] = None
+
+        def finalize_rep(start_idx: int, end_idx: int):
+            if start_idx is None or end_idx is None or end_idx < start_idx:
+                return
+            if (end_idx - start_idx + 1) < MIN_REP_FRAMES_PHASE_ONLY:
+                return
+            disp = self.analyzer.normalized_hip_displacement
+            seg  = disp[start_idx:end_idx + 1] if disp is not None else None
+            if seg is not None and len(seg) > 0:
+                seg_safe = np.where(np.isnan(seg), -np.inf, seg)
+                top_off   = int(np.argmax(seg_safe))
+                top_frame  = start_idx + top_off
+                max_height = float(seg_safe[top_off]) if np.isfinite(seg_safe[top_off]) else 0.0
+            else:
+                top_frame  = int((start_idx + end_idx) // 2)
+                max_height = 0.0
+            phases = self._extract_rep_phases(start_idx, end_idx, top_frame)
+            reps.append(Repetition(
+                rep_id=len(reps) + 1,
+                start_frame=int(start_idx),
+                end_frame=int(end_idx),
+                phases=phases,
+                squat_depth_normalized=float(max_height),
+                squat_depth_angle=0.0,
+                bottom_frame=int(top_frame),
+                bottom_knee_angle=0.0,
+            ))
+
+        for i in range(n):
+            p = int(phase_ids[i])
+
+            if state == WAIT_CONC:
+                if p == SquatPhase.CONCENTRIC.value:
+                    rep_start = i
+                    state = IN_CONC
+
+            elif state == IN_CONC:
+                if p == SquatPhase.CONCENTRIC.value:
+                    continue
+                if p == SquatPhase.ISOMETRIC.value:
+                    state = IN_ISO
+                elif p == SquatPhase.ECCENTRIC.value:
+                    state = IN_ECC
+                elif p == SquatPhase.IDLE.value:
+                    rep_start = None
+                    state = WAIT_CONC
+
+            elif state == IN_ISO:
+                if p == SquatPhase.ISOMETRIC.value:
+                    continue
+                if p == SquatPhase.ECCENTRIC.value:
+                    state = IN_ECC
+                elif p == SquatPhase.CONCENTRIC.value:
+                    state = IN_CONC
+                elif p == SquatPhase.IDLE.value:
+                    rep_start = None
+                    state = WAIT_CONC
+
+            elif state == IN_ECC:
+                if p == SquatPhase.ECCENTRIC.value:
+                    continue
+                if p == SquatPhase.IDLE.value:
+                    finalize_rep(rep_start, i - 1)
+                    rep_start = None
+                    state = WAIT_CONC
+                elif p == SquatPhase.CONCENTRIC.value:
+                    # next rep starts immediately
+                    finalize_rep(rep_start, i - 1)
+                    rep_start = i
+                    state = IN_CONC
+
+        if state == IN_ECC and rep_start is not None:
+            finalize_rep(rep_start, n - 1)
+
+        return reps
+
+    def _detect_repetitions_phase_only_squat(self) -> List[Repetition]:
         """
         Simple rep counting from phase sequence ONLY.
 
@@ -1304,15 +1910,15 @@ class TemporalSegmenter:
         return phases
 
 
-def process_video(json_path: str) -> Tuple[str, str, Optional[dict], Optional[str]]:
-    """Process a single video's keypoints. Returns (video_id, status, result, quality)"""
+def process_video(json_path: str, exercise: str = "squat") -> Tuple[str, str, Optional[dict], Optional[str]]:
+    """Process a single video's keypoints with exercise-specific segmentation. Returns (video_id, status, result, quality)"""
     video_id = os.path.splitext(os.path.basename(json_path))[0]
     
     try:
         with open(json_path, 'r') as f:
             data = json.load(f)
         
-        segmenter = TemporalSegmenter(data, video_id)
+        segmenter = TemporalSegmenter(data, video_id, exercise=exercise)
         result = segmenter.segment()
         
         quality = result.get("info", {}).get("quality_rating", "unknown").lower()
@@ -1327,10 +1933,10 @@ def process_video(json_path: str) -> Tuple[str, str, Optional[dict], Optional[st
         return video_id, "Error", None, None
 
 
-def create_segmentation_visualization(video_id: str, seg_data: dict, quality: str) -> bool:
+def create_segmentation_visualization(video_id: str, seg_data: dict, quality: str, video_dir: Optional[str] = None) -> bool:
     """Create annotated video with phase overlay, rep markers, and signal graphs"""
     
-    video_path = find_video_file(video_id, quality)
+    video_path = find_video_file(video_id, quality, CURRENT_EXERCISE, video_dir=video_dir)
     output_dir = VISUALIZATION_DIRS.get(quality.lower(), VISUALIZATION_DIR_EXCELLENT)
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, f"{video_id}_phases.mp4")
@@ -1470,7 +2076,7 @@ def create_segmentation_visualization(video_id: str, seg_data: dict, quality: st
         return False
 
 
-def run_segmentation(quality_filter=None, create_visualization=True):
+def run_segmentation(quality_filter=None, create_visualization=True, exercise="squat", video_dir=None):
     """
     Process all extracted features and segment into reps using biomechanical analysis.
     
@@ -1529,6 +2135,8 @@ def run_segmentation(quality_filter=None, create_visualization=True):
     if create_visualization:
         print(f"📹 Creating phase visualizations...")
     print(f"📁 Quality filters: {quality_filter if quality_filter else 'all'}")
+    if video_dir:
+        print(f"📁 Custom video directory: {video_dir}")
     print(f"\n📊 Analysis Parameters:")
     print(f"   • Window size: {ANALYSIS_WINDOW_SIZE} frames")
     print(f"   • Min phase duration: {MIN_PHASE_DURATION_FRAMES} frames")
@@ -1554,7 +2162,7 @@ def run_segmentation(quality_filter=None, create_visualization=True):
         video_id = os.path.splitext(os.path.basename(json_path))[0]
         print(f"\n▶ [{idx}/{len(json_files)}] Segmenting {video_id}...", flush=True)
 
-        video_id, status, result, quality = process_video(json_path)
+        video_id, status, result, quality = process_video(json_path, exercise=exercise)
         source_quality = quality_mapping.get(json_path, quality)
         
         if status == "Success" and result and "error" not in result:
@@ -1592,9 +2200,15 @@ def run_segmentation(quality_filter=None, create_visualization=True):
                 json.dump(result, f, indent=2)
             print(f"   ✓ Saved segmentation JSON: {output_path}", flush=True)
             
+            # Save debug log if present
+            if _debug_enabled() and "debug_log" in result:
+                debug_log = result["debug_log"]
+                _save_phase_debug_log(video_id, exercise, quality_to_use, debug_log)
+                print(f"   ✓ Saved debug log: {exercise}/debug_phases/{quality_to_use}/{video_id}_phases.json", flush=True)
+            
             # Create visualization
             if create_visualization:
-                if create_segmentation_visualization(video_id, result, quality_to_use):
+                if create_segmentation_visualization(video_id, result, quality_to_use, video_dir=video_dir):
                     stats["visualized"] += 1
                     print(f"   ✓ Visualization created for {video_id}", flush=True)
                 else:
@@ -1659,11 +2273,28 @@ def run_segmentation(quality_filter=None, create_visualization=True):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Segment squat videos into repetitions.")
+    parser = argparse.ArgumentParser(description="Segment videos into repetitions with biomechanical analysis.")
     parser.add_argument("--no-viz", action="store_true", help="Disable video visualization")
     parser.add_argument("--quality", choices=["excellent", "good", "fair", "raw_unfiltered"], help="Filter by quality")
     parser.add_argument("--video-id", help="Process only one video id (e.g., 25709_1)")
+    parser.add_argument("--exercise", default="squat", help="Exercise type (default: squat)")
+    parser.add_argument("--video-dir", help="Path to custom video directory (searches recursively)")
+    parser.add_argument("--debug-phases", action="store_true", help="Enable phase detection debug output (outputs to {exercise}/debug_phases/)")
     args = parser.parse_args()
+    
+    # Enable debug mode if requested
+    if args.debug_phases:
+        os.environ["DEBUG_PHASES"] = "1"
+        print("ℹ️  Debug mode enabled: Phase detection logs will be saved")
+
+    # Update paths based on exercise
+    paths = _build_temporal_paths(args.exercise)
+    FEATURES_DIRS = paths["features_dirs"]
+    OUTPUT_DIRS = paths["output_dirs"]
+    VISUALIZATION_DIRS = paths["visualization_dirs"]
+    VIDEO_DIR = paths["video_dir"]
+    VIZ_POSES_DIR = paths["viz_poses_dir"]
+    CURRENT_EXERCISE = args.exercise
 
     # Priority: CLI flag > Env var > Default True
     create_viz = not args.no_viz
@@ -1674,4 +2305,4 @@ if __name__ == "__main__":
         VIDEO_IDS_TO_PROCESS[:] = [args.video_id]
         print(f"ℹ️  Video filter enabled: {args.video_id}")
 
-    run_segmentation(quality_filter=args.quality, create_visualization=create_viz)
+    run_segmentation(quality_filter=args.quality, create_visualization=create_viz, exercise=args.exercise, video_dir=args.video_dir)

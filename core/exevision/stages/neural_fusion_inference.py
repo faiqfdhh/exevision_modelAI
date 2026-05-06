@@ -293,6 +293,7 @@ def process_video(
     quality_tier: str,
     models: Dict[str, torch.nn.Module],
     device: torch.device,
+    exercise: str = "squat",
 ) -> Optional[Dict[str, Any]]:
     """
     Process one video: read segmented reps, infer all, return output dict.
@@ -300,14 +301,14 @@ def process_video(
     Returns dict with "video_id", "quality", "reps", or None on critical failure.
     """
     # Discover feature and segmentation JSONs
-    feature_json_path = workspace_root / "squat" / "extracted_features_clean" / quality_tier / f"{video_id}.json"
-    seg_json_path = workspace_root / "squat" / "segmented_reps" / quality_tier / f"{video_id}_segmented.json"
+    feature_json_path = workspace_root / exercise / "extracted_features_clean" / quality_tier / f"{video_id}.json"
+    seg_json_path = workspace_root / exercise / "segmented_reps" / quality_tier / f"{video_id}_segmented.json"
 
     if not feature_json_path.exists():
         logger.warning(f"Missing feature JSON for {video_id}: {feature_json_path}")
         return None
     if not seg_json_path.exists():
-        seg_root = workspace_root / "squat" / "segmented_reps"
+        seg_root = workspace_root / exercise / "segmented_reps"
         fallback = sorted(seg_root.rglob(f"{video_id}_segmented.json")) if seg_root.exists() else []
         if fallback:
             seg_json_path = fallback[0]
@@ -340,7 +341,7 @@ def process_video(
     # Search the ENTIRE aqa_analysis_simple/ tree, not just {quality_tier}/.
     # Stage 8 writes to aqa_analysis_simple/{source_quality}/{score_tier}/ where
     # source_quality can differ from quality_tier (e.g., "unknown" vs "raw_unfiltered").
-    aqa_base = workspace_root / "squat" / "aqa_analysis_simple"
+    aqa_base = workspace_root / exercise / "aqa_analysis_simple"
     aqa_by_rep_id: dict = {}
     if aqa_base.exists():
         aqa_matches = sorted(aqa_base.rglob(f"{video_id}_aqa_simple.json"))
@@ -414,7 +415,7 @@ def process_video(
     }
 
 
-def discover_videos(workspace_root: Path, quality_tier_filter: Optional[str] = None) -> List[tuple[str, str]]:
+def discover_videos(workspace_root: Path, quality_tier_filter: Optional[str] = None, exercise: str = "squat") -> List[tuple[str, str]]:
     """
     Discover all processed videos across quality tiers.
     
@@ -424,7 +425,7 @@ def discover_videos(workspace_root: Path, quality_tier_filter: Optional[str] = N
     Returns list of (video_id, quality_tier) tuples.
     """
     videos = []
-    features_dir = workspace_root / "squat" / "extracted_features_clean"
+    features_dir = workspace_root / exercise / "extracted_features_clean"
     if not features_dir.exists():
         return videos
 
@@ -451,9 +452,10 @@ def discover_videos(workspace_root: Path, quality_tier_filter: Optional[str] = N
 def save_outputs(
     video_results: Dict[str, Dict[str, Any]],
     workspace_root: Path,
+    exercise: str = "squat",
 ) -> None:
     """Save per-video neural outputs and aggregate scoreboard."""
-    neural_dir = workspace_root / "squat" / "neural_analysis"
+    neural_dir = workspace_root / exercise / "neural_analysis"
     neural_dir.mkdir(parents=True, exist_ok=True)
 
     scoreboard = {
@@ -527,25 +529,28 @@ def parse_args() -> argparse.Namespace:
              "When omitted, all tiers are processed.",
     )
     parser.add_argument("--cpu", action="store_true", help="Force CPU inference")
+    parser.add_argument("--exercise", default="squat", help="Exercise type (default: squat)")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     workspace_root = Path(args.workspace_root).resolve()
+    exercise = args.exercise
     device = get_device(force_cpu=args.cpu)
 
     logger.info("=== Neural Fusion Inference ===")
     logger.info(f"Workspace: {workspace_root}")
+    logger.info(f"Exercise: {exercise}")
     logger.info(f"Device: {device}")
 
     # Check workspace structure
-    if not (workspace_root / "squat" / "extracted_features_clean").exists():
-        logger.error("Missing extracted_features_clean in workspace")
+    if not (workspace_root / exercise / "extracted_features_clean").exists():
+        logger.error(f"Missing extracted_features_clean in {exercise} workspace")
         return 1
 
     # Discover videos
-    videos = discover_videos(workspace_root, quality_tier_filter=args.quality_tier)
+    videos = discover_videos(workspace_root, quality_tier_filter=args.quality_tier, exercise=exercise)
     if args.video_id:
         videos = [(video_id, q) for video_id, q in videos if video_id == args.video_id]
         logger.info(f"Video filter enabled: {args.video_id}")
@@ -600,7 +605,7 @@ def main() -> int:
 
     for video_id, quality_tier in videos:
         try:
-            result = process_video(video_id, workspace_root, quality_tier, models, device)
+            result = process_video(video_id, workspace_root, quality_tier, models, device, exercise=exercise)
             if result is not None:
                 video_results[video_id] = result
                 successful += 1
@@ -616,7 +621,7 @@ def main() -> int:
 
     # Save outputs
     if video_results:
-        save_outputs(video_results, workspace_root)
+        save_outputs(video_results, workspace_root, exercise=exercise)
 
     return 0 if successful > 0 else 1
 

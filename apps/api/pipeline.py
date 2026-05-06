@@ -31,11 +31,54 @@ STAGES_DIR = WORKSPACE_ROOT / "core" / "exevision" / "stages"
 RUNS_ROOT = WORKSPACE_ROOT / "pipeline_ui_runs"
 SHARED_MODEL_PATH = WORKSPACE_ROOT / "models" / "pose_landmarker_heavy.task"
 SHARED_FACE_MODEL_PATH = WORKSPACE_ROOT / "models" / "blaze_face_short_range.tflite"
-BILSTM_CKPT = WORKSPACE_ROOT / "models" / "bilstm_finetuned.pt"
-STGCN_CKPT = WORKSPACE_ROOT / "models" / "stgcn_finetuned.pt"
-FUSION_CKPT = WORKSPACE_ROOT / "models" / "fusion_layer.pt"
+
+
+def _get_model_path(model_name: str, exercise: str) -> Path:
+    """Construct exercise-specific model path, with fallback to generic names for compatibility."""
+    # First try exercise-specific: bilstm_squat.pt
+    specific = WORKSPACE_ROOT / "models" / f"{model_name}_{exercise}.pt"
+    if specific.exists():
+        return specific
+    # Fallback to generic: bilstm_finetuned.pt (for now, during transition)
+    if model_name in ["bilstm", "stgcn", "fusion"]:
+        return WORKSPACE_ROOT / "models" / f"{model_name}_finetuned.pt"
+    return WORKSPACE_ROOT / "models" / f"{model_name}.pt"
 FEEDBACK_EXERCISE_CONFIG = WORKSPACE_ROOT / "core" / "exevision" / "config" / "exercises" / "squat.json"
 FEEDBACK_TEMPLATES_CONFIG = WORKSPACE_ROOT / "core" / "exevision" / "config" / "templates" / "feedback_templates.json"
+EXERCISES_CONFIG_DIR = WORKSPACE_ROOT / "core" / "exevision" / "config" / "exercises"
+
+
+def _resolve_exercise_config(exercise: str) -> Path:
+    """Resolve the exercise config JSON path, raising if not found."""
+    path = EXERCISES_CONFIG_DIR / f"{exercise}.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Exercise config not found: {path}")
+    return path
+
+
+def _get_field_mapping(exercise: str) -> dict[str, str]:
+    """Load field mapping from exercise config, with defaults for backward compatibility."""
+    import json
+    
+    # Default mapping for squat (for backward compatibility)
+    default_mapping = {
+        "squat_depth": "hip_depth",
+        "forward_lean_deg": "forward_lean",
+        "knee_valgus_ratio": "knee_valgus",
+        "knee_tracking_ratio": "knee_tracking",
+    }
+    
+    try:
+        config_path = _resolve_exercise_config(exercise)
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        field_mapping = config.get("field_mapping", {}).get("metrics_to_feedback", {})
+        if field_mapping:
+            return field_mapping
+    except Exception as e:
+        logger.debug(f"Could not load field_mapping from {exercise} config: {e}")
+    
+    # Return default only for squat, empty dict otherwise
+    return default_mapping if exercise == "squat" else {}
 
 
 # ── Stage definitions ──────────────────────────────────────────────────────────
@@ -46,33 +89,39 @@ class StageSpec:
     output_dirs: tuple[str, ...] = field(default_factory=tuple)
 
 
-STAGE_SPECS: dict[str, StageSpec] = {
-    "extract_selected_features": StageSpec(
-        key="extract_selected_features",
-        script=STAGES_DIR / "extract_selected_features.py",
-        output_dirs=("squat/extracted_features_clean", "squat/visualized_poses_clean", "squat/analysis_reports"),
-    ),
-    "classify_views": StageSpec(
-        key="classify_views",
-        script=STAGES_DIR / "classify_views.py",
-        output_dirs=("squat/extracted_features_clean",),
-    ),
-    "temporal_segmentation": StageSpec(
-        key="temporal_segmentation",
-        script=STAGES_DIR / "temporal_segmentation.py",
-        output_dirs=("squat/segmented_reps", "squat/visualized_segmentation"),
-    ),
-    "scoring": StageSpec(
-        key="scoring",
-        script=STAGES_DIR / "scoring.py",
-        output_dirs=("squat/aqa_analysis_simple",),
-    ),
-    "neural_fusion": StageSpec(
-        key="neural_fusion",
-        script=STAGES_DIR / "neural_fusion_inference.py",
-        output_dirs=("squat/neural_analysis",),
-    ),
-}
+def _build_stage_specs(exercise: str = "squat") -> dict[str, StageSpec]:
+    """Build stage specs with exercise-specific paths."""
+    return {
+        "extract_selected_features": StageSpec(
+            key="extract_selected_features",
+            script=STAGES_DIR / "extract_selected_features.py",
+            output_dirs=(f"{exercise}/extracted_features_clean", f"{exercise}/visualized_poses_clean", f"{exercise}/analysis_reports"),
+        ),
+        "classify_views": StageSpec(
+            key="classify_views",
+            script=STAGES_DIR / "classify_views.py",
+            output_dirs=(f"{exercise}/extracted_features_clean",),
+        ),
+        "temporal_segmentation": StageSpec(
+            key="temporal_segmentation",
+            script=STAGES_DIR / "temporal_segmentation.py",
+            output_dirs=(f"{exercise}/segmented_reps", f"{exercise}/visualized_segmentation"),
+        ),
+        "scoring": StageSpec(
+            key="scoring",
+            script=STAGES_DIR / "scoring.py",
+            output_dirs=(f"{exercise}/aqa_analysis_simple",),
+        ),
+        "neural_fusion": StageSpec(
+            key="neural_fusion",
+            script=STAGES_DIR / "neural_fusion_inference.py",
+            output_dirs=(f"{exercise}/neural_analysis",),
+        ),
+    }
+
+
+# Default to squat for backward compatibility
+STAGE_SPECS = _build_stage_specs("squat")
 
 DEFAULT_STAGES = [
     "extract_selected_features",
@@ -84,44 +133,48 @@ DEFAULT_STAGES = [
 
 
 # ── Workspace helpers ──────────────────────────────────────────────────────────
-def _prepare_workspace(workspace_root: Path, video_path: Path) -> None:
+def _prepare_workspace(workspace_root: Path, video_path: Path, exercise: str = "squat") -> None:
     """Create workspace directory tree and copy the input video into it."""
-    videos_dir = workspace_root / "squat" / "dataset_videos_all"
+    videos_dir = workspace_root / exercise / "dataset_videos_all"
     videos_dir.mkdir(parents=True, exist_ok=True)
-    (workspace_root / "squat" / "aqa_analysis_simple").mkdir(parents=True, exist_ok=True)
+    (workspace_root / exercise / "aqa_analysis_simple").mkdir(parents=True, exist_ok=True)
     dest = videos_dir / video_path.name
     shutil.copy2(video_path, dest)
 
 
-def _build_stage_cmd(key: str, script: Path, video_id: str, mode: str, generate_viz: bool = True) -> list[str]:
+def _build_stage_cmd(key: str, script: Path, video_id: str, mode: str, generate_viz: bool = True, exercise: str = "squat") -> list[str]:
     """Build the subprocess command for a stage, mirroring app.py arg construction.
 
     API runs skip all visualization outputs (--no-report) by default.
     Visualized outputs (--no-viz) are generated only if generate_viz is True.
     """
     base = [sys.executable, str(script)]
+    exercise_args = ["--exercise", exercise]
     if key == "extract_selected_features":
-        cmd = base + [mode, "--video-id", video_id, "--no-report"]
+        cmd = base + [mode, "--video-id", video_id, "--no-report"] + exercise_args
         if not generate_viz:
             cmd.append("--no-viz")
         return cmd
     elif key == "temporal_segmentation":
-        cmd = base + ["--video-id", video_id]
+        cmd = base + ["--video-id", video_id] + exercise_args
         if not generate_viz:
             cmd.append("--no-viz")
         return cmd
     elif key == "classify_views":
-        return base + ["--video-id", video_id]
+        return base + ["--video-id", video_id] + exercise_args
     elif key == "scoring":
-        return base + [video_id]
+        return base + [video_id] + exercise_args
     elif key == "neural_fusion":
+        bilstm_path = _get_model_path("bilstm", exercise)
+        stgcn_path = _get_model_path("stgcn", exercise)
+        fusion_path = _get_model_path("fusion", exercise)
         return base + [
             "--video-id", video_id,
-            "--bilstm-ckpt", str(BILSTM_CKPT),
-            "--stgcn-ckpt", str(STGCN_CKPT),
-            "--fusion-ckpt", str(FUSION_CKPT),
+            "--bilstm-ckpt", str(bilstm_path),
+            "--stgcn-ckpt", str(stgcn_path),
+            "--fusion-ckpt", str(fusion_path),
             "--quality-tier", "raw_unfiltered",
-        ]
+        ] + exercise_args
     return base
 
 
@@ -133,9 +186,10 @@ def _run_stage(
     logs_root: Path,
     mode: str,
     generate_viz: bool = True,
+    exercise: str = "squat",
 ) -> str:
     """Run one pipeline stage; returns captured stdout+stderr."""
-    cmd = _build_stage_cmd(key, script, video_id, mode, generate_viz)
+    cmd = _build_stage_cmd(key, script, video_id, mode, generate_viz, exercise)
     env = os.environ.copy()
     env["EXEVISION_MODEL_PATH"] = str(SHARED_MODEL_PATH)
     env["EXEVISION_FACE_MODEL_PATH"] = str(SHARED_FACE_MODEL_PATH)
@@ -162,14 +216,14 @@ def _run_stage(
     return combined
 
 
-def _validate_stage_output(key: str, workspace_root: Path, video_id: str) -> None:
+def _validate_stage_output(key: str, workspace_root: Path, video_id: str, exercise: str = "squat") -> None:
     """Ensure each stage produced the expected artifact for the requested video."""
     expected_patterns = {
-        "extract_selected_features": f"squat/extracted_features_clean/**/{video_id}.json",
-        "classify_views": f"squat/extracted_features_clean/**/{video_id}.json",
-        "temporal_segmentation": f"squat/segmented_reps/**/{video_id}_segmented.json",
-        "scoring": f"squat/aqa_analysis_simple/**/{video_id}_aqa_simple.json",
-        "neural_fusion": f"squat/neural_analysis/**/{video_id}_neural.json",
+        "extract_selected_features": f"{exercise}/extracted_features_clean/**/{video_id}.json",
+        "classify_views": f"{exercise}/extracted_features_clean/**/{video_id}.json",
+        "temporal_segmentation": f"{exercise}/segmented_reps/**/{video_id}_segmented.json",
+        "scoring": f"{exercise}/aqa_analysis_simple/**/{video_id}_aqa_simple.json",
+        "neural_fusion": f"{exercise}/neural_analysis/**/{video_id}_neural.json",
     }
 
     pattern = expected_patterns.get(key)
@@ -185,14 +239,15 @@ def _validate_stage_output(key: str, workspace_root: Path, video_id: str) -> Non
 
 
 # ── Workspace cleanup helpers ──────────────────────────────────────────────────
-def _delete_input_video(workspace_root: Path, filename: str) -> None:
+
+def _delete_input_video(workspace_root: Path, filename: str, exercise: str = "squat") -> None:
     """Remove the input video copy from the workspace after extraction."""
-    video_copy = workspace_root / "squat" / "dataset_videos_all" / filename
+    video_copy = workspace_root / exercise / "dataset_videos_all" / filename
     if video_copy.exists():
         video_copy.unlink()
 
 
-def _cleanup_workspace(workspace_root: Path, generate_viz: bool = True) -> None:
+def _cleanup_workspace(workspace_root: Path, generate_viz: bool = True, exercise: str = "squat") -> None:
     """
     Remove heavy intermediate artifacts from the workspace after results are collected.
 
@@ -200,32 +255,33 @@ def _cleanup_workspace(workspace_root: Path, generate_viz: bool = True) -> None:
         workspace_root: Root directory of the workspace
         generate_viz: If True, visualization directories are KEPT (served to frontend).
                       If False, they are removed as they are unneeded.
+        exercise: Exercise type; used to construct path prefixes.
 
     What is removed:
-    - squat/visualized_segmentation/  (phase overlay MP4s — only removed if generate_viz=False)
-    - squat/analysis_reports/         (PNG plots — only useful in desktop UI)
-    - squat/extracted_features_clean/ (large landmark JSONs — no longer needed after scoring)
-    - squat/segmented_reps/           (intermediate rep JSON — no longer needed)
+    - {exercise}/visualized_segmentation/  (phase overlay MP4s — only removed if generate_viz=False)
+    - {exercise}/analysis_reports/         (PNG plots — only useful in desktop UI)
+    - {exercise}/extracted_features_clean/ (large landmark JSONs — no longer needed after scoring)
+    - {exercise}/segmented_reps/           (intermediate rep JSON — no longer needed)
 
     What is kept (in run_root/logs/):
     - Per-stage log files (~21 KB) — useful for debugging failures
 
-    What is kept (in run_root/workspace/squat/):
+    What is kept (in run_root/workspace/{exercise}/):
     - aqa_analysis_simple/  (AQA JSON — source of truth for re-collecting results)
     - neural_analysis/      (neural JSON — same)
     - visualized_poses_clean/    (annotated pose MP4s — kept if generate_viz=True)
     - visualized_segmentation/   (phase overlay MP4s — kept if generate_viz=True)
     """
     subdirs_to_remove = [
-        "squat/analysis_reports",
-        "squat/extracted_features_clean",
-        "squat/segmented_reps",
+        f"{exercise}/analysis_reports",
+        f"{exercise}/extracted_features_clean",
+        f"{exercise}/segmented_reps",
     ]
     # Only remove visualization directories if visualization was not requested
     if not generate_viz:
         subdirs_to_remove.extend([
-            "squat/visualized_segmentation",
-            "squat/visualized_poses_clean",
+            f"{exercise}/visualized_segmentation",
+            f"{exercise}/visualized_poses_clean",
         ])
     
     for rel in subdirs_to_remove:
@@ -464,7 +520,7 @@ def coerce_old_feedback_format(old_feedback: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _build_feedback_fallback(merged_reps: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_feedback_fallback(merged_reps: list[dict[str, Any]], exercise: str = "squat") -> dict[str, Any]:
     """Create a schema-compatible fallback when template/config files are unavailable."""
     rep_payload: list[dict[str, Any]] = []
     rep_scores: list[float] = []
@@ -488,7 +544,7 @@ def _build_feedback_fallback(merged_reps: list[dict[str, Any]]) -> dict[str, Any
     avg_score = round(sum(rep_scores) / len(rep_scores), 2) if rep_scores else 0.0
     return {
         "schema_version": "2.0",
-        "exercise": "squat",
+        "exercise": exercise,
         "reps": rep_payload,
         "session": {
             "avg_score": avg_score,
@@ -561,18 +617,18 @@ def _upload_visualization_to_supabase(
         return None
 
 
-def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
+def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat") -> dict[str, Any]:
     """
     Locate Stage 8 (heuristic), Stage 9 (neural), and Stage 5 (segmentation) output
     JSONs and merge them into a single normalized result dict for the web app.
     """
     import json
 
-    print(f"[DIAGNOSTIC] collect_results START: video_id={video_id}, workspace={workspace_root}", flush=True)
+    print(f"[DIAGNOSTIC] collect_results START: video_id={video_id}, workspace={workspace_root}, exercise={exercise}", flush=True)
 
-    aqa_base = workspace_root / "squat" / "aqa_analysis_simple"
-    neural_base = workspace_root / "squat" / "neural_analysis"
-    seg_base = workspace_root / "squat" / "segmented_reps"
+    aqa_base = workspace_root / exercise / "aqa_analysis_simple"
+    neural_base = workspace_root / exercise / "neural_analysis"
+    seg_base = workspace_root / exercise / "segmented_reps"
 
     aqa_file = _find_json(aqa_base, f"{video_id}_aqa_simple.json")
     neural_file = _find_json(neural_base, f"{video_id}_neural.json")
@@ -699,11 +755,11 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
     feedback_payload = None
     
     # === Diagnostic logging (forcing output for GCR visibility) ===
-    exercise_config_exists = FEEDBACK_EXERCISE_CONFIG.exists()
+    exercise_config_exists = _resolve_exercise_config(exercise).exists() if EXERCISES_CONFIG_DIR.exists() else False
     templates_config_exists = FEEDBACK_TEMPLATES_CONFIG.exists()
     merged_reps_count = len(merged_reps)
     
-    print(f"[DIAGNOSTIC] Feedback prereqs: exercise_config={exercise_config_exists} ({FEEDBACK_EXERCISE_CONFIG}), templates={templates_config_exists} ({FEEDBACK_TEMPLATES_CONFIG}), merged_reps={merged_reps_count}", flush=True)
+    print(f"[DIAGNOSTIC] Feedback prereqs: exercise_config={exercise_config_exists} ({_resolve_exercise_config(exercise) if EXERCISES_CONFIG_DIR.exists() else 'N/A'}), templates={templates_config_exists} ({FEEDBACK_TEMPLATES_CONFIG}), merged_reps={merged_reps_count}", flush=True)
     logger.info(
         "[pipeline] Feedback config check — exercise_config exists: %s, templates exists: %s, merged_reps: %d",
         exercise_config_exists,
@@ -714,24 +770,34 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
     if exercise_config_exists and templates_config_exists and merged_reps:
         print(f"[DIAGNOSTIC] All prereqs met. Initializing FeedbackEngine...", flush=True)
         try:
-            print(f"[DIAGNOSTIC] Loading exercise config from: {FEEDBACK_EXERCISE_CONFIG}", flush=True)
+            exercise_config_path = _resolve_exercise_config(exercise)
+            print(f"[DIAGNOSTIC] Loading exercise config from: {exercise_config_path}", flush=True)
             print(f"[DIAGNOSTIC] Loading templates from: {FEEDBACK_TEMPLATES_CONFIG}", flush=True)
             feedback_engine = FeedbackEngine(
-                exercise_config_path=str(FEEDBACK_EXERCISE_CONFIG),
+                exercise_config_path=str(exercise_config_path),
                 templates_path=str(FEEDBACK_TEMPLATES_CONFIG),
             )
             print(f"[DIAGNOSTIC] FeedbackEngine initialized successfully", flush=True)
             feedback_input: list[dict[str, Any]] = []
+            field_mapping = _get_field_mapping(exercise)  # Get exercise-specific field mapping
+            
             for rep in merged_reps:
                 metric_scores = rep.get("metric_scores") or {}
                 sub_scores = rep.get("sub_scores") or {}
                 metrics = rep.get("metrics") or {}
 
+                # Helper function to map field names via the field_mapping
+                def map_metric_name(raw_name: str) -> str | None:
+                    """Apply field_mapping to translate raw metric name to feedback name."""
+                    mapped = field_mapping.get(raw_name)
+                    return mapped if mapped else raw_name
+                
+                # Build normalized_sub_scores using the field_mapping
                 normalized_sub_scores = {
-                    "forward_lean": sub_scores.get("forward_lean") if sub_scores.get("forward_lean") is not None else metric_scores.get("forward_lean"),
-                    "hip_depth": sub_scores.get("depth") if sub_scores.get("depth") is not None else metric_scores.get("depth"),
-                    "knee_tracking": sub_scores.get("knee_tracking") if sub_scores.get("knee_tracking") is not None else metric_scores.get("knee_tracking"),
-                    "knee_valgus": metric_scores.get("knee_valgus"),
+                    "forward_lean": sub_scores.get("forward_lean") if sub_scores.get("forward_lean") is not None else metric_scores.get(map_metric_name("forward_lean_deg")),
+                    "hip_depth": sub_scores.get("depth") if sub_scores.get("depth") is not None else metric_scores.get(map_metric_name("squat_depth")),
+                    "knee_tracking": sub_scores.get("knee_tracking") if sub_scores.get("knee_tracking") is not None else metric_scores.get(map_metric_name("knee_tracking_ratio")),
+                    "knee_valgus": metric_scores.get(map_metric_name("knee_valgus_ratio")),
                     "smoothness": sub_scores.get("smoothness"),
                     "control": sub_scores.get("control"),
                 }
@@ -804,7 +870,7 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
             exercise_config_exists,
             templates_config_exists,
         )
-        feedback_payload = _build_feedback_fallback(merged_reps)
+        feedback_payload = _build_feedback_fallback(merged_reps, exercise)
         print(
             f"[DIAGNOSTIC] Fallback feedback generated: {len(feedback_payload.get('reps', []))} reps "
             f"(exercise_config={exercise_config_exists}, templates_config={templates_config_exists})",
@@ -822,15 +888,15 @@ def collect_results(workspace_root: Path, video_id: str) -> dict[str, Any]:
     base_url = os.environ.get("API_PUBLIC_URL", "http://localhost:8000").rstrip("/")
     job_id = workspace_root.parent.name
 
-    logger.info(f"collect_results: workspace_root={workspace_root}, video_id={video_id}")
+    logger.info(f"collect_results: workspace_root={workspace_root}, video_id={video_id}, exercise={exercise}")
     logger.info(f"workspace_root exists: {workspace_root.exists()}")
     logger.info(f"workspace_root type: {type(workspace_root)}")
 
     # Check if these directories exist
-    dataset_dir = workspace_root / "squat" / "dataset_videos_all"
+    dataset_dir = workspace_root / exercise / "dataset_videos_all"
     logger.info(f"dataset_dir={dataset_dir}, exists={dataset_dir.exists()}")
 
-    viz_dir = workspace_root / "squat" / "visualized_poses_clean"
+    viz_dir = workspace_root / exercise / "visualized_poses_clean"
     logger.info(f"viz_dir={viz_dir}, exists={viz_dir.exists()}")
 
     # Safe lookups
@@ -921,13 +987,14 @@ def run_pipeline_sync(
     stages: list[str] | None = None,
     mode: str = "filtered",
     generate_viz: bool = True,
+    exercise: str = "squat",
 ) -> dict[str, Any]:
     """
     Run the full pipeline synchronously for a single video.
     Called from a background thread/process by the API server.
     Returns the merged result dict.
     """
-    print(f"[DIAGNOSTIC] run_pipeline_sync START: job_id={job_id}, video={video_path.name}, stages={stages or 'default'}, mode={mode}", flush=True)
+    print(f"[DIAGNOSTIC] run_pipeline_sync START: job_id={job_id}, video={video_path.name}, stages={stages or 'default'}, mode={mode}, exercise={exercise}", flush=True)
     stages = stages or DEFAULT_STAGES
     run_root = RUNS_ROOT / job_id
     workspace_root = run_root / "workspace"
@@ -936,11 +1003,14 @@ def run_pipeline_sync(
     workspace_root.mkdir(parents=True, exist_ok=True)
     logs_root.mkdir(parents=True, exist_ok=True)
 
-    _prepare_workspace(workspace_root, video_path)
+    _prepare_workspace(workspace_root, video_path, exercise)
     video_id = video_path.stem
+    
+    # Build exercise-specific stage specs
+    stage_specs = _build_stage_specs(exercise)
 
     for key in stages:
-        spec = STAGE_SPECS.get(key)
+        spec = stage_specs.get(key)
         if spec is None:
             raise ValueError(f"Unknown stage: '{key}'")
         if not spec.script.exists():
@@ -950,21 +1020,21 @@ def run_pipeline_sync(
         if key == "extract_selected_features":
             # Run filtered first — may produce no output for Poor quality videos (not a fatal error)
             try:
-                _run_stage(key, spec.script, video_id, workspace_root, logs_root, "filtered", generate_viz)
+                _run_stage(key, spec.script, video_id, workspace_root, logs_root, "filtered", generate_viz, exercise)
                 logger.info("Stage extract_selected_features (filtered) completed.")
             except RuntimeError as e:
                 logger.warning(f"Filtered extraction failed (likely Poor quality): {e}")
             # Run unfiltered unconditionally — always produces output
-            _run_stage(key, spec.script, video_id, workspace_root, logs_root, "unfiltered", generate_viz)
+            _run_stage(key, spec.script, video_id, workspace_root, logs_root, "unfiltered", generate_viz, exercise)
             logger.info("Stage extract_selected_features (unfiltered) completed.")
             # Validate that at least one of the two produced the expected artifact
-            _validate_stage_output(key, workspace_root, video_id)
+            _validate_stage_output(key, workspace_root, video_id, exercise)
         else:
             # Neural fusion is optional: if it fails, we still return feedback based on heuristic scores.
             # All other stages are mandatory: failure propagates.
             try:
-                _run_stage(key, spec.script, video_id, workspace_root, logs_root, mode, generate_viz)
-                _validate_stage_output(key, workspace_root, video_id)
+                _run_stage(key, spec.script, video_id, workspace_root, logs_root, mode, generate_viz, exercise)
+                _validate_stage_output(key, workspace_root, video_id, exercise)
             except RuntimeError as exc:
                 if key == "neural_fusion":
                     # Neural fusion failure is non-fatal. Log and continue.
@@ -977,9 +1047,9 @@ def run_pipeline_sync(
         # needed (stage 2.5 has already produced the feature JSON) and accounts for
         # ~15% of workspace disk usage.
         # if key == "extract_selected_features":
-        #     _delete_input_video(workspace_root, video_path.name)
+        #     _delete_input_video(workspace_root, video_path.name, exercise)
 
-    result = collect_results(workspace_root, video_id)
+    result = collect_results(workspace_root, video_id, exercise)
 
     # Note: if neural_fusion was requested but failed, result.neural_available will be False
     # and all reps will have neural_score=None. This is NOT an error condition — feedback
@@ -994,7 +1064,7 @@ def run_pipeline_sync(
     # intermediate files that are not needed after this point.
     # Logs are retained for debugging; only the heavy intermediate files are removed.
     # Visualization directories are retained if generate_viz=True so frontend can serve them.
-    _cleanup_workspace(workspace_root, generate_viz=generate_viz)
+    _cleanup_workspace(workspace_root, generate_viz=generate_viz, exercise=exercise)
 
     print(f"[DIAGNOSTIC] run_pipeline_sync END: job_id={job_id}, rep_count={result['rep_count']}, has_feedback={result['feedback'] is not None}, neural_available={result['neural_available']}", flush=True)
     return result

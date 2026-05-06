@@ -116,7 +116,14 @@ def _extract_rep_matrix(seg_data: dict, rep: dict) -> Optional[np.ndarray]:
     if min_len <= 0:
         return None
     stacked = np.stack([array[:min_len] for array in sliced], axis=-1).astype(np.float32, copy=False)
-    return np.nan_to_num(stacked, nan=0.0, posinf=0.0, neginf=0.0)
+    stacked = np.nan_to_num(stacked, nan=0.0, posinf=0.0, neginf=0.0)
+    # Per-channel z-score normalization: removes unit/scale disparity between channels
+    # (e.g. knee_angles in degrees [88-175] vs hip_displacement in [0-0.05])
+    for ch in range(stacked.shape[-1]):
+        col = stacked[:, ch]
+        std = col.std()
+        stacked[:, ch] = (col - col.mean()) / std if std > 1e-8 else col - col.mean()
+    return stacked
 
 
 def load_bilstm_reps(features_dir, segmented_dir, max_videos=None):

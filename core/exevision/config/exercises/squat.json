@@ -94,5 +94,13 @@
       "bad_threshold": 50,
       "unit": "score"
     }
+  },
+  "field_mapping": {
+    "metrics_to_feedback": {
+      "squat_depth": "hip_depth",
+      "forward_lean_deg": "forward_lean",
+      "knee_valgus_ratio": "knee_valgus",
+      "knee_tracking_ratio": "knee_tracking"
+    }
   }
 }
