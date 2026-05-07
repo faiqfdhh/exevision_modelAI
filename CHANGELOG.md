@@ -3,6 +3,49 @@
 > Older sessions archived here from `CLAUDE.md` Appendix A.
 > Latest sessions are kept inline in `CLAUDE.md` Appendix A for quick reference.
 
+## 2026-05-07 (Continued) — OHP Phase 2 Error Head Learning Problem & Diagnosis
+
+**Status:** Standing/seated OHP fine-tuning in progress with loss weight adjustments. **BLOCKED** on error head learning.
+
+**What was completed:**
+1. **Tasks 11-12 Complete:** Batch stage extraction on 2,716 labeled FitnessAQA videos; annotation JSON generation with soft label derivation.
+2. **Task 13 Partial:** Standing OHP fine-tuning completed (epoch 27, early stop).
+3. **Soft Label Analysis:** Executed diagnostic on FitnessAQA-derived annotation JSONs:
+   - **Elbow error:** 21.8% positive labels (620/2838 reps) → moderate class imbalance
+   - **Knee error:** 16.4% positive labels (465/2838 reps) → severe class imbalance (<20% threshold)
+   - Overall quality: mean 81.7, well-distributed [21.5, 85.0]
+
+**Problem Identified — Error Heads Not Learning:**
+- Standing OHP evaluation (before loss weight fix):
+  - MAE: 4.302 ✅ (passes <15 threshold)
+  - Elbow AUC: 0.046 ❌ (fails >0.65 threshold, worse than random 0.5)
+  - Knee AUC: 0.466 ❌ (fails >0.65 threshold)
+- Seated OHP (previous iteration):
+  - MAE: 3.567 ✅
+  - Elbow AUC: 0.055 ❌ (even worse)
+- **Root cause:** Quality head learns well (MAE excellent) because human_score labels are clean and dense. Error heads fail because:
+  1. **Class imbalance:** 84% of reps have zero knee errors; model learns to predict near-zero → AUC ≈ 0.5
+  2. **Label-quality mismatch:** Soft labels (overlap ratios from FitnessAQA error windows) don't correlate with human_score. Example: rep with human_score=70.9 (good) has knee_error_soft=0.5746 (57% error). Model optimizes for quality and ignores error signal.
+  3. **Loss weight insufficient:** Original _LAMBDA_ELBOW=0.3 too low relative to quality MSE; error BCE treated as optional side task.
+
+**Attempted Fixes & Learnings:**
+1. **First attempt (pos_weight=3.58, 5.10):** Loss scaled to 1.7-3.6 (vs original 0.2). **Result:** Training destabilized, loss too high. **Lesson:** Don't multiply BCE by pos_weight; instead adjust _LAMBDA weights.
+2. **Second attempt (_LAMBDA_ELBOW=2.0, _LAMBDA_KNEE=1.5):** Loss reduced to 1.7-1.6 but still 7× higher than original. **Result:** Still worse than baseline. **Lesson:** Aggressive loss weight rebalancing breaks multi-task balance.
+3. **Current approach (_LAMBDA_ELBOW=0.6, _LAMBDA_KNEE=0.4):** Doubling original weights (more moderate). Currently training; expected to converge near original loss magnitude (~0.2-0.3) while giving error heads moderate priority.
+
+**Data Quality Concern:**
+- FitnessAQA error window labels may be noisy or independent of overall quality
+- Soft label derivation (overlap ratio) assumes error windows map to video frames linearly — unvalidated
+- No way to verify if error labels are correct without manual inspection of source videos
+
+**Next Steps (Pending Restrategization):**
+1. Complete fine-tuning with _LAMBDA_ELBOW=0.6, _LAMBDA_KNEE=0.4 and compare results
+2. If error AUC still <0.65: investigate whether soft labels fundamentally uncorrelated with quality
+3. **Phase 3 consideration:** Might require manual annotation of error presence/absence (hard binary labels) instead of soft overlap ratios
+4. Alternative: Use error labels only as auxiliary task with much higher weight (0.3→2.0) and accept quality MAE increase as trade-off
+
+---
+
 ## 2026-05-07 — OHP Phase 2 Multi-Task Fine-Tuning Setup
 
 **Focus:** Execute Tasks 1-10 of the OHP Phase 2 Multi-Task Fine-Tuning plan to prepare the codebase for multi-task neural training (quality and error prediction) on FitnessAQA data.
