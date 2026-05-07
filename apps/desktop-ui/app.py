@@ -32,7 +32,7 @@ class Stage:
 
 def _build_stages(exercise: str = "squat") -> tuple[Stage, ...]:
     """Build stage definitions with exercise-specific paths."""
-    return (
+    stages: list[Stage] = [
         Stage(
             key="extract_selected_features",
             label="2.5 Extract Selected Features",
@@ -65,21 +65,23 @@ def _build_stages(exercise: str = "squat") -> tuple[Stage, ...]:
             args=("*",),
             output_paths=(f"{exercise}/aqa_analysis_simple",),
         ),
-        Stage(
+    ]
+    if exercise == "squat":
+        stages.append(Stage(
             key="analyze_results",
             label="9 Analyze Results",
             script_path=RUNTIME_ROOT / "squat" / "aqa_analysis_simple" / "analyze_results.py",
             args=(),
             output_paths=(f"{exercise}/aqa_analysis_simple/analysis_visualizations",),
-        ),
-        Stage(
-            key="neural_fusion",
-            label="9 Neural Fusion Scoring",
-            script_path=STAGES_DIR / "neural_fusion_inference.py",
-            args=(),
-            output_paths=(f"{exercise}/neural_analysis",),
-        ),
-    )
+        ))
+    stages.append(Stage(
+        key="neural_fusion",
+        label="9 Neural Fusion Scoring",
+        script_path=STAGES_DIR / "neural_fusion_inference.py",
+        args=(),
+        output_paths=(f"{exercise}/neural_analysis",),
+    ))
+    return tuple(stages)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -91,6 +93,18 @@ STAGES_DIR = WORKSPACE_ROOT / "core" / "exevision" / "stages"
 RUNTIME_ROOT = WORKSPACE_ROOT / "_hidden_legacy"
 RUNS_ROOT = WORKSPACE_ROOT / "pipeline_ui_runs"
 LEGACY_RUNS_ROOT = RUNTIME_ROOT / "pipeline_ui_runs"
+CONFIG_EXERCISES_DIR = WORKSPACE_ROOT / "core" / "exevision" / "config" / "exercises"
+
+
+def _config_file_for_exercise(exercise: str) -> str:
+    """Return config JSON stem for the given exercise.
+    seated_overhead_press shares its config with overhead_press.
+    """
+    if exercise == "seated_overhead_press":
+        return "overhead_press"
+    return exercise
+
+
 SHARED_MODEL_PATH = WORKSPACE_ROOT / "models" / "pose_landmarker_heavy.task"
 SHARED_FACE_MODEL_PATH = WORKSPACE_ROOT / "models" / "blaze_face_short_range.tflite"
 
@@ -219,14 +233,19 @@ class PipelineRunnerUI:
     def _on_exercise_changed(self) -> None:
         """Update STAGES when exercise selection changes."""
         global STAGES
-        STAGES = _build_stages(self.exercise_var.get())
-        self._log(f"Exercise changed to: {self.exercise_var.get()}")
-        # Update custom stage checkboxes
+        exercise = self.exercise_var.get()
+        STAGES = _build_stages(exercise)
+        self._log(f"Exercise changed to: {exercise}")
         for key in self.stage_checks:
             self.stage_checks[key].set(False)
         for stage in STAGES if STAGES else []:
             if stage.key in self.stage_checks:
                 self.stage_checks[stage.key].set(True)
+        # Squat has a known default dataset path; OHP videos are browsed manually
+        if exercise == "squat":
+            self.dataset_var.set(str(RUNTIME_ROOT / "squat" / "dataset_videos_all"))
+        else:
+            self.dataset_var.set("")
 
     def _build_layout(self) -> None:
         # Top bar with window controls
@@ -267,7 +286,7 @@ class PipelineRunnerUI:
         exercise_combo = ttk.Combobox(
             exercise_frame,
             textvariable=self.exercise_var,
-            values=["squat", "overhead_press"],
+            values=["squat", "overhead_press", "seated_overhead_press"],
             state="readonly",
             width=16
         )
@@ -746,13 +765,14 @@ class PipelineRunnerUI:
             raise RuntimeError(f"Shared face model file not found: {SHARED_FACE_MODEL_PATH}")
         self._log(f"Using shared face model: {SHARED_FACE_MODEL_PATH}")
 
-        # Ensure local copy of analyze_results.py exists inside workspace
+        # Ensure local copy of analyze_results.py exists inside workspace (squat only)
         exercise = self.exercise_var.get()
-        analyze_src = RUNTIME_ROOT / "squat" / "aqa_analysis_simple" / "analyze_results.py"
-        analyze_dst = workspace_root / exercise / "aqa_analysis_simple" / "analyze_results.py"
-        analyze_dst.parent.mkdir(parents=True, exist_ok=True)
-        if analyze_src.exists():
-            shutil.copy2(analyze_src, analyze_dst)
+        if exercise == "squat":
+            analyze_src = RUNTIME_ROOT / "squat" / "aqa_analysis_simple" / "analyze_results.py"
+            analyze_dst = workspace_root / exercise / "aqa_analysis_simple" / "analyze_results.py"
+            analyze_dst.parent.mkdir(parents=True, exist_ok=True)
+            if analyze_src.exists():
+                shutil.copy2(analyze_src, analyze_dst)
 
     def _safe_link_or_copy(self, src: Path, dst: Path) -> None:
         try:
@@ -965,9 +985,10 @@ class PipelineRunnerUI:
             f.write(f"outputs_found={copied_any}\n")
 
     def _find_annotated_videos(self, run_root: Path, selected_stem: str | None) -> list[Path]:
+        _ex = self.exercise_var.get()
         search_roots = [
-            run_root / "workspace" / "squat" / "visualized_poses_clean",
-            run_root / "workspace" / "squat" / "visualized_segmentation",
+            run_root / "workspace" / _ex / "visualized_poses_clean",
+            run_root / "workspace" / _ex / "visualized_segmentation",
             run_root / "stage_outputs",
         ]
 
@@ -1008,7 +1029,7 @@ class PipelineRunnerUI:
             return (type_rank, tier_rank)
         values.sort(key=sort_key)
         run_root = Path(RUNS_ROOT) / self.run_name_var.get().strip()
-        dataset_dir = run_root / "workspace" / "squat" / "dataset_videos_all"
+        dataset_dir = run_root / "workspace" / self.exercise_var.get() / "dataset_videos_all"
         all_stems = set()
         if dataset_dir.exists():
             for p in dataset_dir.rglob("*"):
@@ -1040,7 +1061,7 @@ class PipelineRunnerUI:
 
     def _find_score_json(self, run_root: Path, video_id: str) -> Path | None:
         search_roots = [
-            run_root / "workspace" / "squat" / "aqa_analysis_simple",
+            run_root / "workspace" / self.exercise_var.get() / "aqa_analysis_simple",
             run_root / "stage_outputs",
         ]
 
@@ -1054,7 +1075,7 @@ class PipelineRunnerUI:
 
     def _find_analysis_summary_json(self, run_root: Path, video_id: str) -> Path | None:
         search_roots = [
-            run_root / "workspace" / "squat" / "aqa_analysis_simple" / "analysis_visualizations",
+            run_root / "workspace" / self.exercise_var.get() / "aqa_analysis_simple" / "analysis_visualizations",
             run_root / "stage_outputs",
         ]
 
@@ -1069,7 +1090,7 @@ class PipelineRunnerUI:
     def _find_neural_json(self, run_root: Path, video_id: str) -> Path | None:
         """Find neural fusion scoring JSON for a video."""
         search_roots = [
-            run_root / "workspace" / "squat" / "neural_analysis",
+            run_root / "workspace" / self.exercise_var.get() / "neural_analysis",
             run_root / "stage_outputs",
         ]
 
@@ -1099,6 +1120,34 @@ class PipelineRunnerUI:
         self._set_score_display(text)
 
     def _metric_specs(self) -> dict[str, dict[str, str]]:
+        if self.exercise_var.get() in ("overhead_press", "seated_overhead_press"):
+            return {
+                "grip_ratio": {
+                    "label": "Grip width",
+                    "source_key": "grip_ratio",
+                    "unit": "ratio",
+                    "evaluation": "direct",
+                },
+                "rom": {
+                    "label": "ROM (elbow flexion)",
+                    "source_key": "min_elbow_angle",
+                    "unit": "deg",
+                    "evaluation": "direct",
+                },
+                "lockout": {
+                    "label": "Lockout extension",
+                    "source_key": "max_elbow_angle",
+                    "unit": "deg",
+                    "evaluation": "direct",
+                },
+                "elbow_flare": {
+                    "label": "Elbow flare",
+                    "source_key": "elbow_flare_mean",
+                    "unit": "deg",
+                    "evaluation": "direct",
+                },
+            }
+        # squat (default)
         return {
             "knee_valgus": {
                 "label": "Knee tracking",
@@ -1150,7 +1199,9 @@ class PipelineRunnerUI:
         if raw_value is None or metric_score is None:
             return None
 
-        threshold = get_view_thresholds(view)[metric_name]
+        threshold = get_view_thresholds(view).get(metric_name)
+        if threshold is None:
+            return None
         evaluated_value = abs(raw_value) if specs["evaluation"] == "absolute" else raw_value
         violated = (
             evaluated_value < float(threshold["good"])
@@ -1176,7 +1227,7 @@ class PipelineRunnerUI:
 
     def _build_rep_diagnostics(self, rep: dict, view: str) -> list[dict]:
         diagnostics = []
-        for metric_name in ("knee_valgus", "forward_lean", "depth", "squat_depth"):
+        for metric_name in self._metric_specs():
             detail = self._build_metric_diagnostic(metric_name, rep, view)
             if detail is not None:
                 diagnostics.append(detail)
@@ -1398,7 +1449,7 @@ class PipelineRunnerUI:
             if run_root is None:
                 return None
 
-            dataset_root = run_root / "workspace" / "squat" / "dataset_videos_all"
+            dataset_root = run_root / "workspace" / self.exercise_var.get() / "dataset_videos_all"
             if not dataset_root.exists():
                 return None
 
@@ -1430,7 +1481,7 @@ class PipelineRunnerUI:
             if run_root:
                  search_dirs = [
                      run_root / "stage_outputs" / "03_temporal_segmentation",
-                     run_root / "workspace" / "squat" / "segmented_reps"
+                     run_root / "workspace" / self.exercise_var.get() / "segmented_reps"
                  ]
                  for path in search_dirs:
                      if not path.exists():
@@ -1456,7 +1507,7 @@ class PipelineRunnerUI:
             self._preview_overlay_photo = None
             
             # Try to update view metadata anyway if possible
-            dummy_path = run_root / "workspace" / "squat" / "segmented_reps" / "excellent" / f"{stem}_segmented.json" if run_root else Path(f"{stem}_segmented.json")
+            dummy_path = run_root / "workspace" / self.exercise_var.get() / "segmented_reps" / "excellent" / f"{stem}_segmented.json" if run_root else Path(f"{stem}_segmented.json")
             self._update_metadata_display(dummy_path)
             return
 
@@ -1529,14 +1580,15 @@ class PipelineRunnerUI:
             stem_clean = overlay_path.stem.replace("_annotated", "").replace("_segmented", "").replace("_phases", "")
             
             # 2. Construct potential JSON path
-            # Search upwards for the 'squat' directory to anchor our path
-            squat_root = None
+            # Search upwards for the exercise directory to anchor our path
+            _exercise_names = {"squat", "overhead_press", "seated_overhead_press"}
+            exercise_root = None
             for parent in overlay_path.parents:
-                if parent.name == "squat":
-                    squat_root = parent
+                if parent.name in _exercise_names:
+                    exercise_root = parent
                     break
-            
-            if squat_root is None:
+
+            if exercise_root is None:
                 return
 
             run_root = self._find_run_root_for_path(overlay_path)
@@ -1546,8 +1598,8 @@ class PipelineRunnerUI:
                 self._clear_score_display()
 
             if is_segmentation:
-                # .../squat/segmented_reps/<quality>/<vid>_segmented.json
-                json_path = squat_root / "segmented_reps" / quality_folder / f"{stem_clean}_segmented.json"
+                # .../{exercise}/segmented_reps/<quality>/<vid>_segmented.json
+                json_path = exercise_root / "segmented_reps" / quality_folder / f"{stem_clean}_segmented.json"
                 
                 if json_path.exists():
                     with open(json_path, "r") as f:
@@ -1563,8 +1615,8 @@ class PipelineRunnerUI:
                     self.view_type_var.set("Reps: ?")
 
             else:
-                # .../squat/extracted_features_clean/<quality>/<vid>.json
-                json_path = squat_root / "extracted_features_clean" / quality_folder / f"{stem_clean}.json"
+                # .../{exercise}/extracted_features_clean/<quality>/<vid>.json
+                json_path = exercise_root / "extracted_features_clean" / quality_folder / f"{stem_clean}.json"
 
                 if json_path.exists():
                     with open(json_path, "r") as f:
@@ -1807,7 +1859,8 @@ class PipelineRunnerUI:
             for rep in reps:
                 lines.append(f"Rep {rep['rep_id']}:")
                 lines.append(f"  Start: {rep['start_frame']} -> End: {rep['end_frame']}")
-                lines.append(f"  Depth: {rep['squat_depth_normalized']:.3f} (Angle: {rep['squat_depth_angle']:.1f}°)")
+                if "squat_depth_normalized" in rep:
+                    lines.append(f"  Depth: {rep['squat_depth_normalized']:.3f} (Angle: {rep.get('squat_depth_angle', 0):.1f}°)")
                 
                 lines.append("  Phases:")
                 for p in rep.get("phases", []):
@@ -1882,6 +1935,7 @@ class AnnotationToolUI:
         self.current_rep_idx: int = 0                 # which rep we're annotating
         self.current_video_idx: int | None = None     # index of current selected video
         self.pipeline_run_used: str = ""              # which run folder was used
+        self._annotation_exercise_var = tk.StringVar(value="squat")
         self.annotation_extraction_mode_var = tk.StringVar(value="Filtered")
         self._annotation_extraction_mode_map = {
             "Filtered": "filtered",
@@ -1943,8 +1997,23 @@ class AnnotationToolUI:
         ttk.Button(folder_frame, text="Browse…", width=8,
                    command=self._pick_folder).grid(row=0, column=1, padx=(4, 0))
 
+        # Exercise selector — row 1 inside folder_frame
+        ttk.Label(folder_frame, text="Exercise:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ann_exercise_combo = ttk.Combobox(
+            folder_frame,
+            textvariable=self._annotation_exercise_var,
+            values=["squat", "overhead_press", "seated_overhead_press"],
+            state="readonly",
+            width=22,
+        )
+        ann_exercise_combo.grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(4, 0))
+        ann_exercise_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self._on_annotation_exercise_changed(),
+        )
+
         # -- Status
-        self.status_var = tk.StringVar(value="Pick a folder of squat videos to begin.")
+        self.status_var = tk.StringVar(value="Pick a folder of videos to begin.")
         ttk.Label(left, textvariable=self.status_var,
                   wraplength=290, font=("TkDefaultFont", 9)).grid(
             row=1, column=0, sticky="w", pady=(4, 4))
@@ -1964,7 +2033,7 @@ class AnnotationToolUI:
                 left.rowconfigure(3, weight=0)
                 # Show bottom elements when collapsed
                 score_frame.grid()
-                flags_frame.grid()
+                self._flags_frame.grid()
                 metrics_frame.grid()
                 conf_frame.grid()
                 notes_frame.grid()
@@ -1980,7 +2049,7 @@ class AnnotationToolUI:
                 left.rowconfigure(3, weight=1)
                 # Hide bottom elements when expanded
                 score_frame.grid_remove()
-                flags_frame.grid_remove()
+                self._flags_frame.grid_remove()
                 metrics_frame.grid_remove()
                 conf_frame.grid_remove()
                 notes_frame.grid_remove()
@@ -2074,46 +2143,12 @@ class AnnotationToolUI:
         self.view_combo.pack(side=tk.LEFT)
 
         # -- Errors (replaces old Flags)
-        flags_frame = ttk.LabelFrame(left, text="Form Errors", padding=8)
-        flags_frame.grid(row=8, column=0, sticky="ew", pady=(8, 0))
+        self._flags_frame = ttk.LabelFrame(left, text="Form Errors", padding=8)
+        self._flags_frame.grid(row=8, column=0, sticky="ew", pady=(8, 0))
 
         self.flag_vars: dict[str, tk.BooleanVar] = {}
         self.flag_severity_vars: dict[str, tk.DoubleVar] = {}
-        flag_defs = [
-            ("insufficient_squat_depth",      "Insufficient Squat Depth"),
-            ("knee_valgus",                   "Knee Valgus"),
-            ("lumbar_flexion",                "Lumbar Flexion"),
-            ("heel_rise",                     "Heel Rise"),
-            ("asymmetric_descent",            "Asymmetric Descent"),
-            ("forward_lean",                  "Forward Lean"),
-        ]
-        for i, (key, label) in enumerate(flag_defs):
-            var = tk.BooleanVar(value=False)
-            self.flag_vars[key] = var
-            sev_var = tk.DoubleVar(value=0)
-            self.flag_severity_vars[key] = sev_var
-            
-            row = ttk.Frame(flags_frame)
-            row.grid(row=i, column=0, sticky="ew", pady=2)
-            row.columnconfigure(0, weight=1)
-            
-            cb = ttk.Checkbutton(row, text=label, variable=var, 
-                                 command=lambda k=key: self._on_checkbox_toggled(k))
-            cb.grid(row=0, column=0, sticky="w")
-            
-            slider = ttk.Scale(row, from_=0, to=5, variable=sev_var, orient=tk.HORIZONTAL, length=80,
-                               command=lambda v, k=key: self._on_scale_changed(v, k))
-            slider.grid(row=0, column=1, padx=(10, 0))
-            
-            val_lbl = ttk.Label(row, textvariable=sev_var, width=3)
-            val_lbl.grid(row=0, column=2, padx=(4, 0))
-
-        # Keybinds F1-F7 mapping to checkboxes (optional but helpful)
-        flag_keys_list = list(self.flag_vars.keys())
-        for idx in range(min(7, len(flag_keys_list))):
-            fkey = f"<F{idx + 1}>"
-            flag_key = flag_keys_list[idx]
-            self.root.bind(fkey, lambda e, k=flag_key: self._toggle_flag(k))
+        self._rebuild_annotation_flags()
 
         # -- Neural Metrics
         metrics_frame = ttk.LabelFrame(left, text="Target Metrics (0-100, blank = null)", padding=8)
@@ -2185,7 +2220,7 @@ class AnnotationToolUI:
         # Initially start expanded (which means bottom is hidden according to new logic)
         self._list_expanded = True
         score_frame.grid_remove()
-        flags_frame.grid_remove()
+        self._flags_frame.grid_remove()
         metrics_frame.grid_remove()
         conf_frame.grid_remove()
         notes_frame.grid_remove()
@@ -2258,11 +2293,75 @@ class AnnotationToolUI:
         self.log_text.pack(fill=tk.X)
 
     # ============================================================ Folder
+    def _build_annotation_flag_defs(self) -> list[tuple[str, str]]:
+        """Load annotation flag definitions from the exercise config JSON."""
+        exercise = self._annotation_exercise_var.get()
+        config_stem = _config_file_for_exercise(exercise)
+        config_path = CONFIG_EXERCISES_DIR / f"{config_stem}.json"
+        if not config_path.exists():
+            return []
+        try:
+            import json as _json
+            with open(config_path, encoding="utf-8") as f:
+                cfg = _json.load(f)
+            return list(cfg.get("annotation_flags", {}).items())
+        except Exception:
+            return []
+
+    def _rebuild_annotation_flags(self) -> None:
+        """Destroy existing flag widgets and rebuild from current exercise config."""
+        for widget in self._flags_frame.winfo_children():
+            widget.destroy()
+
+        self.flag_vars = {}
+        self.flag_severity_vars = {}
+
+        for i, (key, label) in enumerate(self._build_annotation_flag_defs()):
+            var = tk.BooleanVar(value=False)
+            self.flag_vars[key] = var
+            sev_var = tk.DoubleVar(value=0)
+            self.flag_severity_vars[key] = sev_var
+
+            row_frame = ttk.Frame(self._flags_frame)
+            row_frame.grid(row=i, column=0, sticky="ew", pady=2)
+            row_frame.columnconfigure(0, weight=1)
+
+            ttk.Checkbutton(
+                row_frame, text=label, variable=var,
+                command=lambda k=key: self._on_checkbox_toggled(k),
+            ).grid(row=0, column=0, sticky="w")
+
+            sev_var_label = tk.DoubleVar(value=0)
+            self.flag_severity_vars[key] = sev_var_label
+            ttk.Scale(
+                row_frame, from_=0, to=5, variable=sev_var_label,
+                orient=tk.HORIZONTAL, length=80,
+                command=lambda v, k=key: self._on_scale_changed(v, k),
+            ).grid(row=0, column=1, padx=(10, 0))
+
+            ttk.Label(row_frame, textvariable=sev_var_label, width=3).grid(row=0, column=2, padx=(4, 0))
+
+        # Rebind F1–F7 hotkeys to the new flag list
+        flag_keys_list = list(self.flag_vars.keys())
+        for idx in range(min(7, len(flag_keys_list))):
+            self.root.bind(f"<F{idx + 1}>", lambda e, k=flag_keys_list[idx]: self._toggle_flag(k))
+
+    def _on_annotation_exercise_changed(self) -> None:
+        """Rebuild annotation flags when exercise selection changes in annotation tab."""
+        self._rebuild_annotation_flags()
+        exercise = self._annotation_exercise_var.get()
+        self.status_var.set(f"Exercise changed to {exercise}. Pick a folder of videos.")
+        self.video_files = []
+        self.folder_var.set("")
+        if hasattr(self, "_video_listbox"):
+            self._video_listbox.delete(0, tk.END)
+
     def _pick_folder(self) -> None:
-        default = str(PROJECT_ROOT / "squat" / "dataset_videos_all")
+        exercise = self._annotation_exercise_var.get()
+        default = str(PROJECT_ROOT / exercise / "dataset_videos_all")
         selected = filedialog.askdirectory(
             initialdir=default if Path(default).exists() else str(PROJECT_ROOT),
-            title="Select folder of squat videos",
+            title=f"Select folder of {exercise.replace('_', ' ')} videos",
         )
         if not selected:
             return
@@ -2310,14 +2409,15 @@ class AnnotationToolUI:
             for run_dir in list(runs_root.iterdir()):
                 if not run_dir.is_dir():
                     continue
-                # Fix: Check for both segmentation and scores
-                seg_root = run_dir / "workspace" / "squat" / "segmented_reps"
-                if seg_root.exists():
-                    for f in seg_root.rglob("*_segmented.json"):
-                        vid_id = f.stem.replace("_segmented", "")
-                        processed_vids.add(vid_id)
+                # Check for both segmentation and scores across all exercise namespaces
+                for _ex_ns in ("squat", "overhead_press", "seated_overhead_press"):
+                    seg_root = run_dir / "workspace" / _ex_ns / "segmented_reps"
+                    if seg_root.exists():
+                        for f in seg_root.rglob("*_segmented.json"):
+                            vid_id = f.stem.replace("_segmented", "")
+                            processed_vids.add(vid_id)
 
-                score_root = run_dir / "workspace" / "squat" / "aqa_analysis_simple"
+                score_root = run_dir / "workspace" / self._annotation_exercise_var.get() / "aqa_analysis_simple"
                 if score_root.exists():
                     for f in score_root.rglob("*_aqa_simple.json"):
                         vid_id = f.stem.replace("_aqa_simple", "")
@@ -2680,7 +2780,8 @@ class AnnotationToolUI:
                 continue
 
             # Check for segmented JSON
-            seg_root = workspace / "squat" / "segmented_reps"
+            _ann_ex = self._annotation_exercise_var.get()
+            seg_root = workspace / _ann_ex / "segmented_reps"
             if not seg_root.exists():
                 continue
 
@@ -2689,7 +2790,7 @@ class AnnotationToolUI:
                 continue
 
             # Check for scoring JSON
-            score_root = workspace / "squat" / "aqa_analysis_simple"
+            score_root = workspace / _ann_ex / "aqa_analysis_simple"
             if score_root.exists():
                 score_matches = list(score_root.rglob(f"{video_id}_aqa_simple.json"))
                 if score_matches:
@@ -2731,7 +2832,8 @@ class AnnotationToolUI:
         existing_annotation = self._load_existing_annotation(video_id) or {}
 
         # Find segmented JSON
-        seg_root = workspace / "squat" / "segmented_reps"
+        _ann_ex = self._annotation_exercise_var.get()
+        seg_root = workspace / _ann_ex / "segmented_reps"
         seg_matches = list(seg_root.rglob(f"{video_id}_segmented.json"))
         if not seg_matches:
             return None
@@ -2742,7 +2844,7 @@ class AnnotationToolUI:
             seg_data = json.load(f)
 
         # Find scoring JSON (recursive into nested dirs)
-        score_root = workspace / "squat" / "aqa_analysis_simple"
+        score_root = workspace / _ann_ex / "aqa_analysis_simple"
         score_data = None
         score_matches = []
         if score_root.exists():
@@ -2752,7 +2854,7 @@ class AnnotationToolUI:
                     score_data = json.load(f)
 
         # Find features JSON path
-        feat_root = workspace / "squat" / "extracted_features_clean"
+        feat_root = workspace / _ann_ex / "extracted_features_clean"
         features_path = ""
         if feat_root.exists():
             feat_matches = list(feat_root.rglob(f"{video_id}.json"))
@@ -2777,7 +2879,7 @@ class AnnotationToolUI:
         vis_video = ""
 
         # (1) Pose-landmark annotated video
-        poses_root = workspace / "squat" / "visualized_poses_clean"
+        poses_root = workspace / _ann_ex / "visualized_poses_clean"
         for viz_q in ("raw_unfiltered", quality):
             if vis_video:
                 break
@@ -2787,7 +2889,7 @@ class AnnotationToolUI:
 
         # (2) Segmentation phase overlay
         if not vis_video:
-            seg_vis_root = workspace / "squat" / "visualized_segmentation"
+            seg_vis_root = workspace / _ann_ex / "visualized_segmentation"
             for viz_q in ("raw_unfiltered", quality):
                 if vis_video:
                     break
@@ -2799,7 +2901,7 @@ class AnnotationToolUI:
 
         # (3) Raw video fallback
         if not vis_video:
-            raw = workspace / "squat" / "dataset_videos_all" / f"{video_id}.mp4"
+            raw = workspace / _ann_ex / "dataset_videos_all" / f"{video_id}.mp4"
             if raw.exists():
                 vis_video = str(raw)
 
@@ -3040,7 +3142,7 @@ class AnnotationToolUI:
         elif stage.key == "scoring":
             stage_args = [video_stem]
 
-        cmd = [sys.executable, str(stage.script_path), *stage_args]
+        cmd = [sys.executable, str(stage.script_path), *stage_args, "--exercise", self._annotation_exercise_var.get()]
         env = os.environ.copy()
         env["EXEVISION_MODEL_PATH"] = str(SHARED_MODEL_PATH)
         env["EXEVISION_FACE_MODEL_PATH"] = str(SHARED_FACE_MODEL_PATH)
@@ -3117,8 +3219,8 @@ class AnnotationToolUI:
 
         try:
             # Prepare workspace
-            squat_dir = workspace / "squat"
-            dataset_target = squat_dir / "dataset_videos_all"
+            exercise_dir = workspace / self._annotation_exercise_var.get()
+            dataset_target = exercise_dir / "dataset_videos_all"
             dataset_target.mkdir(parents=True, exist_ok=True)
             logs_root.mkdir(parents=True, exist_ok=True)
 
@@ -3190,8 +3292,8 @@ class AnnotationToolUI:
 
             try:
                 # Prepare workspace
-                squat_dir = workspace / "squat"
-                dataset_target = squat_dir / "dataset_videos_all"
+                exercise_dir = workspace / self._annotation_exercise_var.get()
+                dataset_target = exercise_dir / "dataset_videos_all"
                 dataset_target.mkdir(parents=True, exist_ok=True)
                 logs_root.mkdir(parents=True, exist_ok=True)
 

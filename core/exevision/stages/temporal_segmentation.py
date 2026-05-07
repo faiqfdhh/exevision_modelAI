@@ -62,6 +62,7 @@ VISUALIZATION_DIRS = {
 }
 
 VIDEO_DIR = "./squat/dataset_videos_all"
+CURRENT_EXERCISE = "squat"
 
 
 def _build_temporal_paths(exercise: str):

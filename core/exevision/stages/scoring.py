@@ -695,46 +695,32 @@ def _ohp_grip_width(rep_frames: List) -> Optional[float]:
     return float(np.mean(ratios)) if ratios else None
 
 
-def _ohp_bar_path_deviation(rep_frames: List) -> Optional[float]:
+def _ohp_elbow_angle(frame: Any, sh_idx: int, el_idx: int, wr_idx: int, use_2d: bool) -> Optional[float]:
+    """Compute elbow angle using 2D (X,Y) or 3D coords depending on view."""
+    if use_2d:
+        sh = _lm(frame, sh_idx)
+        el = _lm(frame, el_idx)
+        wr = _lm(frame, wr_idx)
+        if any(x is None for x in (sh, el, wr)):
+            return None
+        return _angle_2d(sh[:2], el[:2], wr[:2])
+    else:
+        sh = _xyz(frame, sh_idx)
+        el = _xyz(frame, el_idx)
+        wr = _xyz(frame, wr_idx)
+        if any(x is None for x in (sh, el, wr)):
+            return None
+        return _angle_3d(sh, el, wr)
+
+
+def _ohp_rom(rep_frames: List, use_2d: bool = False) -> Tuple[Optional[float], Optional[float]]:
     """
-    Horizontal (XZ body-local) drift of wrist midpoint from first to last frame,
-    normalised by shoulder width. Ideal ≤ 0.05; bad ≥ 0.25.
-    """
-    if len(rep_frames) < 2:
-        return None
-
-    def _bar_local(frame):
-        bf = _build_body_frame(frame)
-        if bf is None:
-            return None, None
-        lw = _xyz(frame, L_WRIST)
-        rw = _xyz(frame, R_WRIST)
-        ls = _xyz(frame, L_SHOULDER)
-        rs = _xyz(frame, R_SHOULDER)
-        if any(x is None for x in (lw, rw, ls, rs)):
-            return None, None
-        bar = _to_body_local((lw + rw) / 2.0, bf)
-        ls_l = _to_body_local(ls, bf)
-        rs_l = _to_body_local(rs, bf)
-        sh_w = abs(rs_l[0] - ls_l[0])
-        return bar, sh_w
-
-    bar_bottom, sh_w = _bar_local(rep_frames[0])
-    bar_top, _ = _bar_local(rep_frames[-1])
-    if bar_bottom is None or bar_top is None or sh_w < 1e-3:
-        return None
-
-    d_horiz = math.sqrt((bar_top[0] - bar_bottom[0])**2 + (bar_top[2] - bar_bottom[2])**2)
-    return float(d_horiz / sh_w)
-
-
-def _ohp_rom(rep_frames: List) -> Optional[float]:
-    """
-    Minimum 3D elbow angle (average of L and R) across all rep frames.
-    Represents how much the elbows flexed at the bottom of the rep.
-    Full ROM: ≤ 75°; partial: 75-90°; insufficient: > 90°.
+    Returns (min_elbow_angle, max_elbow_angle) across the rep.
+    min = most flexed frame (bottom of press); max = most extended (top of press).
+    use_2d=True for side views where MediaPipe Z depth is unreliable.
     """
     min_angle = 180.0
+    max_angle = 0.0
     found = False
     for frame in rep_frames:
         frame_angles: List[float] = []
@@ -742,25 +728,42 @@ def _ohp_rom(rep_frames: List) -> Optional[float]:
             (L_SHOULDER, L_ELBOW, L_WRIST),
             (R_SHOULDER, R_ELBOW, R_WRIST),
         ):
-            sh = _xyz(frame, sh_idx)
-            el = _xyz(frame, el_idx)
-            wr = _xyz(frame, wr_idx)
-            if any(x is None for x in (sh, el, wr)):
-                continue
-            a = _angle_3d(sh, el, wr)
+            a = _ohp_elbow_angle(frame, sh_idx, el_idx, wr_idx, use_2d)
             if a is not None:
                 frame_angles.append(a)
         if frame_angles:
-            min_angle = min(min_angle, float(np.mean(frame_angles)))
+            mean_angle = float(np.mean(frame_angles))
+            min_angle = min(min_angle, mean_angle)
+            max_angle = max(max_angle, mean_angle)
             found = True
-    return float(min_angle) if found else None
+    return (float(min_angle), float(max_angle)) if found else (None, None)
 
 
-def _ohp_lockout(rep_frames: List, fps: float) -> Optional[float]:
+def _ohp_elbow_below_shoulder(rep_frames: List, min_angle: float) -> bool:
     """
-    Maximum 3D elbow extension angle (average L+R) sustained for ≥ 0.5 s.
+    Check whether elbows (13/14) dropped below shoulders (11/12) at any point in the rep.
+    Primary: raw Y coordinate comparison (image Y increases downward, so elbow_y > shoulder_y
+    means elbow is physically lower). Fallback: min elbow angle <= 110 deg as a proxy
+    when landmark Y values are unreliable (e.g. pure side view perspective artifacts).
+    """
+    for frame in rep_frames:
+        ls = _lm(frame, L_SHOULDER)
+        le = _lm(frame, L_ELBOW)
+        if ls is not None and le is not None and le[1] > ls[1]:
+            return True
+        rs = _lm(frame, R_SHOULDER)
+        re = _lm(frame, R_ELBOW)
+        if rs is not None and re is not None and re[1] > rs[1]:
+            return True
+    return min_angle <= 110.0
+
+
+def _ohp_lockout(rep_frames: List, fps: float, use_2d: bool = False) -> Optional[float]:
+    """
+    Maximum elbow extension angle (average L+R) sustained for ≥ 0.5 s.
     If no 0.5 s window is found, returns the peak angle (partial lockout credit).
     Ideal: ≥ 165°; bad: ≤ 145°.
+    use_2d=True for side views where MediaPipe Z depth is unreliable.
     """
     LOCKOUT_THRESH = 165.0
     MIN_SUSTAIN = max(1, int(0.5 * fps))
@@ -772,12 +775,7 @@ def _ohp_lockout(rep_frames: List, fps: float) -> Optional[float]:
             (L_SHOULDER, L_ELBOW, L_WRIST),
             (R_SHOULDER, R_ELBOW, R_WRIST),
         ):
-            sh = _xyz(frame, sh_idx)
-            el = _xyz(frame, el_idx)
-            wr = _xyz(frame, wr_idx)
-            if any(x is None for x in (sh, el, wr)):
-                continue
-            a = _angle_3d(sh, el, wr)
+            a = _ohp_elbow_angle(frame, sh_idx, el_idx, wr_idx, use_2d)
             if a is not None:
                 angles.append(a)
         per_frame.append(float(np.mean(angles)) if angles else None)
@@ -940,19 +938,26 @@ def _score_ohp_grip(ratio: float, cfg: Dict) -> float:
     return max(0.0, 100.0 * (1.0 - abs(ratio - perfect) / tolerance))
 
 
-def _score_ohp_bar_path(deviation: float, cfg: Dict) -> float:
-    c = cfg["metrics"]["bar_path_deviation"]
-    return score_metric_linear(deviation, good=c["good_threshold"], bad=c["bad_threshold"], higher_is_better=False)
+def _score_ohp_rom(max_angle: Optional[float], elbow_below_shoulder: Optional[bool], cfg: Dict) -> float:
+    """
+    ROM = 50% top extension + 50% elbow-below-shoulder at bottom.
+    Top: how straight arms get at the top (max elbow angle).
+    Bottom: did elbow landmark go below shoulder landmark (Y check).
+    """
+    # Top component (50%): arm extension quality
+    if max_angle is not None:
+        c_top = cfg["metrics"]["rom_top"]
+        top_score = score_metric_linear(
+            max_angle, good=c_top["good_threshold"], bad=c_top["bad_threshold"],
+            higher_is_better=True,
+        )
+    else:
+        top_score = 50.0  # neutral if uncomputable
 
+    # Bottom component (50%): elbow reached below shoulder level (binary)
+    bottom_score = 100.0 if elbow_below_shoulder else 0.0
 
-def _score_ohp_rom(min_angle: float, cfg: Dict) -> float:
-    c = cfg["metrics"]["min_elbow_angle"]
-    full, partial = c["full_rom_threshold"], c["partial_rom_threshold"]
-    if min_angle <= full:
-        return 100.0
-    if min_angle >= partial:
-        return 0.0
-    return 100.0 * (partial - min_angle) / (partial - full)
+    return round(0.5 * top_score + 0.5 * bottom_score, 1)
 
 
 def _score_ohp_lockout(max_angle: float, cfg: Dict) -> float:
@@ -993,9 +998,11 @@ def _score_overhead_press(
     fps: float,
     exercise: str,
     config: Dict,
+    view: str = "front",
 ) -> Dict[str, Any]:
     """
-    Compute all 5 OHP metrics, score them, and return a result dict.
+    Compute all 4 OHP metrics (grip_ratio, ROM, lockout, elbow_flare), score them,
+    and return a result dict.
 
     Works identically for 'overhead_press' and 'seated_overhead_press'.
     The exercise parameter is only used to label the output — metric logic
@@ -1004,41 +1011,55 @@ def _score_overhead_press(
 
     Output schema matches score_rep_simple() for pipeline compatibility:
       overall_score, metric_scores, raw_metrics, exercise, weights_used
+    
+    Note: bar_path_deviation metric removed (cannot be reliably computed from
+    pose landmarks alone; requires actual bar position detection).
     """
     weights: Dict[str, float] = config.get("metric_weights", {
-        "grip_ratio": 0.20, "bar_path_deviation": 0.20,
-        "rom": 0.20, "lockout": 0.20, "elbow_flare": 0.20,
+        "grip_ratio": 0.25,
+        "rom": 0.25, "lockout": 0.25, "elbow_flare": 0.25,
     })
+
+    # Side view: use 2D angles (Z depth unreliable when arm extends toward/away from camera)
+    _is_side = (view == "side")
+    _is_diagonal = view in {"front_side", "back_side", "side"}
 
     # ── Raw measurements ──
     grip_ratio = _ohp_grip_width(rep_frames)
-    bar_path   = _ohp_bar_path_deviation(rep_frames)
-    min_elbow  = _ohp_rom(rep_frames)
-    max_elbow  = _ohp_lockout(rep_frames, fps)
+    min_elbow, max_elbow_rom = _ohp_rom(rep_frames, use_2d=_is_side)
+    elbow_below = _ohp_elbow_below_shoulder(rep_frames, min_elbow) if min_elbow is not None else False
+    max_elbow  = _ohp_lockout(rep_frames, fps, use_2d=_is_side)
     fl_left, fl_right, fl_both = _ohp_elbow_flare(rep_frames, rep_phases)
 
     raw_metrics: Dict[str, Any] = {
-        "grip_ratio":         round(float(grip_ratio), 4) if grip_ratio is not None else None,
-        "bar_path_deviation": round(float(bar_path),   4) if bar_path   is not None else None,
-        "min_elbow_angle":    round(float(min_elbow),  2) if min_elbow  is not None else None,
-        "max_elbow_angle":    round(float(max_elbow),  2) if max_elbow  is not None else None,
-        "elbow_flare_left":   round(float(fl_left),    2) if fl_left    is not None else None,
-        "elbow_flare_right":  round(float(fl_right),   2) if fl_right   is not None else None,
-        "elbow_flare_mean":   round(float(fl_both),    2) if fl_both    is not None else None,
+        "grip_ratio":          round(float(grip_ratio), 4)  if grip_ratio is not None else None,
+        "min_elbow_angle":     round(float(min_elbow),  2)  if min_elbow  is not None else None,
+        "max_elbow_angle":     round(float(max_elbow),  2)  if max_elbow  is not None else None,
+        "elbow_below_shoulder": elbow_below,
+        "elbow_flare_left":    round(float(fl_left),    2)  if fl_left    is not None else None,
+        "elbow_flare_right":   round(float(fl_right),   2)  if fl_right   is not None else None,
+        "elbow_flare_mean":    round(float(fl_both),    2)  if fl_both    is not None else None,
     }
 
     # ── Per-metric scores ──
     metric_scores: Dict[str, float] = {}
-    if grip_ratio is not None:
-        metric_scores["grip_ratio"]        = _score_ohp_grip(grip_ratio, config)
-    if bar_path is not None:
-        metric_scores["bar_path_deviation"] = _score_ohp_bar_path(bar_path, config)
-    if min_elbow is not None:
-        metric_scores["rom"]               = _score_ohp_rom(min_elbow, config)
+
+    # Grip ratio: excluded for pure side view (shoulder width ≈ 0 makes it unreliable)
+    if grip_ratio is not None and not _is_side:
+        metric_scores["grip_ratio"] = _score_ohp_grip(grip_ratio, config)
+
+    # ROM: 50% top extension + 50% elbow-below-shoulder at bottom (all views)
+    if min_elbow is not None or max_elbow_rom is not None:
+        metric_scores["rom"] = _score_ohp_rom(max_elbow_rom, elbow_below, config)
+
+    # Lockout: max elbow extension (all views)
     if max_elbow is not None:
-        metric_scores["lockout"]           = _score_ohp_lockout(max_elbow, config)
+        metric_scores["lockout"] = _score_ohp_lockout(max_elbow, config)
+
+    # Elbow flare: exclude from diagonal/side views (foreshortening effect)
     if fl_both is not None or fl_left is not None or fl_right is not None:
-        metric_scores["elbow_flare"]       = _score_ohp_flare(fl_left, fl_right, fl_both, config)
+        if not _is_diagonal:
+            metric_scores["elbow_flare"] = _score_ohp_flare(fl_left, fl_right, fl_both, config)
 
     # ── Weighted overall ──
     avail_w = {k: weights[k] for k in metric_scores if k in weights}
@@ -1229,7 +1250,7 @@ def process_single_video(video_id: str, source_quality: str, save_output: bool =
         if exercise in ("overhead_press", "seated_overhead_press") and _ohp_config is not None:
             rep_phases = frame_phases_all[start:end + 1] if frame_phases_all else []
             rep_score = _score_overhead_press(
-                frames, rep_phases, fps=fps, exercise=exercise, config=_ohp_config
+                frames, rep_phases, fps=fps, exercise=exercise, config=_ohp_config, view=view
             )
             metrics = rep_score["raw_metrics"]
         else:

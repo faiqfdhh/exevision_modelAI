@@ -136,37 +136,6 @@ def test_grip_width_wider():
     assert abs(ratio - 0.20) < 0.02
 
 
-# ── _ohp_bar_path_deviation ──────────────────────────────────────────────────
-
-def test_bar_path_perfect_vertical():
-    """Wrists move straight up (no horizontal drift) → deviation = 0."""
-    bottom = _make_frame(lw=(-.10, .1, 0.), rw=(.10, .1, 0.),
-                         ls=(-.10, .5, 0.), rs=(.10, .5, 0.),
-                         lh=(-.10, 0., 0.), rh=(.10, 0., 0.))
-    top    = _make_frame(lw=(-.10, .9, 0.), rw=(.10, .9, 0.),
-                         ls=(-.10, .5, 0.), rs=(.10, .5, 0.),
-                         lh=(-.10, 0., 0.), rh=(.10, 0., 0.))
-    frames = [bottom] + [bottom] * 8 + [top] * 10
-    dev = scoring._ohp_bar_path_deviation(frames)
-    assert dev is not None
-    assert dev < 0.02
-
-
-def test_bar_path_forward_drift():
-    """Wrists drift forward 10% of shoulder width → deviation ≈ 0.10."""
-    sh_w = 0.20
-    bottom = _make_frame(lw=(-.10, .1, 0.00), rw=(.10, .1, 0.00),
-                         ls=(-.10, .5, 0.), rs=(.10, .5, 0.),
-                         lh=(-.10, 0., 0.), rh=(.10, 0., 0.))
-    top    = _make_frame(lw=(-.10, .9, 0.02), rw=(.10, .9, 0.02),  # 0.02 drift in Z
-                         ls=(-.10, .5, 0.), rs=(.10, .5, 0.),
-                         lh=(-.10, 0., 0.), rh=(.10, 0., 0.))
-    frames = [bottom] + [top] * 19
-    dev = scoring._ohp_bar_path_deviation(frames)
-    assert dev is not None
-    assert abs(dev - 0.10) < 0.02   # 0.02 / sh_w=0.20 = 0.10
-
-
 # ── _ohp_rom ─────────────────────────────────────────────────────────────────
 
 def test_rom_full_flexion():

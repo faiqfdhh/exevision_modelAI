@@ -11,56 +11,51 @@
   "improvement_threshold": 75,
   "severity_band": 5,
   "metric_weights": {
-    "grip_ratio":        0.20,
-    "bar_path_deviation": 0.20,
-    "rom":               0.20,
-    "lockout":           0.20,
-    "elbow_flare":       0.20
+    "grip_ratio":  0.25,
+    "rom":         0.25,
+    "lockout":     0.25,
+    "elbow_flare": 0.25
   },
   "metrics": {
     "grip_ratio": {
-      "ideal_low":  0.05,
-      "ideal_high": 0.25,
-      "perfect":    0.15,
-      "tolerance":  0.30,
+      "ideal_low":  0.20,
+      "ideal_high": 1.20,
+      "perfect":    0.65,
+      "tolerance":  0.90,
       "unit": "ratio",
-      "note": "grip_ratio=(grip_width - shoulder_width)/shoulder_width; ideal 5-25% wider than shoulders"
+      "note": "grip_ratio=(grip_width - shoulder_width)/shoulder_width; ideal 20-120% wider than shoulders."
     },
-    "bar_path_deviation": {
-      "good_threshold": 0.05,
-      "bad_threshold":  0.25,
-      "unit": "normalized",
-      "note": "horizontal XZ drift from bottom to top / shoulder_width; body-local frame"
-    },
-    "min_elbow_angle": {
-      "full_rom_threshold":    75.0,
-      "partial_rom_threshold": 90.0,
+    "rom_top": {
+      "good_threshold": 157.0,
+      "bad_threshold":  110.0,
       "unit": "degrees",
-      "note": "3D elbow angle at maximum flexion; <= 75 = full ROM, > 90 = no credit"
+      "note": "50% of ROM score. Max elbow extension at top of press. >= 157° = full extension (100), <= 110° = poor extension (0). 153° ~= 92."
+    },
+    "rom_bottom": {
+      "note": "50% of ROM score. Binary check: did elbow landmark (13/14) go below shoulder landmark (11/12) in image Y coords at bottom frames?"
     },
     "max_elbow_angle": {
-      "good_threshold": 165.0,
-      "bad_threshold":  145.0,
+      "good_threshold": 150.0,
+      "bad_threshold":  135.0,
       "unit": "degrees",
       "note": "3D elbow angle at lockout, sustained >= 0.5 s"
     },
     "elbow_flare": {
-      "ideal_low":          30.0,
-      "ideal_high":         60.0,
-      "bad_low":            20.0,
-      "bad_high":           70.0,
-      "asymmetry_threshold": 15.0,
+      "ideal_low":          90.0,
+      "ideal_high":         150.0,
+      "bad_low":            60.0,
+      "bad_high":           175.0,
+      "asymmetry_threshold": 20.0,
       "unit": "degrees",
-      "note": "mean shoulder abduction during concentric phase; 0 = arm along torso, 90 = horizontal out"
+      "note": "angle between upper-arm (elbow→shoulder) and torso-down (hip→shoulder) during concentric phase. At bottom: ~90deg; at lockout: ~170deg. Ideal concentric mean: 90-150deg. Excluded from diagonal views due to foreshortening."
     }
   },
   "field_mapping": {
     "metrics_to_feedback": {
-      "grip_ratio":         "grip_ratio",
-      "bar_path_deviation": "bar_path_deviation",
-      "min_elbow_angle":    "rom",
-      "max_elbow_angle":    "lockout",
-      "elbow_flare_mean":   "elbow_flare"
+      "grip_ratio":       "grip_ratio",
+      "rom_range":        "rom",
+      "max_elbow_angle":  "lockout",
+      "elbow_flare_mean": "elbow_flare"
     }
   },
   "annotation_flags": {
@@ -94,24 +89,6 @@
       "combined_cue": {
         "needs_work": "Work on your lockout: press higher and extend the elbows fully.",
         "focus_here": "Your lockout needs significant work — incomplete extension and insufficient height."
-      }
-    },
-    "bar_path": {
-      "metrics": ["bar_path_deviation", "forward_lean"],
-      "label": "bar path",
-      "single_cues": {
-        "bar_path_deviation": {
-          "needs_work": "Work on keeping the bar path vertical.",
-          "focus_here": "The bar path is drifting significantly — focus on pressing straight up."
-        },
-        "forward_lean": {
-          "needs_work": "Stay more upright during the press.",
-          "focus_here": "Excessive forward lean — brace your core and stay vertical."
-        }
-      },
-      "combined_cue": {
-        "needs_work": "Work on your bar path: stay upright and press vertically.",
-        "focus_here": "Bar path and body lean both need attention — brace hard and press straight."
       }
     }
   }

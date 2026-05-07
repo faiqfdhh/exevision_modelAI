@@ -111,19 +111,15 @@ def _classify_frame(frame, face_detected: bool = False) -> str | None:
     depth_forward = _facing_camera(frame, has_vis)
 
     if shoulder_width < DIAGONAL_WIDTH:
-        # Priority 1: reliable nose depth
         if depth_forward is True:
             return "front_side"
         if depth_forward is False:
             return "back_side"
-        # Priority 2 (depth ambiguous): external face detector
+        # depth ambiguous (None): fall back to face signals
         if face_detected:
             return "front_side"
-        # Priority 3: MediaPipe face landmark visibility (nose/eyes still visible
-        # even when their position is unreliable)
         if any_face:
             return "front_side"
-        # Default: no facing signal available
         return "back_side"
 
     # Pure front vs back (wide-shoulder zone)
@@ -147,15 +143,25 @@ def get_view_label(keypoints_img: list, face_detected_list: list = None) -> str:
 def get_view_label_with_probs(keypoints_img: list, face_detected_list: list = None) -> tuple[str, dict]:
     """Classify with full vote distribution."""
     votes = []
+    has_any_forward_depth = False  # True if nose was ever definitively in front of hips
 
     for idx, frame in enumerate(keypoints_img or []):
         if len(votes) >= MAX_FRAMES:
             break
-        
+
         is_face_detected = face_detected_list[idx] if (face_detected_list and idx < len(face_detected_list)) else False
         label = _classify_frame(frame, face_detected=is_face_detected)
         if label:
             votes.append(label)
+
+        # Track any frame where depth is definitively forward (nose closer than hips).
+        # A single True frame proves the person faced the camera at some point —
+        # back/back_side votes on other frames are OHP head-tilt noise, not actual
+        # back-facing orientation.
+        if frame and len(frame) > 24:
+            has_vis = len(frame[0]) > 3
+            if _facing_camera(frame, has_vis) is True:
+                has_any_forward_depth = True
 
     if not votes:
         return "unknown", {"front": 0.0, "back": 0.0, "side": 0.0, "front_side": 0.0, "back_side": 0.0}
@@ -166,6 +172,14 @@ def get_view_label_with_probs(keypoints_img: list, face_detected_list: list = No
              for v in ["front", "back", "side", "front_side", "back_side"]}
 
     label = max(probs, key=probs.get)
+
+    # Video-level correction: if any frame showed forward depth, the majority
+    # back/back_side vote is from head tilt — override to the front equivalent.
+    if has_any_forward_depth and label == "back_side":
+        label = "front_side"
+    elif has_any_forward_depth and label == "back":
+        label = "front"
+
     return label, probs
 
 def process_video_classification(json_path: str) -> tuple:
@@ -201,20 +215,23 @@ def process_video_classification(json_path: str) -> tuple:
         return video_id, "Error", str(e)
 
 
-def run_classification(quality_filter=None, video_id_filter=None):
+def run_classification(quality_filter=None, video_id_filter=None, exercise="squat"):
     """
     Process all extracted features and classify by view.
     Updates JSON files in place with view field.
-    
+
     Args:
         quality_filter: None (all), 'excellent', 'good', or 'fair'
+        exercise: exercise name (default: 'squat'); controls which directory tree is scanned
     """
+    features_dirs = _build_features_dirs(exercise)
+
     # Determine which folders to process
     if quality_filter:
-        folders_to_process = [f for f in FEATURES_DIRS 
+        folders_to_process = [f for f in features_dirs
                              if quality_filter.lower() in f.lower()]
     else:
-        folders_to_process = FEATURES_DIRS
+        folders_to_process = features_dirs
     
     # Collect all JSON files
     json_files = []
@@ -278,7 +295,7 @@ def run_classification(quality_filter=None, video_id_filter=None):
     
     print(f"\n✅ All JSON files updated with 'view' field")
     print(f"📁 Updated in: {', '.join([os.path.basename(f) for f in folders_to_process])}")
-print('='*70)
+    print('='*70)
 
 
 if __name__ == "__main__":
@@ -290,7 +307,4 @@ if __name__ == "__main__":
     parser.add_argument("--exercise", default="squat", help="Exercise type (default: squat)")
     args = parser.parse_args()
 
-    # Update features dirs based on exercise
-    FEATURES_DIRS = _build_features_dirs(args.exercise)
-
-    run_classification(quality_filter=args.quality, video_id_filter=args.video_id)
+    run_classification(quality_filter=args.quality, video_id_filter=args.video_id, exercise=args.exercise)

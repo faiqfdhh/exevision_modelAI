@@ -102,5 +102,19 @@
       "knee_valgus_ratio": "knee_valgus",
       "knee_tracking_ratio": "knee_tracking"
     }
+  },
+  "annotation_flags": {
+    "insufficient_squat_depth": "Insufficient Squat Depth",
+    "knee_valgus":              "Knee Valgus",
+    "lumbar_flexion":           "Lumbar Flexion",
+    "heel_rise":                "Heel Rise",
+    "asymmetric_descent":       "Asymmetric Descent",
+    "forward_lean":             "Forward Lean"
+  },
+  "annotation_metrics": {
+    "depth":      "Depth Quality",
+    "stability":  "Stability",
+    "smoothness": "Smoothness",
+    "control":    "Control"
   }
 }

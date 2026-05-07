@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-_Last updated: 2026-05-06 — See [CHANGELOG.md](CHANGELOG.md) for full session history._
+_Last updated: 2026-05-06 (Session 6) — See [CHANGELOG.md](CHANGELOG.md) for full session history._
 
 ---
 
@@ -22,8 +22,10 @@ _Last updated: 2026-05-06 — See [CHANGELOG.md](CHANGELOG.md) for full session 
 ### Launch Desktop UI (Multi-Exercise)
 ```bash
 python apps/desktop-ui/app.py
-# New: Exercise selector dropdown in UI; choose squat or overhead_press
-# New: Stage outputs appear in {exercise}/extracted_features_clean/, etc.
+# Exercises: squat, overhead_press, seated_overhead_press — all fully supported
+# Inference tab: routes output to {exercise}/ workspace subdirectory; analyze_results stage squat-only
+# Annotation tab: independent exercise selector (_annotation_exercise_var); flags loaded from {exercise}.json
+# _config_file_for_exercise() in app.py: routes seated_overhead_press → overhead_press.json for config/flags
 ```
 
 ### Launch Inference API Server
@@ -55,6 +57,12 @@ curl -X POST http://localhost:8000/infer -H "Authorization: Bearer your-secret" 
 
 ### Run a Single Stage Directly (for debugging)
 ```bash
+# PowerShell tip: paths containing apostrophes (e.g. "Faiq's FYP") break with inline quoting.
+# Use variables instead:
+#   $py = "C:\Users\faiqf\Documents\Faiq's FYP\exevision_modelAI\.venv\Scripts\python.exe"
+#   $script = "C:\...\classify_views.py"
+#   & $py $script --exercise overhead_press --video-id 80863_1 --quality raw_unfiltered
+#
 # Stages use CWD as the workspace (pipeline.py runs them with cwd=workspace_root).
 # Set env vars that pipeline.py normally provides:
 export EXEVISION_MODEL_PATH=models/pose_landmarker_heavy.task
@@ -256,7 +264,13 @@ $env:EXEVISION_FACE_MODEL_PATH = "C:\Users\faiqf\Documents\Faiq's FYP\exevision_
 - `core/exevision/stages/temporal_segmentation.py` — FSM phase segmentation with strict legal sequences (squat + OHP paths)
 - `core/exevision/stages/scoring.py` — Rule-based AQA scoring and metrics
   - **Squat scoring:** View-dependent weights, 4 metrics (knee valgus, forward lean, depth, below_parallel)
-  - **OHP scoring (NEW):** View-independent, 5 biomechanical metrics in body-local 3D frame (grip_ratio, bar_path_deviation, ROM, lockout, elbow_flare); supports `overhead_press` and `seated_overhead_press` with identical metric logic
+  - **OHP scoring:** 3–4 biomechanical metrics depending on view. View-aware rules (Session 6):
+    - `grip_ratio`: excluded for `side` view only (shoulder width ≈ 0 from side → unreliable)
+    - `rom`: 2-component score — 50% top extension (`max_elbow_angle` vs `rom_top` thresholds) + 50% elbow-below-shoulder (raw Y comparison first, fallback `min_angle ≤ 110°`)
+    - `lockout`: all views; uses `use_2d=True` for `side` view (MediaPipe Z unreliable from side — arm extends toward/away from camera)
+    - `elbow_flare`: excluded from ALL diagonal views (`front_side`, `back_side`, `side`) — foreshortening effect
+    - `_ohp_rom()` returns `(min_angle, max_angle)` tuple; `_ohp_lockout()` and `_ohp_rom()` accept `use_2d` flag
+  - **Score discrepancy gotcha:** Desktop UI runs Stage 4 (classify_views) before scoring; CLI run without Stage 4 uses `view=unknown` which includes all 4 metrics. `front_side` view excludes grip_ratio + lockout → scores can differ dramatically for the same video
 - `core/exevision/stages/neural_fusion_inference.py` — Neural fusion stage (Step 9)
 
 **UI & Orchestration:**
@@ -337,7 +351,8 @@ Key thresholds: `MIN_LANDMARK_CONFIDENCE=0.4`, `MIN_KEY_JOINT_CONFIDENCE=0.5` (h
 - Use seated variant for training models robust to knee-occluded camera angles (common in seated shoulder press form videos)
 
 **Stage 4 — View Classification:** `core/exevision/stages/classify_views.py`
-Determine camera view (front/back/side) via eye visibility + shoulder width + nose-vs-hip Z-depth. Output: view label in feature JSON.
+Accepts `--exercise` param; scans `{exercise}/extracted_features_clean/{tier}/` and writes `info.view` in-place. `run_classification()` derives dirs internally from `exercise` param (no module-level global dependency).
+**OHP head-tilt fix:** During overhead press, the lifter's head tilts back at lockout, pushing `nose_z` behind hips and falsely signalling back-facing. Fix: video-level `has_any_forward_depth` flag in `get_view_label_with_probs` — if ANY frame had the nose in front of the hips, a majority back/back_side vote is overridden to front/front_side. MediaPipe visibility scores are unreliable for front/back discrimination (reports 1.00 for all landmarks regardless of facing direction); `face_detected` (BlazeFace) is used only when depth is ambiguous (None), not as a hard override.
 
 **Stage 5 — Temporal Segmentation:** `core/exevision/stages/temporal_segmentation.py` (Refactored 2026-05-05)
 
@@ -395,7 +410,13 @@ Key params: `DOWNWARD_VELOCITY_THRESHOLD=0.0015`, `UPWARD_VELOCITY_THRESHOLD=-0.
 
 **Stage 8 — Scoring & AQA:** `core/exevision/stages/scoring.py`
 - **Squat:** knee_angle, knee_valgus_ratio, forward_lean_deg, squat_depth. Thresholds view-dependent. Per-leg independent depth to avoid diagonal-view Z-drift. Output: `squat/aqa_analysis_simple/{quality}/{video_id}/aqa_simple.json`
-- **OHP / Seated OHP:** 5 biomechanical metrics in body-local 3D frame (grip_ratio, bar_path_deviation, ROM, lockout, elbow_flare). View-independent; body frame built from shoulder/hip landmarks. Config-driven thresholds from `overhead_press.json`. Output: `{exercise}/aqa_analysis_simple/{quality}/{video_id}/aqa_simple.json`
+- **OHP / Seated OHP:** View-aware scoring, 3–4 metrics depending on view:
+  - `grip_ratio`: all views except `side`; thresholds: ideal [0.20, 1.20], perfect 0.65, tolerance 0.90
+  - `rom`: all views; **2-component** — 50% top extension (`rom_top`: good=157°, bad=110°) + 50% elbow-below-shoulder (Y-coord check, fallback `min_elbow ≤ 110°`)
+  - `lockout`: all views; `max_elbow_angle`: good=150°, bad=135°; uses 2D angles for `side` view
+  - `elbow_flare`: `front`/`back` only — excluded from `side`, `front_side`, `back_side`
+  - `_ohp_rom()` → `(min_angle, max_angle)` tuple; angles use 2D (X,Y) for `side` view to avoid Z-depth noise
+  - Output: `{exercise}/aqa_analysis_simple/{quality}/{video_id}/aqa_simple.json`
 
 **Stage 9 — Neural Fusion:** `core/exevision/stages/neural_fusion_inference.py`
 `neural_score = clamp(heuristic + tanh(residual) × 40, 0, 100)`. Requires `bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt`. Output: merged AQA with neural scores + three-judge breakdown (BiLSTM/ST-GCN/Heuristic).

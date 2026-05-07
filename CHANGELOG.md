@@ -3,6 +3,99 @@
 > Older sessions archived here from `CLAUDE.md` Appendix A.
 > Latest sessions are kept inline in `CLAUDE.md` Appendix A for quick reference.
 
+## 2026-05-06 — Session 6: OHP Scoring Redesign (ROM, View-Aware Metrics, Side View Fix)
+
+**Focus:** Complete redesign of OHP ROM scoring; fix score discrepancy between desktop UI and CLI; fix side-view angle computation; relax thresholds based on real rep data.
+
+**scoring.py — `_score_overhead_press` / OHP helpers:**
+- `_ohp_rom()` now returns `(min_angle, max_angle)` tuple instead of single float
+- Added `_ohp_elbow_angle(frame, sh, el, wr, use_2d)` helper — uses `_angle_2d` for side views, `_angle_3d` otherwise; side view Z-depth from MediaPipe is unreliable when arm extends toward/away from camera
+- `_ohp_lockout()` and `_ohp_rom()` both accept `use_2d=True` flag, set automatically for `side` view in `_score_overhead_press`
+- Added `_ohp_elbow_below_shoulder(rep_frames, min_angle)` — checks raw Y coords first (elbow_y > shoulder_y across all rep frames), falls back to `min_angle <= 110°`
+- **ROM redesigned as 2-component score:** 50% top extension (`score_metric_linear` on `max_elbow_rom` vs `rom_top` thresholds) + 50% elbow-below-shoulder (binary)
+- **Grip ratio:** excluded for `side` view only (shoulder width ≈ 0 makes measurement unreliable)
+- **Elbow flare:** excluded from ALL diagonal views (`side`, `front_side`, `back_side`) — foreshortening effect
+- Grip ratio thresholds relaxed: ideal [0.40→0.20, 0.95→1.20], tolerance 0.60→0.90
+
+**overhead_press.json:**
+- Replaced `min_elbow_angle` metric with `rom_top` (good=157°, bad=110°) and `rom_bottom` (note only — binary check in code)
+- `max_elbow_angle`: good 158°→**150°**, bad 135° (unchanged) — recalibrated to real rep data
+- Removed `diagonal_offset` from `elbow_flare` (elbow_flare now fully excluded on diagonal views)
+- Updated `field_mapping`: `min_elbow_angle→rom_range`, `max_elbow_angle→lockout`
+
+**Root cause diagnosed — Desktop UI vs CLI score discrepancy:**
+- Desktop UI runs Stage 4 (classify_views) → view becomes `front_side` → grip_ratio + lockout excluded → only 2 metrics scored
+- CLI without Stage 4 → `view=unknown` → all 4 metrics included → completely different weighted average
+- Fix: always run `classify_views.py` before `scoring.py`
+
+---
+
+## 2026-05-06 — Session 5: OHP View Classification Fix + View-Aware Scoring Calibration
+
+**Focus:** Fix incorrect view classification for OHP videos (head-tilt during press fools depth signal). Recalibrate OHP scoring thresholds to match real athlete data. Add view-aware scoring so side/diagonal views are not penalised for metrics that can't be measured from those angles.
+
+**classify_views.py:**
+- Added video-level `has_any_forward_depth` flag in `get_view_label_with_probs`: if any frame shows nose definitively in front of hips, a majority back/back_side vote is overridden to front/front_side — handles OHP head tilt at lockout corrupting the per-frame depth signal
+- Reverted frame-level logic to simple depth-first; `face_detected`/`any_face` only used as fallback when depth is ambiguous (None)
+- Key finding: MediaPipe visibility scores are all 1.00 regardless of facing direction — useless as a front/back discriminator; BlazeFace (`face_detected`) has low recall for OHP videos
+
+**scoring.py — `_score_overhead_press`:**
+- Added `view` parameter (default `"front"`)
+- `side`, `front_side`, `back_side` views: grip_ratio and lockout **excluded from weighted average** (arm/wrist axis collapses into camera line of sight — measurements unreliable)
+- elbow_flare for diagonal views: shifted +`diagonal_offset` degrees (from config, default 15°) before scoring to compensate for apparent foreshortening
+- Call site updated to pass `view=view`
+
+**overhead_press.json — threshold recalibration (based on 4 verified good reps):**
+- `grip_ratio`: ideal 0.05–0.25 → **0.40–0.95**; perfect 0.15 → 0.65; tolerance 0.30 → 0.60
+- `min_elbow_angle`: full_rom 75° → **85°**; partial 90° → **115°**
+- `max_elbow_angle`: good 165° → **158°**; bad 145° → **135°**
+- `elbow_flare`: ideal 30–60° → **90–150°** (measurement is during concentric press, not static bottom position); bad_low 20° → 60°; bad_high 70° → 175°; added `diagonal_offset: 15.0`
+
+---
+
+## 2026-05-06 — Session 4: Desktop UI OHP/Seated OHP Integration + Stage Pipeline Fixes
+
+**Focus:** Full `overhead_press` and `seated_overhead_press` support in the desktop UI (inference + annotation tabs). Stage pipeline I/O consistency fixes for Stages 4 and 5.
+
+**Stage fixes:**
+- `classify_views.py`: `run_classification()` now accepts `exercise` param and derives dirs via `_build_features_dirs(exercise)` internally — no longer depends on module-level global reassignment from `__main__`. Fixed stray `print('='*70)` at module level (was executing on every import).
+- `temporal_segmentation.py`: Added `CURRENT_EXERCISE = "squat"` module-level default — was only assigned inside `if __name__ == "__main__":`, causing latent `NameError` if `create_segmentation_visualization()` was ever called from an import context.
+
+**Desktop UI (`apps/desktop-ui/app.py`):**
+- Inference dropdown: added `seated_overhead_press`; `analyze_results` stage now squat-only in `_build_stages`; `dataset_var` clears for non-squat exercises in `_on_exercise_changed`
+- All inference output-discovery methods parameterised with `self.exercise_var.get()`: `_find_score_json`, `_find_analysis_summary_json`, `_find_neural_json`, `_find_annotated_videos`, `_set_preview_outputs`, `_find_original_video_for_overlay`, `_load_selected_preview`, `_update_metadata_display` (9 methods, 12 path fixes)
+- Scoring display: `_metric_specs()` exercise-aware (OHP returns grip_ratio/rom/lockout/elbow_flare); `_build_rep_diagnostics()` uses dynamic metric keys; `_build_metric_diagnostic()` guards `get_view_thresholds` with `.get()` to avoid KeyError on OHP metrics
+- Annotation tab: independent `self._annotation_exercise_var`; exercise combobox inside folder frame; `_on_annotation_exercise_changed()` rebuilds flags and clears folder state
+- Annotation flags: replaced hardcoded squat list with `_build_annotation_flag_defs()` + `_rebuild_annotation_flags()` — reads from `{exercise}.json` config via `_config_file_for_exercise()` helper; F1-F7 hotkeys rebind on exercise change
+- Annotation paths: all `_build_annotation_payload_from_run`, `_find_existing_pipeline_output`, `_find_overlay_from_pipeline_outputs` use `_annotation_exercise_var`
+- Annotation pipeline threads (`_pipeline_thread`, `_batch_pipeline_thread`): workspace dir now uses annotation exercise; stages built via `_build_stages(_ann_exercise)` not global `STAGES`
+- `_run_pipeline_stage`: now passes `--exercise` flag to all stage subprocesses
+- Processed-video scan: scans all three exercise namespaces so green/red listbox colouring works across exercises
+
+**New helpers in app.py:**
+- `CONFIG_EXERCISES_DIR` — `Path` constant pointing to `core/exevision/config/exercises/`
+- `_config_file_for_exercise(exercise)` — routes `seated_overhead_press → overhead_press` for config/flag loading
+
+**Config:**
+- `squat.json`: added `annotation_flags` and `annotation_metrics` (mirrors `overhead_press.json` structure)
+
+---
+
+## 2026-05-06 — Session 3
+
+Removed invalid `bar_path_deviation` metric from Overhead Press scoring and rebalanced weights.
+
+- Rationale: bar path cannot be reliably inferred from pose landmarks (wrist != bar).
+- Code: removed `_ohp_bar_path_deviation()` and `_score_ohp_bar_path()` in `core/exevision/stages/scoring.py`.
+- Config: updated `core/exevision/config/exercises/overhead_press.json` (4 metrics, 0.25 weights).
+- Tests: removed bar_path unit tests from `tests/test_ohp_scoring.py`.
+- Docs: updated `CLAUDE.md` to reflect removal and rebalancing.
+
+Next planned work:
+1. Add view classifier and integrate into pipeline (next, in-progress).
+2. Recalibrate OHP scoring thresholds to match elite lifter data.
+3. Run full test suite and re-run AQA on sample dataset.
+
 ---
 
 ## Session 2026-05-06 (2) — Stage 8 OHP Scoring: 5 Biomechanical Metrics
