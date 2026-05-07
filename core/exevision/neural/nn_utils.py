@@ -7,14 +7,14 @@ from typing import Dict, Iterable, List, Optional
 
 import numpy as np
 
-# MediaPipe indices used by the project (11 active joints after foot consolidation)
+# ---------------------------------------------------------------------------
+# Squat skeleton (11 joints: head, shoulders, hips, knees, ankles)
+# Used by: squat models, squat Phase 1 pretraining, squat Phase 2 finetuning
+# ---------------------------------------------------------------------------
 ACTIVE_JOINTS = [0, 1, 2, 11, 12, 23, 24, 25, 26, 27, 28]
 NUM_ACTIVE_JOINTS = 11
-
-# Mapping from MediaPipe index to local index (0-10)
 MP_TO_LOCAL = {mp_idx: local_idx for local_idx, mp_idx in enumerate(ACTIVE_JOINTS)}
 
-# Bone edges using LOCAL indices (not MediaPipe indices)
 BONE_EDGES = [
     (0, 1), (0, 2),
     (1, 3), (2, 4),
@@ -24,16 +24,12 @@ BONE_EDGES = [
     (5, 7), (6, 8),
     (7, 9), (8, 10),
 ]
-
-# Biomechanical symmetry edges (domain knowledge for squat analysis)
-SYMMETRY_EDGES = [
-    (7, 8),
-    (9, 10),
-]
-
+# Symmetry edges for squat: knee-knee and ankle-ankle pairs
+SYMMETRY_EDGES = [(7, 8), (9, 10)]
 ALL_EDGES = BONE_EDGES + SYMMETRY_EDGES
+HIP_LOCAL_INDICES = [5, 6]   # local indices of L_HIP, R_HIP in squat skeleton
 
-# BiLSTM signal channels
+# BiLSTM signal channels for squat
 BILSTM_SIGNAL_KEYS = [
     "normalized_hip_displacement",
     "window_velocity",
@@ -42,11 +38,53 @@ BILSTM_SIGNAL_KEYS = [
 ]
 NUM_BILSTM_CHANNELS = len(BILSTM_SIGNAL_KEYS)
 
-# Fixed sequence length for padding/truncation
-FIXED_SEQ_LEN = 128
+# ---------------------------------------------------------------------------
+# OHP skeleton (10 joints: shoulders, elbows, wrists, hips, knees)
+# Used by: OHP models, OHP Phase 1 pretraining, OHP Phase 2+ finetuning
+# Designed for upper-body form detection (arm alignment, grip, ROM, flare)
+# ---------------------------------------------------------------------------
+OHP_ACTIVE_JOINTS = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26]
+# Local mapping:
+#   0=L_SHOULDER(11), 1=R_SHOULDER(12)
+#   2=L_ELBOW(13),    3=R_ELBOW(14)
+#   4=L_WRIST(15),    5=R_WRIST(16)
+#   6=L_HIP(23),      7=R_HIP(24)
+#   8=L_KNEE(25),     9=R_KNEE(26)
+NUM_OHP_ACTIVE_JOINTS = 10
+OHP_MP_TO_LOCAL = {mp_idx: local_idx for local_idx, mp_idx in enumerate(OHP_ACTIVE_JOINTS)}
 
-# ST-GCN input channels per joint: x, y, z, visibility, vx, vy, vz
-STGCN_CHANNELS = 7
+OHP_BONE_EDGES = [
+    (0, 1),   # shoulder bridge
+    (0, 2), (2, 4),   # L arm chain: shoulder-elbow-wrist
+    (1, 3), (3, 5),   # R arm chain: shoulder-elbow-wrist
+    (0, 6), (1, 7),   # torso: shoulder-hip
+    (6, 7),           # hip bridge
+    (6, 8), (7, 9),   # legs: hip-knee
+]
+# Symmetry edges for OHP: L-R pairs across upper and lower body
+OHP_SYMMETRY_EDGES = [(0, 1), (2, 3), (4, 5), (8, 9)]
+OHP_ALL_EDGES = OHP_BONE_EDGES + OHP_SYMMETRY_EDGES
+OHP_HIP_LOCAL_INDICES = [6, 7]   # local indices of L_HIP, R_HIP in OHP skeleton
+
+# BiLSTM signal channels for OHP (8 channels)
+# Channels 0-3 already exist in segmented JSON; 4-7 are NEW (computed by temporal_segmentation.py)
+BILSTM_SIGNAL_KEYS_OHP = [
+    "normalized_hip_displacement",   # wrist Y signal (misleading name kept for compat)
+    "window_velocity",
+    "knee_angles",
+    "landmark_confidence",
+    "elbow_angles_avg",              # mean(L_elbow_angle, R_elbow_angle) — ROM, lockout, smoothness
+    "wrist_lr_diff_y",               # L_wrist_y - R_wrist_y — lift stability (asymmetry)
+    "shoulder_lr_diff_y",            # L_shoulder_y - R_shoulder_y — torso lateral lean
+    "wrist_acceleration",            # derivative of wrist velocity — control/smoothness
+]
+NUM_OHP_BILSTM_CHANNELS = len(BILSTM_SIGNAL_KEYS_OHP)
+
+# ---------------------------------------------------------------------------
+# Shared constants
+# ---------------------------------------------------------------------------
+FIXED_SEQ_LEN = 128
+STGCN_CHANNELS = 7   # per joint: x, y, z, visibility, vx, vy, vz
 
 
 def _as_path(path_like: str | Path) -> Path:
@@ -96,10 +134,18 @@ def _discover_segmented_files(segmented_dir: str | Path) -> List[Path]:
     return sorted(path for path in segmented_root.rglob("*_segmented.json") if path.is_file())
 
 
-def _extract_rep_matrix(seg_data: dict, rep: dict) -> Optional[np.ndarray]:
+def _extract_rep_matrix(seg_data: dict, rep: dict,
+                         exercise: str = "squat") -> Optional[np.ndarray]:
+    """Extract BiLSTM input matrix for a rep.
+
+    Uses OHP signal keys (8 channels) for overhead_press exercises,
+    squat signal keys (4 channels) for squat.
+    """
+    is_ohp = exercise in ("overhead_press", "seated_overhead_press")
+    keys = BILSTM_SIGNAL_KEYS_OHP if is_ohp else BILSTM_SIGNAL_KEYS
     signals = seg_data.get("signals", {})
     arrays = []
-    for key in BILSTM_SIGNAL_KEYS:
+    for key in keys:
         values = signals.get(key, [])
         arrays.append(_to_float_array(values))
 
@@ -153,6 +199,7 @@ def load_bilstm_reps(features_dir, segmented_dir, max_videos=None):
 
 
 def _extract_active_joints(frame: np.ndarray) -> np.ndarray:
+    """Extract squat skeleton joints from a MediaPipe frame."""
     joints = np.zeros((NUM_ACTIVE_JOINTS, frame.shape[-1]), dtype=np.float32)
     for mp_idx, local_idx in MP_TO_LOCAL.items():
         if mp_idx < frame.shape[0]:
@@ -160,13 +207,30 @@ def _extract_active_joints(frame: np.ndarray) -> np.ndarray:
     return joints
 
 
-def _normalize_stgcn_sequence(sequence: np.ndarray, body_scale: float) -> np.ndarray:
+def _extract_active_joints_ohp(frame: np.ndarray) -> np.ndarray:
+    """Extract OHP skeleton joints (shoulders, elbows, wrists, hips, knees)."""
+    joints = np.zeros((NUM_OHP_ACTIVE_JOINTS, frame.shape[-1]), dtype=np.float32)
+    for mp_idx, local_idx in OHP_MP_TO_LOCAL.items():
+        if mp_idx < frame.shape[0]:
+            joints[local_idx] = frame[mp_idx]
+    return joints
+
+
+def _normalize_stgcn_sequence(sequence: np.ndarray, body_scale: float,
+                               hip_indices: list = None) -> np.ndarray:
+    """Normalize ST-GCN sequence: scale by body size, center on hip midpoint.
+
+    hip_indices: local joint indices of [L_HIP, R_HIP] for centering.
+                 Defaults to squat HIP_LOCAL_INDICES = [5, 6].
+    """
+    if hip_indices is None:
+        hip_indices = HIP_LOCAL_INDICES
     normalized = sequence.astype(np.float32, copy=True)
     if body_scale is None or not np.isfinite(body_scale) or body_scale <= 0:
         body_scale = 1.0
     normalized[:, :, :3] /= float(body_scale)
     for frame_idx in range(normalized.shape[0]):
-        hips = normalized[frame_idx, [5, 6], :3]
+        hips = normalized[frame_idx, hip_indices, :3]
         if hips.shape[0] < 2:
             continue
         hip_mid = hips.mean(axis=0)
@@ -183,7 +247,17 @@ def _compute_velocity(sequence: np.ndarray, fps: float) -> np.ndarray:
     return velocity
 
 
-def _extract_stgcn_rep(seg_data: dict, feature_data: dict, rep: dict) -> Optional[np.ndarray]:
+def _extract_stgcn_rep(seg_data: dict, feature_data: dict, rep: dict,
+                        exercise: str = "squat") -> Optional[np.ndarray]:
+    """Extract ST-GCN input sequence for a rep.
+
+    Uses OHP skeleton (10 joints: shoulders/elbows/wrists/hips/knees) for
+    overhead_press exercises, squat skeleton (11 joints) for squat.
+    """
+    is_ohp = exercise in ("overhead_press", "seated_overhead_press")
+    joint_extractor = _extract_active_joints_ohp if is_ohp else _extract_active_joints
+    hip_indices = OHP_HIP_LOCAL_INDICES if is_ohp else HIP_LOCAL_INDICES
+
     keypoints_img = feature_data.get("keypoints_img", []) or []
     if not keypoints_img:
         return None
@@ -206,7 +280,7 @@ def _extract_stgcn_rep(seg_data: dict, feature_data: dict, rep: dict) -> Optiona
         frame_array = np.asarray(frame, dtype=np.float32)
         if frame_array.ndim != 2 or frame_array.shape[1] < 4:
             return None
-        joints = _extract_active_joints(frame_array)
+        joints = joint_extractor(frame_array)
         frame_arrays.append(joints)
 
     sequence = np.stack(frame_arrays, axis=0).astype(np.float32, copy=False)
@@ -215,7 +289,7 @@ def _extract_stgcn_rep(seg_data: dict, feature_data: dict, rep: dict) -> Optiona
     body_scale = seg_data.get("info", {}).get("calibration", {}).get("body_scale", 1.0)
     fps = float(feature_data.get("info", {}).get("fps", seg_data.get("info", {}).get("fps", 30.0)))
 
-    sequence = _normalize_stgcn_sequence(sequence, body_scale)
+    sequence = _normalize_stgcn_sequence(sequence, body_scale, hip_indices=hip_indices)
     velocity = _compute_velocity(sequence, fps)
 
     visibility = sequence[:, :, 3:4]
@@ -296,25 +370,30 @@ def pad_or_truncate(seq, target_len=FIXED_SEQ_LEN):
     return np.concatenate([array, padding], axis=0).astype(np.float32, copy=False)
 
 
-def build_adjacency_matrix():
-    """
-    Build the normalized adjacency matrix for the 11-joint skeleton graph.
-
-    Returns: numpy array of shape (11, 11), float32
-
-    Steps:
-        1. Create binary adjacency A from ALL_EDGES (undirected: add both directions)
-        2. Add self-loops: A = A + I
-        3. Degree-normalize: D^{-1/2} @ A @ D^{-1/2}
-    """
-    adjacency = np.zeros((NUM_ACTIVE_JOINTS, NUM_ACTIVE_JOINTS), dtype=np.float32)
-    for src, dst in ALL_EDGES:
+def _build_normalized_adjacency(n_joints: int, edges: list) -> np.ndarray:
+    """Shared helper: build degree-normalized adjacency matrix with self-loops."""
+    adjacency = np.zeros((n_joints, n_joints), dtype=np.float32)
+    for src, dst in edges:
         adjacency[src, dst] = 1.0
         adjacency[dst, src] = 1.0
-    adjacency += np.eye(NUM_ACTIVE_JOINTS, dtype=np.float32)
+    adjacency += np.eye(n_joints, dtype=np.float32)
     degrees = adjacency.sum(axis=1)
     inv_sqrt_deg = np.zeros_like(degrees, dtype=np.float32)
     nonzero = degrees > 0
     inv_sqrt_deg[nonzero] = np.power(degrees[nonzero], -0.5)
     normalized = inv_sqrt_deg[:, None] * adjacency * inv_sqrt_deg[None, :]
     return normalized.astype(np.float32, copy=False)
+
+
+def build_adjacency_matrix() -> np.ndarray:
+    """Normalized adjacency matrix for the squat 11-joint skeleton. Shape (11, 11)."""
+    return _build_normalized_adjacency(NUM_ACTIVE_JOINTS, ALL_EDGES)
+
+
+def build_adjacency_matrix_ohp() -> np.ndarray:
+    """Normalized adjacency matrix for the OHP 10-joint skeleton. Shape (10, 10).
+
+    OHP skeleton: shoulders, elbows, wrists, hips, knees.
+    Includes upper-body arm chains and L-R symmetry edges.
+    """
+    return _build_normalized_adjacency(NUM_OHP_ACTIVE_JOINTS, OHP_ALL_EDGES)

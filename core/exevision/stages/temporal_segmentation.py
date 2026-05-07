@@ -753,6 +753,61 @@ class BiomechanicalAnalyzer:
         self._interpolate_array(self.knee_angles)
         return self.knee_angles
     
+    def compute_ohp_signals(self) -> None:
+        """Compute OHP-specific BiLSTM channels not present in squat segmentation.
+
+        Writes to self: elbow_angles_avg, wrist_lr_diff_y,
+                        shoulder_lr_diff_y, wrist_acceleration.
+        Only call this for overhead_press / seated_overhead_press exercises.
+        """
+        n = len(self.keypoints)
+        elbow_angles = np.full(n, np.nan, dtype=np.float32)
+        wrist_lr = np.zeros(n, dtype=np.float32)
+        shoulder_lr = np.zeros(n, dtype=np.float32)
+
+        for i, frame in enumerate(self.keypoints):
+            if frame is None or len(frame) < 17:
+                continue
+            # Elbow angles: shoulder-elbow-wrist for L and R
+            l_sh = np.array(frame[L_SHOULDER][:3])
+            l_el = np.array(frame[L_ELBOW][:3])
+            l_wr = np.array(frame[L_WRIST][:3])
+            r_sh = np.array(frame[R_SHOULDER][:3])
+            r_el = np.array(frame[R_ELBOW][:3])
+            r_wr = np.array(frame[R_WRIST][:3])
+
+            l_conf = min(frame[L_SHOULDER][3], frame[L_ELBOW][3], frame[L_WRIST][3])
+            r_conf = min(frame[R_SHOULDER][3], frame[R_ELBOW][3], frame[R_WRIST][3])
+
+            angles = []
+            if l_conf >= MIN_LANDMARK_CONFIDENCE:
+                angles.append(self._calculate_angle(l_sh, l_el, l_wr))
+            if r_conf >= MIN_LANDMARK_CONFIDENCE:
+                angles.append(self._calculate_angle(r_sh, r_el, r_wr))
+            if angles:
+                elbow_angles[i] = float(np.mean(angles))
+
+            # Wrist L-R asymmetry (Y axis — positive = left higher than right)
+            if frame[L_WRIST][3] >= MIN_LANDMARK_CONFIDENCE and frame[R_WRIST][3] >= MIN_LANDMARK_CONFIDENCE:
+                wrist_lr[i] = float(frame[L_WRIST][1] - frame[R_WRIST][1])
+
+            # Shoulder L-R asymmetry (Y axis — torso lateral lean)
+            if frame[L_SHOULDER][3] >= MIN_LANDMARK_CONFIDENCE and frame[R_SHOULDER][3] >= MIN_LANDMARK_CONFIDENCE:
+                shoulder_lr[i] = float(frame[L_SHOULDER][1] - frame[R_SHOULDER][1])
+
+        # Interpolate NaN gaps in elbow angles
+        self.elbow_angles_avg = elbow_angles
+        self._interpolate_array(self.elbow_angles_avg)
+
+        self.wrist_lr_diff_y = wrist_lr
+        self.shoulder_lr_diff_y = shoulder_lr
+
+        # Wrist acceleration = derivative of primary displacement velocity
+        if self.velocity_signal is not None:
+            self.wrist_acceleration = np.gradient(self.velocity_signal).astype(np.float32)
+        else:
+            self.wrist_acceleration = np.zeros(n, dtype=np.float32)
+
     def compute_velocity_signal(self) -> np.ndarray:
         """
         Compute smoothed velocity of hip displacement.
@@ -1296,6 +1351,8 @@ class TemporalSegmenter:
             self.analyzer.compute_velocity_signal()
             self.analyzer.compute_window_velocities()
             self.analyzer.compute_valid_frame_mask()
+            if self.exercise.lower() in ("overhead_press", "seated_overhead_press"):
+                self.analyzer.compute_ohp_signals()
             
             # Step 4: Window-based FSM phase detection
             self.state_machine = SquatStateMachine(self.analyzer, self.fps)
@@ -1347,7 +1404,13 @@ class TemporalSegmenter:
                     "window_velocity": self.analyzer.window_velocities.tolist(),
                     "raw_velocity": self.analyzer.velocity_signal.tolist(),
                     "knee_angles": self.analyzer.knee_angles.tolist(),
-                    "landmark_confidence": self.analyzer.landmark_confidence.tolist()
+                    "landmark_confidence": self.analyzer.landmark_confidence.tolist(),
+                    **({
+                        "elbow_angles_avg": self.analyzer.elbow_angles_avg.tolist(),
+                        "wrist_lr_diff_y": self.analyzer.wrist_lr_diff_y.tolist(),
+                        "shoulder_lr_diff_y": self.analyzer.shoulder_lr_diff_y.tolist(),
+                        "wrist_acceleration": self.analyzer.wrist_acceleration.tolist(),
+                    } if self.exercise.lower() in ("overhead_press", "seated_overhead_press") else {})
                 }
             }
             

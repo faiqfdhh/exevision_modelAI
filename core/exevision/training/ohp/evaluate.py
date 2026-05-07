@@ -16,7 +16,7 @@ for _p in [str(_NEURAL), str(_OHP_NEURAL), str(_TRAIN_OHP)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from nn_utils import build_adjacency_matrix
+from nn_utils import build_adjacency_matrix_ohp
 from ohp.models import OHPBiLSTMScorer, OHPSTGCNScorer
 from ohp.fusion import build_ohp_fusion
 from data import build_dataloaders
@@ -53,7 +53,7 @@ def evaluate(
     if "test" not in loaders:
         raise RuntimeError("No test split found")
 
-    A = torch.tensor(build_adjacency_matrix())
+    A = torch.tensor(build_adjacency_matrix_ohp())
     bilstm = OHPBiLSTMScorer().to(device)
     stgcn = OHPSTGCNScorer(A).to(device)
     fusion = build_ohp_fusion().to(device)

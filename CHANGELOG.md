@@ -3,6 +3,106 @@
 > Older sessions archived here from `CLAUDE.md` Appendix A.
 > Latest sessions are kept inline in `CLAUDE.md` Appendix A for quick reference.
 
+## 2026-05-08 — Fix Squat-Derived Components in OHP Path
+
+**Problem:** Three squat-centric components were inherited by the OHP neural path.
+They worked for Phase 2 (knee error detection, which only needs knee joints) but would
+block Phase 3 arm-form labels (grip, ROM, elbow flare, smoothness, lift stability).
+
+**What was wrong and why it mattered:**
+
+| Component | Problem | Impact on Phase 3 |
+|-----------|---------|-------------------|
+| `ACTIVE_JOINTS` (11 joints: head/shoulders/hips/knees/ankles) | **No elbows (13,14) or wrists (15,16)** | ST-GCN literally cannot see arm movement |
+| `SYMMETRY_EDGES = [(7,8),(9,10)]` | Knee/ankle pairs — squat-domain knowledge | Wrong graph structure for OHP upper-body |
+| `BILSTM_SIGNAL_KEYS` (4 channels) | No elbow angles, no L-R asymmetry signals | BiLSTM cannot detect smoothness or lift stability |
+
+**Why Phase 2 still worked despite these issues:**
+- Phase 2 quality target = heuristic_score (no arm-specific knowledge needed)
+- Phase 2 error target = knee error (knees ARE in `ACTIVE_JOINTS`)
+- The signals present (wrist Y, velocity, knee angles) were sufficient for Phase 2 labels
+
+**Changes made:**
+
+`core/exevision/neural/nn_utils.py`:
+- Added `OHP_ACTIVE_JOINTS = [11,12,13,14,15,16,23,24,25,26]` — 10 joints: shoulders, elbows, wrists, hips, knees
+- Added `NUM_OHP_ACTIVE_JOINTS = 10`, `OHP_MP_TO_LOCAL`
+- Added `OHP_BONE_EDGES` — arm chains (shoulder→elbow→wrist) + torso + legs
+- Added `OHP_SYMMETRY_EDGES = [(0,1),(2,3),(4,5),(8,9)]` — L-R shoulder/elbow/wrist/knee pairs
+- Added `OHP_HIP_LOCAL_INDICES = [6, 7]` for centering normalization
+- Added `BILSTM_SIGNAL_KEYS_OHP` (8 channels): original 4 + `elbow_angles_avg`, `wrist_lr_diff_y`, `shoulder_lr_diff_y`, `wrist_acceleration`
+- Added `NUM_OHP_BILSTM_CHANNELS = 8`
+- Added `build_adjacency_matrix_ohp()` for 10-joint OHP graph
+- Added `_extract_active_joints_ohp()` for OHP joint extraction
+- Updated `_normalize_stgcn_sequence()` to accept `hip_indices` param (default squat [5,6], OHP [6,7])
+- Updated `_extract_rep_matrix()` and `_extract_stgcn_rep()` to accept `exercise` param → routes to OHP paths automatically
+- Squats: unchanged (all original constants still exist)
+
+`core/exevision/stages/temporal_segmentation.py`:
+- Added `compute_ohp_signals()` to Analyzer class — computes: `elbow_angles_avg` (shoulder-elbow-wrist angle), `wrist_lr_diff_y` (lift stability), `shoulder_lr_diff_y` (torso lateral lean), `wrist_acceleration` (smoothness/control)
+- Called automatically for OHP exercises in Step 3 of segmentation
+- New signals written to segmented JSON `signals` dict for OHP only (squat JSON unchanged)
+
+`core/exevision/neural/ohp/models.py`:
+- `OHPBiLSTMScorer` now uses `NUM_OHP_BILSTM_CHANNELS = 8` (was `NUM_BILSTM_CHANNELS = 4`)
+- `OHPSTGCNScorer` now expects adjacency matrix from `build_adjacency_matrix_ohp()` (10×10, not 11×11)
+
+`core/exevision/training/ohp/data.py`, `finetune.py`, `evaluate.py`, `inference.py`:
+- All now use `build_adjacency_matrix_ohp()`, `NUM_OHP_ACTIVE_JOINTS`, pass `exercise="overhead_press"` to extraction functions
+
+**Impact on existing Phase 2 models:**
+- `bilstm_ohp_phase2.pt` and `stgcn_ohp_phase2.pt` are **invalidated** — architecture changed (4→8 BiLSTM channels, 11→10 ST-GCN joints)
+- Phase 2 will need to be **re-run** before using these models in inference
+- This was planned — Phase 3 retraining was already required; this just adds Phase 2 re-run
+
+**What this enables for Phase 3:**
+- ST-GCN can now see elbows and wrists → can detect grip width, elbow flare, ROM
+- BiLSTM gets 4 new channels → can detect smoothness (elbow_angles_avg), control (wrist_acceleration), lift stability (wrist_lr_diff_y, shoulder_lr_diff_y)
+- All 29 tests passing
+
+---
+
+## NEXT SESSION — What to pick up
+
+**State of the codebase:**
+- Phase 1 (self-supervised pretraining): ✅ Complete — BiLSTM + ST-GCN pretrained on ~2.8k unlabeled OHP videos
+- Phase 2 (FitnessAQA fine-tuning): ✅ Complete — standing OHP only, knee error detection (AUC 0.702), quality (MAE 0.095)
+- Seated OHP: pretrained encoder only, no Phase 2 model, returns `neural_available: false` at inference
+- Squat: unchanged, fully working
+
+**What the neural model currently outputs (standing OHP only):**
+```json
+{ "neural_score": 72.4, "knee_error_prob": 0.83, "neural_available": true }
+```
+
+**What is NOT done yet:**
+
+### Priority 1 — Wire `knee_error_prob` into feedback engine
+- `core/exevision/feedback/engine.py` — currently ignores `knee_error_prob` entirely
+- When `knee_error_prob > threshold` (suggest 0.5), feedback should say something like "Your knees showed instability during the press — focus on keeping them tracking over your toes"
+- Need to define threshold, feedback text, and where in the feedback JSON it surfaces
+- Check `apps/api/pipeline.py` `collect_results()` to see if `knee_error_prob` is already passed through to the result payload
+
+### Priority 2 — Wire Stage 9 into desktop UI (Active Issue #4)
+- `apps/desktop-ui/app.py` runs stages 2.5→4→5→8 only (heuristic-only)
+- Stage 9 (`neural_fusion_inference.py`) exists and works in API pipeline but not desktop UI
+- Add neural toggle checkbox to UI; when enabled, run Stage 9 after Stage 8
+- Standing OHP will now show `knee_error_prob` in desktop results
+
+### Priority 3 — Phase 3: Manual annotation + fusion retraining (separate plan)
+- AUC ceiling at 0.70 with FitnessAQA labels (noisy, pose-based)
+- Manual annotation of a subset of videos with explicit error labels → cleaner training signal
+- Retrain fusion layer on manually annotated data
+- Could push knee AUC to 0.80+
+- Separate brainstorm + plan required before starting
+
+### Known limitations to document before Phase 3:
+- `knee_error_prob` is a probability, not a diagnosis — 0.83 means "likely knee error" not "definite knee error"
+- AUC 0.70 means ~30% of predictions are wrong at threshold 0.5
+- Seated OHP never gets knee feedback (by design — legs zeroed)
+
+---
+
 ## 2026-05-08 — OHP Phase 2 Complete: Standing OHP Knee Error Detection
 
 **Status: COMPLETE ✅**

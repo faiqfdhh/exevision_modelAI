@@ -2329,6 +2329,156 @@ git commit -m "docs: record OHP Phase 2 fine-tuning results"
 ## What this plan deliberately does NOT cover
 
 - Phase 3 (manual annotation fine-tuning and fusion calibration) — separate plan
-- Feedback engine integration of `elbow_error_prob` / `knee_error_prob` — part of Phase 3 plan
+- Feedback engine integration of `knee_error_prob` — part of Phase 3 plan
 - Desktop UI neural toggle for OHP — deferred until Phase 3 models are ready
-- `seated_overhead_press` seated-variant Stage 5 run — seated features reuse OHP segmentation paths, so a separate Stage 5 run is not required
+
+---
+
+## Actual Outcomes (completed 2026-05-08)
+
+**What changed from original plan:**
+- Elbow error head dropped entirely — FitnessAQA elbow labels too subtle/strict to be useful signal
+- Seated OHP dropped from Phase 2 — leg landmarks are zeroed, FitnessAQA knee labels don't apply. `bilstm_seated_ohp_pretrained.pt` / `stgcn_seated_ohp_pretrained.pt` remain as Phase 1 pretrained-only and are untouched
+- Soft overlap ratio labels replaced with binary labels (per FitnessAQA paper §5)
+- Quality target decoupled from error labels (using heuristic_score directly)
+
+**Final results:**
+- MAE: 0.095 ✅ | Knee AUC: 0.702 ✅
+- Checkpoints: `bilstm_ohp_phase2.pt`, `stgcn_ohp_phase2.pt`, `fusion_ohp_phase2.pt`
+
+---
+
+## Phase 3 Preview — Hybrid Three-Judge Fusion Calibration
+
+> **Project context:** ExeVision is a hybrid three-judge AQA system (Heuristic + BiLSTM + ST-GCN). The thesis is that fusion across rule-based, temporal, and spatial models is more robust than any single judge. Phase 3's goal is **fusion ≈ human score**.
+
+**Phase 3 requires a separate brainstorm + plan.** This section captures key design decisions and known blockers.
+
+---
+
+### Squat-Derived Components Still in OHP Path (must address before Phase 3)
+
+These components were designed for squat and remain in shared `nn_utils.py`:
+
+| Component | Current state | Phase 3 action |
+|-----------|--------------|----------------|
+| `ACTIVE_JOINTS = [0,1,2,11,12,23,24,25,26,27,28]` | Head, shoulders, hips, knees, ankles. **No elbows or wrists.** | Add `OHP_ACTIVE_JOINTS` including elbows (13,14) and wrists (15,16). Required for ST-GCN to see arm form. |
+| `SYMMETRY_EDGES = [(7,8),(9,10)]` | Knee/ankle pairs (squat domain knowledge) | Add `OHP_SYMMETRY_EDGES` for shoulder/elbow/wrist L-R pairs. |
+| `BILSTM_SIGNAL_KEYS["normalized_hip_displacement"]` | Misleading name. For OHP contains wrist Y. Data correct, naming confusing. | Rename to `primary_displacement` or add `wrist_displacement` field. Cosmetic but worth doing. |
+| `BILSTM_SIGNAL_KEYS["knee_angles"]` | Used for knee error detection (worked in Phase 2). | Keep, but add `elbow_angles`, `wrist_lr_diff_y`, `shoulder_lr_diff_y` channels for arm/asymmetry signals. |
+
+**Critical blocker:** ST-GCN cannot detect arm form errors (grip, ROM, elbow flare) without elbows/wrists in the joint set. Phase 2 worked for knee detection because knees ARE in `ACTIVE_JOINTS`. Phase 3 arm labels need this fix first.
+
+**RESOLVED (2026-05-08):** Option B implemented — `nn_utils.py` now has OHP-specific
+joint set, adjacency matrix, and BiLSTM channels. Squat path unchanged.
+Phase 2 models invalidated and must be re-run before Phase 3.
+All new signals (`elbow_angles_avg`, `wrist_lr_diff_y`, `shoulder_lr_diff_y`,
+`wrist_acceleration`) computed by `temporal_segmentation.py` for OHP exercises.
+See CHANGELOG 2026-05-08 for full details.
+
+---
+
+### Label-to-Judge Assignment
+
+Each label assigned to the judge(s) best suited to detect it. "Cross-validation" labels (where multiple judges train on the same label) are explicit second opinions for the fusion layer.
+
+| Label | Heuristic | BiLSTM | ST-GCN | Notes |
+|-------|-----------|--------|--------|-------|
+| Grip ratio (too wide/narrow) | ✅ Primary | ❌ | ❌ | Spatial measurement at lockout. Heuristic owns it; well-defined thresholds. |
+| ROM top (incomplete lockout) | ✅ Primary | ✅ Cross-validate | ❌ | Heuristic measures max elbow angle; BiLSTM detects "didn't reach the top" pattern. |
+| ROM bottom (elbow not below shoulder) | ✅ Primary | ❌ | ❌ | Spatial Y-coordinate comparison. |
+| Elbow flare (too wide) | ✅ Primary | ❌ | ❌ | Joint angle measurement. View-dependent. |
+| Knee error (wobble) | ❌ | ✅ Primary (Phase 2 done) | ✅ Cross-validate (Phase 2 done) | Temporal noise + spatial alignment. |
+| Smoothness | ❌ | ✅ Primary | ❌ | Velocity/acceleration variance over rep — heuristic can't measure. |
+| Control | ❌ | ✅ Primary | ❌ | Tempo regularity, pause patterns — temporal only. |
+| Lift stability (NEW) | ⚠️ Partial | ✅ Cross-validate | ✅ Primary | Torso lateral lean + wrist L-R asymmetry. ST-GCN best with full skeleton (after Option A: new BiLSTM channels enable cross-validation). |
+
+**Lift stability decomposition:**
+- `torso_lean_side` (lateral, not forward — heuristic only measures forward)
+- `wrist_asymmetry` (L vs R wrist height at lockout)
+- `bar_drift` (horizontal trajectory variance over rep)
+
+---
+
+### New BiLSTM Channels (required for Phase 3)
+
+```python
+# Current (squat-derived)
+BILSTM_SIGNAL_KEYS = [
+    "normalized_hip_displacement",   # actually wrist_y for OHP — rename
+    "window_velocity",
+    "knee_angles",
+    "landmark_confidence",
+]
+
+# Proposed for OHP Phase 3 (additions in bold)
+BILSTM_SIGNAL_KEYS_OHP = [
+    "primary_displacement",          # renamed wrist_y
+    "window_velocity",
+    "knee_angles",
+    "landmark_confidence",
+    # NEW for Phase 3:
+    "elbow_angles_avg",              # mean(left, right) — for ROM, lockout, smoothness
+    "wrist_lr_diff_y",               # left_wrist_y - right_wrist_y — lift stability
+    "shoulder_lr_diff_y",            # left_shoulder_y - right_shoulder_y — torso lateral lean
+    "wrist_acceleration",            # smoothness/control signal
+]
+```
+
+`temporal_segmentation.py` must compute and write these to the segmented JSON `signals` dict.
+
+---
+
+### Phase 3 Implementation Path (high-level)
+
+The five priorities below should expand into the next plan. Each is roughly one sprint of work.
+
+**P1: Add new BiLSTM channels** (`nn_utils.py`, `temporal_segmentation.py`)
+- Define `BILSTM_SIGNAL_KEYS_OHP`
+- Compute new signals during segmentation stage
+- Write to segmented JSON
+- Verify with existing standing OHP test videos
+
+**P2: Manual annotation tooling** (`apps/desktop-ui/app.py`, `core/exevision/feedback/`)
+- Add Phase 3 fields to annotation tab: smoothness (0–5), control (0–5), grip_error (binary + direction), rom_top (binary), rom_bottom (binary), elbow_flare (binary), lift_stability (0–5)
+- Export annotations to `training_dataset/annotations/videos/{video_id}.json` with new schema
+- Active learning: rank candidate videos by judge disagreement (high disagreement = annotate first)
+- Target: 100–150 annotated reps
+
+**P3: Two-stage fusion training**
+- Stage A: Encoders FROZEN (Phase 2 weights kept)
+- Stage B: Train fusion alone with target = human_score, MSE loss
+- New fusion architecture takes [heuristic_vec_extended, BiLSTM_embedding, STGCN_embedding] → quality + per-error-head outputs
+- Loss: MSE(fusion_score, human_score) + λ × per_error_head_consistency
+
+**P4: Confidence-weighted fusion** (academic narrative payoff)
+- `heuristic_confidence = mean(landmark_visibility for rep)`
+- `neural_confidence = 1 - variance(BiLSTM, STGCN predictions)`
+- Final: weighted blend by confidence
+- Demonstrates per-case adaptive weighting
+
+**P5: Wire into feedback engine + desktop UI**
+- `core/exevision/feedback/engine.py`: consume per-error probabilities, generate coaching text
+- Add desktop UI neural toggle (resolves Active Issue #4)
+- Result schema: per-rep fusion_score + per-error probs + which judges agreed
+
+---
+
+### Acceptance Criteria for Phase 3
+
+| Metric | Target | Notes |
+|--------|--------|-------|
+| Fusion MAE vs human_score | < 8.0 | Better than current heuristic alone |
+| Pearson correlation (fusion vs human) | > 0.75 | Distribution shape match |
+| Per-error AUC (smoothness, control, lift_stability) | > 0.70 | Each new error head |
+| Knee AUC (Phase 2 retained) | ≥ 0.70 | No regression |
+| Confidence-weighting demo | 3+ documented cases | Show heuristic-fails-but-neural-saves and vice versa for thesis |
+
+---
+
+### Out of Scope for Phase 3
+
+- Re-running Phase 1 OHP pretraining (Option B above)
+- Training seated OHP neural model (still no clean signal source)
+- Replacing rule-based heuristic measurements that already work (grip ratio, ROM top/bottom, elbow flare)
+- Frame-level temporal localization (keeping rep-level binary)

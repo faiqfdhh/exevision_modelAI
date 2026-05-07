@@ -13,7 +13,7 @@ for _p in [str(_NEURAL), str(_OHP), str(_TRAIN_OHP)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from nn_utils import build_adjacency_matrix, _extract_stgcn_rep, _extract_rep_matrix, pad_or_truncate, FIXED_SEQ_LEN
+from nn_utils import build_adjacency_matrix_ohp, _extract_stgcn_rep, _extract_rep_matrix, pad_or_truncate, FIXED_SEQ_LEN
 from ohp.models import OHPBiLSTMScorer, OHPSTGCNScorer
 from ohp.fusion import build_ohp_fusion
 from ohp.heuristic_vec import build_ohp_heuristic_vector
@@ -51,7 +51,7 @@ def run_ohp_inference(args) -> None:
         return
 
     device = torch.device("cpu")
-    A = torch.tensor(build_adjacency_matrix())
+    A = torch.tensor(build_adjacency_matrix_ohp())
 
     bilstm = OHPBiLSTMScorer().to(device)
     stgcn = OHPSTGCNScorer(A).to(device)
@@ -84,8 +84,8 @@ def run_ohp_inference(args) -> None:
 
     rep_results = []
     for rep in (seg_data.get("repetitions") or []):
-        bilstm_raw = _extract_rep_matrix(seg_data, rep)
-        stgcn_raw = _extract_stgcn_rep(seg_data, feat_data, rep)
+        bilstm_raw = _extract_rep_matrix(seg_data, rep, exercise=exercise)
+        stgcn_raw = _extract_stgcn_rep(seg_data, feat_data, rep, exercise=exercise)
         if bilstm_raw is None or stgcn_raw is None:
             continue
 

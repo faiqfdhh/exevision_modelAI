@@ -14,7 +14,7 @@ for _p in [str(_NEURAL_ROOT), str(_TRAIN_ROOT)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from nn_utils import NUM_BILSTM_CHANNELS
+from nn_utils import NUM_OHP_BILSTM_CHANNELS, NUM_OHP_ACTIVE_JOINTS
 from pretrain_bilstm import TemporalAttention   # encoder building block — not modified
 from pretrain_stgcn import STGCNBlock           # encoder building block — not modified
 
@@ -58,7 +58,7 @@ class OHPBiLSTMScorer(nn.Module):
 
     def __init__(
         self,
-        input_dim: int = NUM_BILSTM_CHANNELS,
+        input_dim: int = NUM_OHP_BILSTM_CHANNELS,
         hidden_dim: int = 128,
         dropout: float = 0.3,
     ) -> None:
@@ -130,6 +130,7 @@ class OHPSTGCNScorer(nn.Module):
             A = torch.tensor(A, dtype=torch.float32)
 
         from nn_utils import STGCN_CHANNELS
+        # A must be (NUM_OHP_ACTIVE_JOINTS, NUM_OHP_ACTIVE_JOINTS) — built via build_adjacency_matrix_ohp()
         self.block1 = STGCNBlock(STGCN_CHANNELS, 64,  A, stride=1, dropout=dropout)
         self.block2 = STGCNBlock(64,  64,  A, stride=1, dropout=dropout)
         self.block3 = STGCNBlock(64,  128, A, stride=2, dropout=dropout)

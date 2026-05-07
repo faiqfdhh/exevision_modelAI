@@ -18,12 +18,13 @@ for _p in [str(_NEURAL), str(_NEURAL / "ohp"), str(_TRAIN)]:
 
 from nn_utils import (
     FIXED_SEQ_LEN,
-    NUM_ACTIVE_JOINTS,
+    NUM_OHP_ACTIVE_JOINTS,
     STGCN_CHANNELS,
+    NUM_OHP_BILSTM_CHANNELS,
     _extract_rep_matrix,
     _extract_stgcn_rep,
     _load_json,
-    build_adjacency_matrix,
+    build_adjacency_matrix_ohp,
     pad_or_truncate,
 )
 from ohp.heuristic_vec import build_ohp_heuristic_vector
@@ -80,14 +81,14 @@ class OHPRepDataset(Dataset):
         feat_data = _load_json(record["feat_path"]) or {}
         seg_data = _load_json(record["seg_path"]) if record["seg_path"].exists() else {}
 
-        bilstm_raw = _extract_rep_matrix(seg_data, rep)
+        bilstm_raw = _extract_rep_matrix(seg_data, rep, exercise="overhead_press")
         if bilstm_raw is None:
-            bilstm_raw = np.zeros((1, 4), dtype=np.float32)
+            bilstm_raw = np.zeros((1, NUM_OHP_BILSTM_CHANNELS), dtype=np.float32)
         bilstm_t = torch.from_numpy(pad_or_truncate(bilstm_raw, FIXED_SEQ_LEN))
 
-        stgcn_raw = _extract_stgcn_rep(seg_data, feat_data, rep)
+        stgcn_raw = _extract_stgcn_rep(seg_data, feat_data, rep, exercise="overhead_press")
         if stgcn_raw is None:
-            stgcn_raw = np.zeros((1, NUM_ACTIVE_JOINTS, STGCN_CHANNELS), dtype=np.float32)
+            stgcn_raw = np.zeros((1, NUM_OHP_ACTIVE_JOINTS, STGCN_CHANNELS), dtype=np.float32)
         stgcn_padded = pad_or_truncate(stgcn_raw, FIXED_SEQ_LEN)  # (T, J, C)
         # Reorder to (C, T, J) for ST-GCN conv
         stgcn_t = torch.from_numpy(
