@@ -3,6 +3,25 @@
 > Older sessions archived here from `CLAUDE.md` Appendix A.
 > Latest sessions are kept inline in `CLAUDE.md` Appendix A for quick reference.
 
+## 2026-05-07 — OHP Phase 2 Multi-Task Fine-Tuning Setup
+
+**Focus:** Execute Tasks 1-10 of the OHP Phase 2 Multi-Task Fine-Tuning plan to prepare the codebase for multi-task neural training (quality and error prediction) on FitnessAQA data.
+
+**What was done:**
+1. **Scaffolded Directories:** Created `core/exevision/neural/ohp/`, `core/exevision/training/ohp/`, and `tests/ohp/` packages.
+2. **Label Derivation:** Implemented `label_derivation.py` with pure mathematical functions for overlap bounding and soft-label derivation from FitnessAQA error windows. Seated variant logic specifically ignores knee errors.
+3. **Heuristic Vector:** Implemented `heuristic_vec.py` to compile the 16-dimensional OHP feature vector, complete with one-hot view encoding.
+4. **Model Architecture:** Added `OHPBiLSTMScorer` and `OHPSTGCNScorer` to `models.py` with multi-task prediction heads (quality score, elbow error, and conditionally knee error).
+5. **Fusion Factory:** Added `build_ohp_fusion` in `fusion.py` to instantiate `HeuristicGuidedFusion` configured for 16-dim OHP heuristics.
+6. **Dataset Prep Script:** Implemented `prepare_dataset.py` to map raw FitnessAQA CSV data to standardized annotation JSONs for `overhead_press` and `seated_overhead_press`.
+7. **Dataset Loading:** Created `OHPRepDataset` in `data.py` to handle tensor preparation and collation.
+8. **Training Script:** Added `finetune.py` with the multi-task loss function combining MSE (quality) and BCE (error probabilities).
+9. **Evaluation Script:** Added `evaluate.py` to output MAE (quality) and ROC-AUC (error probabilities).
+10. **Inference Dispatch:** Created `inference.py` to handle OHP neural predictions and updated `neural_fusion_inference.py` to route OHP requests seamlessly while keeping legacy squat inference perfectly isolated.
+11. **Testing:** Built and ran unit/smoke tests for all new OHP modules. All existing squat tests pass, confirming backward compatibility.
+
+Next step: Batch stage execution (Task 11) to extract features for the 2,367 labeled FitnessAQA videos.
+
 ## 2026-05-06 — Session 6: OHP Scoring Redesign (ROM, View-Aware Metrics, Side View Fix)
 
 **Focus:** Complete redesign of OHP ROM scoring; fix score discrepancy between desktop UI and CLI; fix side-view angle computation; relax thresholds based on real rep data.
