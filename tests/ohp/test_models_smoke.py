@@ -1,0 +1,93 @@
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+# Ensure neural dirs are on path
+_NEURAL = Path(__file__).resolve().parents[2] / "core" / "exevision" / "neural"
+_TRAIN = Path(__file__).resolve().parents[2] / "core" / "exevision" / "training"
+for _p in [str(_NEURAL), str(_NEURAL / "ohp"), str(_TRAIN)]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from nn_utils import NUM_BILSTM_CHANNELS, FIXED_SEQ_LEN, build_adjacency_matrix
+from core.exevision.neural.ohp.models import OHPBiLSTMScorer, OHPSTGCNScorer
+
+
+BATCH = 4
+
+
+def test_bilstm_output_keys():
+    model = OHPBiLSTMScorer(include_knee_head=True)
+    x = torch.zeros(BATCH, FIXED_SEQ_LEN, NUM_BILSTM_CHANNELS)
+    out = model(x)
+    assert "embedding" in out
+    assert "quality" in out
+    assert "elbow_error" in out
+    assert "knee_error" in out
+
+
+def test_bilstm_output_shapes():
+    model = OHPBiLSTMScorer(include_knee_head=True)
+    x = torch.zeros(BATCH, FIXED_SEQ_LEN, NUM_BILSTM_CHANNELS)
+    out = model(x)
+    assert out["quality"].shape == (BATCH,)
+    assert out["elbow_error"].shape == (BATCH,)
+    assert out["knee_error"].shape == (BATCH,)
+
+
+def test_bilstm_seated_no_knee_head():
+    model = OHPBiLSTMScorer(include_knee_head=False)
+    x = torch.zeros(BATCH, FIXED_SEQ_LEN, NUM_BILSTM_CHANNELS)
+    out = model(x)
+    assert "knee_error" not in out
+
+
+def test_bilstm_quality_range():
+    model = OHPBiLSTMScorer()
+    x = torch.randn(BATCH, FIXED_SEQ_LEN, NUM_BILSTM_CHANNELS)
+    out = model(x)
+    assert out["quality"].min() >= 0.0
+    assert out["quality"].max() <= 100.0
+
+
+def test_bilstm_error_probs_range():
+    model = OHPBiLSTMScorer()
+    x = torch.randn(BATCH, FIXED_SEQ_LEN, NUM_BILSTM_CHANNELS)
+    out = model(x)
+    assert out["elbow_error"].min() >= 0.0
+    assert out["elbow_error"].max() <= 1.0
+
+
+def test_stgcn_output_keys():
+    A = torch.tensor(build_adjacency_matrix())
+    model = OHPSTGCNScorer(A, include_knee_head=True)
+    # ST-GCN input: (B, C, T, J)
+    from nn_utils import STGCN_CHANNELS, NUM_ACTIVE_JOINTS
+    x = torch.zeros(BATCH, STGCN_CHANNELS, FIXED_SEQ_LEN, NUM_ACTIVE_JOINTS)
+    out = model(x)
+    assert "embedding" in out
+    assert "quality" in out
+    assert "elbow_error" in out
+    assert "knee_error" in out
+
+
+def test_stgcn_seated_no_knee_head():
+    A = torch.tensor(build_adjacency_matrix())
+    model = OHPSTGCNScorer(A, include_knee_head=False)
+    from nn_utils import STGCN_CHANNELS, NUM_ACTIVE_JOINTS
+    x = torch.zeros(BATCH, STGCN_CHANNELS, FIXED_SEQ_LEN, NUM_ACTIVE_JOINTS)
+    out = model(x)
+    assert "knee_error" not in out
+
+
+def test_stgcn_quality_range():
+    A = torch.tensor(build_adjacency_matrix())
+    model = OHPSTGCNScorer(A)
+    from nn_utils import STGCN_CHANNELS, NUM_ACTIVE_JOINTS
+    x = torch.randn(BATCH, STGCN_CHANNELS, FIXED_SEQ_LEN, NUM_ACTIVE_JOINTS)
+    out = model(x)
+    assert out["quality"].min() >= 0.0
+    assert out["quality"].max() <= 100.0

@@ -535,6 +535,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+
+    if args.exercise in ("overhead_press", "seated_overhead_press"):
+        import sys as _sys
+        from pathlib import Path as _Path
+        _ohp = str(_Path(__file__).resolve().parents[1] / "neural" / "ohp")
+        if _ohp not in _sys.path:
+            _sys.path.insert(0, _ohp)
+        from inference import run_ohp_inference
+        run_ohp_inference(args)
+        return 0
+
     workspace_root = Path(args.workspace_root).resolve()
     exercise = args.exercise
     device = get_device(force_cpu=args.cpu)
