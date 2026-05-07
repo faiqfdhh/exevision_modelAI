@@ -2129,7 +2129,7 @@ git commit -m "feat(ohp): wire OHP inference dispatch into neural_fusion_inferen
 
 ## Task 11: Batch Stage Execution
 
-Before running `prepare_dataset.py`, Stage 2.5 must be run on the 2,260 labeled videos. Run Stage 5 and Stage 8 for `overhead_press` only (seated variant reuses OHP segmentation paths).
+Before running `prepare_dataset.py`, Stage 2.5 must be run on the 2367 labeled videos. Run Stage 5 and Stage 8 for `overhead_press` only (seated variant reuses OHP segmentation paths).
 
 **Pre-flight check — verify workspace doesn't already have outputs:**
 

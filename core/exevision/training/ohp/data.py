@@ -42,7 +42,7 @@ class OHPRepDataset(Dataset):
       knee_error     : float32 scalar tensor  [0, 1]  (0.0 for seated)
     """
 
-    def __init__(self, annotation_paths: List[Path], split: Optional[str] = None) -> None:
+    def __init__(self, annotation_paths: List[Path], split: Optional[str] = None, exercise: Optional[str] = None) -> None:
         """
         Args:
             annotation_paths: List of annotation JSON file paths to index.
@@ -55,6 +55,8 @@ class OHPRepDataset(Dataset):
             except Exception:
                 continue
             if split is not None and anno.get("fitnessaqa_split") != split:
+                continue
+            if exercise is not None and anno.get("exercise") != exercise:
                 continue
             feat_path = Path(anno.get("pipeline_outputs", {}).get("features_json", ""))
             seg_path = Path(anno.get("pipeline_outputs", {}).get("segmented_json", ""))
@@ -113,12 +115,13 @@ def build_dataloaders(
     annotation_dir: Path,
     batch_size: int = 32,
     num_workers: int = 0,
+    exercise: Optional[str] = None,
 ) -> Dict[str, torch.utils.data.DataLoader]:
     """Return train/val/test DataLoaders from all annotation JSONs in annotation_dir."""
     all_paths = sorted(Path(annotation_dir).glob("*.json"))
     loaders = {}
     for split in ("train", "val", "test"):
-        ds = OHPRepDataset(all_paths, split=split)
+        ds = OHPRepDataset(all_paths, split=split, exercise=exercise)
         if len(ds) == 0:
             continue
         loaders[split] = torch.utils.data.DataLoader(

@@ -13,8 +13,8 @@ _HEURISTIC_BLEND = 0.30    # weight for heuristic_score in final blend
 @dataclass(frozen=True)
 class RepLabels:
     overall_score: float      # 0–100
-    elbow_error_soft: float   # 0.0–1.0
-    knee_error_soft: float    # 0.0–1.0 (always 0.0 for seated)
+    elbow_error_soft: float   # 0.0 (no error) or 1.0 (error detected) — binary label
+    knee_error_soft: float    # 0.0 (no error) or 1.0 (error detected) — binary label (always 0.0 for seated)
 
 
 def compute_overlap_ratio(
@@ -22,37 +22,21 @@ def compute_overlap_ratio(
     rep_end_sec: float,
     error_windows: List[List[float]],
 ) -> float:
-    """Return fraction of rep duration covered by error_windows, clamped to [0, 1].
+    """Return binary error label: 1.0 if ANY part of rep overlaps with error_windows, else 0.0.
 
-    Overlapping windows are unioned before dividing, so they never double-count.
+    FitnessAQA paper uses binary classification with class weighting, not soft labels.
     """
     rep_dur = rep_end_sec - rep_start_sec
     if rep_dur <= 0.0 or not error_windows:
         return 0.0
 
-    # Collect overlapping seconds as a sorted list of (start, end) pairs clipped to rep
-    clipped: List[Tuple[float, float]] = []
+    # Check if any error window overlaps with the rep window
     for window in error_windows:
         w_start, w_end = float(window[0]), float(window[1])
-        overlap_start = max(w_start, rep_start_sec)
-        overlap_end = min(w_end, rep_end_sec)
-        if overlap_end > overlap_start:
-            clipped.append((overlap_start, overlap_end))
+        if w_end > rep_start_sec and w_start < rep_end_sec:
+            return 1.0  # Any overlap → error detected
 
-    if not clipped:
-        return 0.0
-
-    # Union overlapping intervals
-    clipped.sort()
-    merged: List[Tuple[float, float]] = [clipped[0]]
-    for start, end in clipped[1:]:
-        if start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-
-    total_overlap = sum(end - start for start, end in merged)
-    return min(total_overlap / rep_dur, 1.0)
+    return 0.0  # No overlap → no error
 
 
 def derive_rep_labels(
@@ -63,8 +47,9 @@ def derive_rep_labels(
     heuristic_score: float,
     seated: bool,
 ) -> RepLabels:
-    """Derive soft training labels for one OHP rep from FitnessAQA error windows.
+    """Derive binary training labels for one OHP rep from FitnessAQA error windows.
 
+    Binary classification: 1.0 if error detected (any overlap), 0.0 if no error.
     For seated OHP, knee_error_soft is forced to 0.0 regardless of knee_windows
     because leg landmarks are zeroed in the seated variant.
     """

@@ -9,7 +9,7 @@ import torch
 
 _NEURAL = Path(__file__).resolve().parents[1]
 _OHP = Path(__file__).resolve().parent
-_TRAIN_OHP = Path(__file__).resolve().parents[3] / "training" / "ohp"
+_TRAIN_OHP = Path(__file__).resolve().parents[2] / "training" / "ohp"
 for _p in [str(_NEURAL), str(_OHP), str(_TRAIN_OHP)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)

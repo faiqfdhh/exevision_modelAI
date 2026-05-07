@@ -9,7 +9,7 @@ import torch.nn as nn
 
 # Resolve shared neural utilities without modifying sys.path permanently
 _NEURAL_ROOT = Path(__file__).resolve().parents[1]
-_TRAIN_ROOT = Path(__file__).resolve().parents[3] / "training"
+_TRAIN_ROOT = Path(__file__).resolve().parents[2] / "training"
 for _p in [str(_NEURAL_ROOT), str(_TRAIN_ROOT)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)

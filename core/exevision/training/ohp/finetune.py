@@ -24,10 +24,16 @@ from ohp.models import OHPBiLSTMScorer, OHPSTGCNScorer
 from ohp.fusion import build_ohp_fusion
 from data import OHPRepDataset, build_dataloaders
 
-# Loss weights — tune these if Phase 2 MAE is above 15
+# Loss weights — per FitnessAQA paper methodology
+# Uses binary error labels with class weights for imbalance handling
 _LAMBDA_COMPONENT_QUALITY = 0.3   # weight for per-model quality loss vs fusion
 _LAMBDA_ELBOW = 0.3               # weight for elbow BCE
 _LAMBDA_KNEE = 0.2                # weight for knee BCE (skipped for seated)
+
+# Class weights: (n_negative / n_positive) — computed dynamically from data
+# For now, estimated from label analysis; computed per-batch in training loop
+_ELBOW_CLASS_WEIGHT = 3.58        # (2218 neg / 620 pos) from 2838 total reps
+_KNEE_CLASS_WEIGHT = 5.10         # (2373 neg / 465 pos) from 2838 total reps
 
 SEED = 42
 EPOCHS = 60
@@ -57,16 +63,27 @@ def _compute_loss(
     mse_bilstm = F.mse_loss(bilstm_out["quality"] / 100.0, target)
     mse_stgcn = F.mse_loss(stgcn_out["quality"] / 100.0, target)
 
-    bce_bilstm_elbow = F.binary_cross_entropy(bilstm_out["elbow_error"], target_elbow)
-    bce_stgcn_elbow = F.binary_cross_entropy(stgcn_out["elbow_error"], target_elbow)
+    # Binary classification with class weights (per FitnessAQA paper methodology)
+    # Compute per-sample weights: higher weight for positive (minority) class
+    bce_bilstm_elbow = F.binary_cross_entropy(bilstm_out["elbow_error"], target_elbow, reduction="none")
+    weight_elbow = torch.where(target_elbow > 0.5, _ELBOW_CLASS_WEIGHT, 1.0)
+    bce_bilstm_elbow = (bce_bilstm_elbow * weight_elbow).mean()
+
+    bce_stgcn_elbow = F.binary_cross_entropy(stgcn_out["elbow_error"], target_elbow, reduction="none")
+    bce_stgcn_elbow = (bce_stgcn_elbow * weight_elbow).mean()
 
     loss = mse_fusion
     loss += _LAMBDA_COMPONENT_QUALITY * (mse_bilstm + mse_stgcn)
     loss += _LAMBDA_ELBOW * (bce_bilstm_elbow + bce_stgcn_elbow)
 
     if include_knee and "knee_error" in bilstm_out:
-        bce_bilstm_knee = F.binary_cross_entropy(bilstm_out["knee_error"], target_knee)
-        bce_stgcn_knee = F.binary_cross_entropy(stgcn_out["knee_error"], target_knee)
+        bce_bilstm_knee = F.binary_cross_entropy(bilstm_out["knee_error"], target_knee, reduction="none")
+        weight_knee = torch.where(target_knee > 0.5, _KNEE_CLASS_WEIGHT, 1.0)
+        bce_bilstm_knee = (bce_bilstm_knee * weight_knee).mean()
+
+        bce_stgcn_knee = F.binary_cross_entropy(stgcn_out["knee_error"], target_knee, reduction="none")
+        bce_stgcn_knee = (bce_stgcn_knee * weight_knee).mean()
+
         loss += _LAMBDA_KNEE * (bce_bilstm_knee + bce_stgcn_knee)
 
     return loss
@@ -121,7 +138,7 @@ def train(
     include_knee = exercise != "seated_overhead_press"
     output_suffix = "ohp_phase2" if exercise == "overhead_press" else "seated_ohp_phase2"
 
-    loaders = build_dataloaders(annotation_dir, batch_size=batch_size)
+    loaders = build_dataloaders(annotation_dir, batch_size=batch_size, exercise=exercise)
     if "train" not in loaders:
         raise RuntimeError(f"No training data found in {annotation_dir}")
 

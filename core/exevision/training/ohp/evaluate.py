@@ -53,7 +53,7 @@ def evaluate(
     suffix = "ohp_phase2" if exercise == "overhead_press" else "seated_ohp_phase2"
     device = torch.device("cpu")
 
-    loaders = build_dataloaders(annotation_dir, batch_size=batch_size)
+    loaders = build_dataloaders(annotation_dir, batch_size=batch_size, exercise=exercise)
     if "test" not in loaders:
         raise RuntimeError("No test split found")
 
