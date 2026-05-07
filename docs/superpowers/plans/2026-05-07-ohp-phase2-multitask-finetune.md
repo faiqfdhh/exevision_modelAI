@@ -21,7 +21,7 @@ Phase 3 (manual annotation fine-tuning and fusion training) is a separate plan.
 ## Pre-conditions (must be true before Task 1)
 
 - Pre-trained weights exist: `models/bilstm_ohp_pretrained.pt`, `models/bilstm_seated_ohp_pretrained.pt`, `models/stgcn_ohp_pretrained_encoder.pt`, `models/stgcn_seated_ohp_pretrained_encoder.pt`
-- FitnessAQA labeled dataset is at `D:\FitnessAQA\Labeled_Dataset\` with sub-paths:
+- FitnessAQA labeled dataset is at `D:\FitnessAQA\Overhead Press\Labeled_Dataset-OHP\Labeled_Dataset\` with sub-paths:
   - `videos\videos\*.mp4` (2,367 files)
   - `Labels\error_elbows.json`, `Labels\error_knees.json`
   - `Splits\train_keys.json`, `Splits\val_keys.json`, `Splits\test_keys.json`
@@ -2152,7 +2152,7 @@ Set-Location "D:\FitnessAQA\ohp_phase2\workspace"
 
 & $py $s25 unfiltered `
   --exercise overhead_press `
-  --video-dir "D:\FitnessAQA\Labeled_Dataset\videos\videos" `
+  --video-dir "D:\FitnessAQA\Overhead Press\Labeled_Dataset-OHP\Labeled_Dataset\videos\videos" `
   --no-viz `
   --no-report
 # Processes all labeled videos. Re-running is safe — skipped videos registry prevents re-processing.
@@ -2211,8 +2211,8 @@ $script = "C:\Users\faiqf\Documents\Faiq's FYP\exevision_modelAI\core\exevision\
 
 & $py $script `
   --workspace "D:\FitnessAQA\ohp_phase2\workspace" `
-  --labels-dir "D:\FitnessAQA\Labeled_Dataset\Labels" `
-  --splits-dir "D:\FitnessAQA\Labeled_Dataset\Splits" `
+  --labels-dir "D:\FitnessAQA\Overhead Press\Labeled_Dataset-OHP\Labeled_Dataset\Labels" `
+  --splits-dir "D:\FitnessAQA\Overhead Press\Labeled_Dataset-OHP\Labeled_Dataset\Splits" `
   --output-dir "C:\Users\faiqf\Documents\Faiq's FYP\exevision_modelAI\training_dataset\annotations\videos"
 ```
 
