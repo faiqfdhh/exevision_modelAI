@@ -1452,9 +1452,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-_NEURAL = Path(__file__).resolve().parents[3] / "neural"
-_TRAIN = Path(__file__).resolve().parents[1]
-for _p in [str(_NEURAL), str(_TRAIN)]:
+_REPO   = Path(__file__).resolve().parents[4]   # ohp/ → training/ → exevision/ → core/ → repo root
+_NEURAL = _REPO / "core" / "exevision" / "neural"
+_TRAIN  = Path(__file__).resolve().parent
+for _p in [str(_NEURAL), str(_NEURAL / "ohp"), str(_TRAIN)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
