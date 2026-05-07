@@ -3,6 +3,39 @@
 > Older sessions archived here from `CLAUDE.md` Appendix A.
 > Latest sessions are kept inline in `CLAUDE.md` Appendix A for quick reference.
 
+## 2026-05-08 — OHP Phase 2 Complete: Standing OHP Knee Error Detection
+
+**Status: COMPLETE ✅**
+
+**Final evaluation results (standing overhead_press):**
+- MAE: 0.095 ✅ (passes <15 threshold — quality mirrors heuristic directly)
+- Knee Error AUC: 0.702 ✅ (passes >0.65 threshold — binary knee wobble detection)
+
+**Trained checkpoints (in `models/`):**
+- `bilstm_ohp_phase2.pt` — BiLSTM encoder fine-tuned for standing OHP. Predicts quality score and knee wobble probability from temporal joint signals (knee_angles channel is primary signal for error detection).
+- `stgcn_ohp_phase2.pt` — ST-GCN encoder fine-tuned for standing OHP. Predicts quality score and knee wobble probability from spatial joint graph (knee position relative to hip/ankle).
+- `fusion_ohp_phase2.pt` — HeuristicGuidedFusion layer that combines BiLSTM + ST-GCN embeddings with the 16-dim heuristic vector into a final quality score.
+
+**What these models can do:**
+- Predict standing OHP overall quality score (~heuristic level accuracy)
+- Detect knee wobbling (binary, AUC 0.702) — trained on FitnessAQA knee error windows
+- Output `knee_error_prob` at inference time for coaching feedback
+
+**What these models cannot do:**
+- Predict elbow errors (head removed — FitnessAQA elbow labels too subtle/strict)
+- Handle seated OHP (leg landmarks zeroed — no useful FitnessAQA signal)
+
+**Seated OHP status:** `bilstm_seated_ohp_pretrained.pt` and `stgcn_seated_ohp_pretrained.pt` remain as Phase 1 pretrained-only. Seated OHP inference returns `neural_available: false` and uses heuristic-only scoring.
+
+**Key lessons learned:**
+1. Soft overlap ratios → binary labels (per FitnessAQA paper §5)
+2. Decouple quality target from error labels (bimodal targets break MAE)
+3. Quality target = heuristic_score directly; neural model refines rather than re-derives
+4. Class weight 5.10 on positive knee error samples handles 16.4% positive class imbalance
+5. AUC ceiling at ~0.70 with pose landmarks — higher requires Phase 3 manual annotation or raw video features
+
+---
+
 ## 2026-05-08 — OHP Phase 2 Restrategy: Knee-Only Standing Fine-Tuning
 
 **Focus:** Drop elbow head and seated fine-tuning entirely. Phase 2 now scoped to standing OHP with knee error head only, using binary labels per FitnessAQA paper methodology.
