@@ -4,7 +4,6 @@ import argparse
 import random
 import sys
 from pathlib import Path
-from typing import Dict
 
 import numpy as np
 import torch
@@ -22,17 +21,13 @@ for _p in [str(_NEURAL), str(_OHP_NEURAL), str(_TRAIN_OHP)]:
 from nn_utils import build_adjacency_matrix
 from ohp.models import OHPBiLSTMScorer, OHPSTGCNScorer
 from ohp.fusion import build_ohp_fusion
-from data import OHPRepDataset, build_dataloaders
+from data import build_dataloaders
 
-# Loss weights — per FitnessAQA paper methodology
-# Uses binary error labels with class weights for imbalance handling
+# Loss weights — knee-only (elbow head dropped per Session 7 strategy)
 _LAMBDA_COMPONENT_QUALITY = 0.3   # weight for per-model quality loss vs fusion
-_LAMBDA_ELBOW = 0.3               # weight for elbow BCE
-_LAMBDA_KNEE = 0.2                # weight for knee BCE (skipped for seated)
+_LAMBDA_KNEE = 0.3                # weight for knee BCE
 
-# Class weights: (n_negative / n_positive) — computed dynamically from data
-# For now, estimated from label analysis; computed per-batch in training loop
-_ELBOW_CLASS_WEIGHT = 3.58        # (2218 neg / 620 pos) from 2838 total reps
+# Class weight: (n_negative / n_positive) — for binary class imbalance
 _KNEE_CLASS_WEIGHT = 5.10         # (2373 neg / 465 pos) from 2838 total reps
 
 SEED = 42
@@ -53,38 +48,25 @@ def _compute_loss(
     stgcn_out: dict,
     fusion_score: torch.Tensor,
     batch: dict,
-    include_knee: bool,
 ) -> torch.Tensor:
     target = batch["overall_score"] / 100.0   # normalize to [0, 1]
-    target_elbow = batch["elbow_error"]
     target_knee = batch["knee_error"]
 
     mse_fusion = F.mse_loss(fusion_score / 100.0, target)
     mse_bilstm = F.mse_loss(bilstm_out["quality"] / 100.0, target)
     mse_stgcn = F.mse_loss(stgcn_out["quality"] / 100.0, target)
 
-    # Binary classification with class weights (per FitnessAQA paper methodology)
-    # Compute per-sample weights: higher weight for positive (minority) class
-    bce_bilstm_elbow = F.binary_cross_entropy(bilstm_out["elbow_error"], target_elbow, reduction="none")
-    weight_elbow = torch.where(target_elbow > 0.5, _ELBOW_CLASS_WEIGHT, 1.0)
-    bce_bilstm_elbow = (bce_bilstm_elbow * weight_elbow).mean()
+    # Binary BCE with class weight on positive (minority) class
+    weight_knee = torch.where(target_knee > 0.5, _KNEE_CLASS_WEIGHT, 1.0)
+    bce_bilstm_knee = F.binary_cross_entropy(bilstm_out["knee_error"], target_knee, reduction="none")
+    bce_bilstm_knee = (bce_bilstm_knee * weight_knee).mean()
 
-    bce_stgcn_elbow = F.binary_cross_entropy(stgcn_out["elbow_error"], target_elbow, reduction="none")
-    bce_stgcn_elbow = (bce_stgcn_elbow * weight_elbow).mean()
+    bce_stgcn_knee = F.binary_cross_entropy(stgcn_out["knee_error"], target_knee, reduction="none")
+    bce_stgcn_knee = (bce_stgcn_knee * weight_knee).mean()
 
     loss = mse_fusion
     loss += _LAMBDA_COMPONENT_QUALITY * (mse_bilstm + mse_stgcn)
-    loss += _LAMBDA_ELBOW * (bce_bilstm_elbow + bce_stgcn_elbow)
-
-    if include_knee and "knee_error" in bilstm_out:
-        bce_bilstm_knee = F.binary_cross_entropy(bilstm_out["knee_error"], target_knee, reduction="none")
-        weight_knee = torch.where(target_knee > 0.5, _KNEE_CLASS_WEIGHT, 1.0)
-        bce_bilstm_knee = (bce_bilstm_knee * weight_knee).mean()
-
-        bce_stgcn_knee = F.binary_cross_entropy(stgcn_out["knee_error"], target_knee, reduction="none")
-        bce_stgcn_knee = (bce_stgcn_knee * weight_knee).mean()
-
-        loss += _LAMBDA_KNEE * (bce_bilstm_knee + bce_stgcn_knee)
+    loss += _LAMBDA_KNEE * (bce_bilstm_knee + bce_stgcn_knee)
 
     return loss
 
@@ -96,7 +78,6 @@ def _run_epoch(
     loader: DataLoader,
     optimizer,
     device: torch.device,
-    include_knee: bool,
     train: bool,
 ) -> float:
     bilstm.train(train)
@@ -114,7 +95,7 @@ def _run_epoch(
                 stgcn_out["embedding"],
                 bilstm_out["embedding"],
             )
-            loss = _compute_loss(bilstm_out, stgcn_out, fusion_score, batch, include_knee)
+            loss = _compute_loss(bilstm_out, stgcn_out, fusion_score, batch)
             if train:
                 optimizer.zero_grad()
                 loss.backward()
@@ -128,24 +109,27 @@ def train(
     pretrain_bilstm: Path,
     pretrain_stgcn: Path,
     output_dir: Path,
-    exercise: str,
     epochs: int = EPOCHS,
     lr: float = LEARNING_RATE,
     batch_size: int = BATCH_SIZE,
 ) -> None:
+    """Fine-tune standing OHP models on FitnessAQA-derived annotations.
+
+    Phase 2 fine-tunes overhead_press only. Seated OHP is excluded — its
+    legs are zeroed so FitnessAQA knee labels don't apply, and the elbow
+    labels in the dataset are too subtle/strict to be useful signal.
+    """
     set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    include_knee = exercise != "seated_overhead_press"
-    output_suffix = "ohp_phase2" if exercise == "overhead_press" else "seated_ohp_phase2"
 
-    loaders = build_dataloaders(annotation_dir, batch_size=batch_size, exercise=exercise)
+    loaders = build_dataloaders(annotation_dir, batch_size=batch_size)
     if "train" not in loaders:
         raise RuntimeError(f"No training data found in {annotation_dir}")
 
     A = torch.tensor(build_adjacency_matrix(), dtype=torch.float32).to(device)
 
-    bilstm = OHPBiLSTMScorer(include_knee_head=include_knee).to(device)
-    stgcn = OHPSTGCNScorer(A, include_knee_head=include_knee).to(device)
+    bilstm = OHPBiLSTMScorer().to(device)
+    stgcn = OHPSTGCNScorer(A).to(device)
     fusion = build_ohp_fusion().to(device)
 
     m_bilstm, _ = bilstm.load_pretrained(str(pretrain_bilstm))
@@ -164,10 +148,10 @@ def train(
     no_improve = 0
 
     for epoch in range(1, epochs + 1):
-        train_loss = _run_epoch(bilstm, stgcn, fusion, loaders["train"], optimizer, device, include_knee, train=True)
+        train_loss = _run_epoch(bilstm, stgcn, fusion, loaders["train"], optimizer, device, train=True)
         val_loss = float("inf")
         if "val" in loaders:
-            val_loss = _run_epoch(bilstm, stgcn, fusion, loaders["val"], optimizer, device, include_knee, train=False)
+            val_loss = _run_epoch(bilstm, stgcn, fusion, loaders["val"], optimizer, device, train=False)
             scheduler.step(val_loss)
 
         print(f"Epoch {epoch:3d}/{epochs} | train={train_loss:.4f} | val={val_loss:.4f}")
@@ -176,9 +160,9 @@ def train(
             best_val = val_loss
             no_improve = 0
             output_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(bilstm.state_dict(), output_dir / f"bilstm_{output_suffix}.pt")
-            torch.save(stgcn.state_dict(), output_dir / f"stgcn_{output_suffix}.pt")
-            torch.save(fusion.state_dict(), output_dir / f"fusion_{output_suffix}.pt")
+            torch.save(bilstm.state_dict(), output_dir / "bilstm_ohp_phase2.pt")
+            torch.save(stgcn.state_dict(), output_dir / "stgcn_ohp_phase2.pt")
+            torch.save(fusion.state_dict(), output_dir / "fusion_ohp_phase2.pt")
         else:
             no_improve += 1
             if no_improve >= PATIENCE:
@@ -189,13 +173,11 @@ def train(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Phase 2 OHP multi-task fine-tuning")
+    parser = argparse.ArgumentParser(description="Phase 2 standing OHP fine-tuning (knee-only)")
     parser.add_argument("--annotation-dir", required=True)
     parser.add_argument("--pretrain-bilstm", required=True)
     parser.add_argument("--pretrain-stgcn", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--exercise", default="overhead_press",
-                        choices=["overhead_press", "seated_overhead_press"])
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--lr", type=float, default=LEARNING_RATE)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
@@ -205,7 +187,6 @@ def main() -> None:
         pretrain_bilstm=Path(args.pretrain_bilstm),
         pretrain_stgcn=Path(args.pretrain_stgcn),
         output_dir=Path(args.output_dir),
-        exercise=args.exercise,
         epochs=args.epochs,
         lr=args.lr,
         batch_size=args.batch_size,

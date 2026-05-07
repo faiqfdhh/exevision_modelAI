@@ -1,11 +1,9 @@
 import json
 import sys
-from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-# Ensure module paths resolve
 _REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO / "core" / "exevision" / "training" / "ohp"))
 sys.path.insert(0, str(_REPO / "core" / "exevision" / "training"))
@@ -18,7 +16,6 @@ def fake_workspace(tmp_path):
     fps = 30.0
     total_frames = 90
 
-    # features JSON (mimics Stage 2.5 output structure)
     feat_dir = tmp_path / "overhead_press" / "extracted_features_clean" / "raw_unfiltered"
     feat_dir.mkdir(parents=True)
     feat_path = feat_dir / f"{vid}.json"
@@ -27,7 +24,6 @@ def fake_workspace(tmp_path):
         "keypoints_img": [[[0.5, 0.5, 0.0, 1.0]] * 33] * total_frames,
     }))
 
-    # segmented JSON (1 rep covering full video)
     seg_dir = tmp_path / "overhead_press" / "segmented_reps" / "raw_unfiltered"
     seg_dir.mkdir(parents=True)
     seg_path = seg_dir / f"{vid}_segmented.json"
@@ -42,7 +38,6 @@ def fake_workspace(tmp_path):
         "repetitions": [{"rep_id": 1, "start_frame": 0, "end_frame": total_frames - 1}],
     }))
 
-    # scoring JSON
     score_dir = tmp_path / "overhead_press" / "aqa_analysis_simple" / "raw_unfiltered" / vid
     score_dir.mkdir(parents=True)
     score_path = score_dir / f"{vid}_aqa_simple.json"
@@ -56,11 +51,6 @@ def fake_workspace(tmp_path):
         }],
     }))
 
-    # seated features (just needs to exist with the right path)
-    seated_dir = tmp_path / "seated_overhead_press" / "extracted_features_clean" / "raw_unfiltered"
-    seated_dir.mkdir(parents=True)
-    (seated_dir / f"{vid}.json").write_text(feat_path.read_text())
-
     return tmp_path, vid, fps, total_frames
 
 
@@ -68,12 +58,8 @@ def fake_workspace(tmp_path):
 def fake_labels_dir(tmp_path):
     labels = tmp_path / "Labels"
     labels.mkdir()
-    (labels / "error_elbows.json").write_text(json.dumps({
-        "test_001": [[0.5, 1.5]],   # 1 sec overlap in a 3-sec rep → 1/3
-    }))
-    (labels / "error_knees.json").write_text(json.dumps({
-        "test_001": [],
-    }))
+    # error_elbows.json no longer used — kept on disk only as a no-op file
+    (labels / "error_knees.json").write_text(json.dumps({"test_001": []}))
     splits = tmp_path / "Splits"
     splits.mkdir()
     (splits / "train_keys.json").write_text(json.dumps(["test_001"]))
@@ -82,8 +68,8 @@ def fake_labels_dir(tmp_path):
     return tmp_path
 
 
-def test_prepare_writes_both_variants(fake_workspace, fake_labels_dir, tmp_path):
-    ws_root, vid, fps, total_frames = fake_workspace
+def test_prepare_writes_standing_only(fake_workspace, fake_labels_dir, tmp_path):
+    ws_root, vid, _, _ = fake_workspace
     out_dir = tmp_path / "annotations"
     out_dir.mkdir()
 
@@ -97,11 +83,11 @@ def test_prepare_writes_both_variants(fake_workspace, fake_labels_dir, tmp_path)
 
     ohp_path = out_dir / f"{vid}.json"
     seated_path = out_dir / f"{vid}_seated.json"
-    assert ohp_path.exists(), "OHP annotation not written"
-    assert seated_path.exists(), "Seated OHP annotation not written"
+    assert ohp_path.exists(), "Standing OHP annotation not written"
+    assert not seated_path.exists(), "Seated annotation should not be generated in Phase 2 v2"
 
 
-def test_ohp_annotation_schema(fake_workspace, fake_labels_dir, tmp_path):
+def test_annotation_schema(fake_workspace, fake_labels_dir, tmp_path):
     ws_root, vid, _, _ = fake_workspace
     out_dir = tmp_path / "annotations"
     out_dir.mkdir()
@@ -122,20 +108,21 @@ def test_ohp_annotation_schema(fake_workspace, fake_labels_dir, tmp_path):
 
     rep = data["reps"][0]
     assert "human_score" in rep
-    assert "elbow_error_soft" in rep
-    assert "knee_error_soft" in rep
+    assert "knee_error" in rep
+    assert "elbow_error_soft" not in rep, "elbow_error_soft should be removed"
+    assert "knee_error_soft" not in rep, "knee_error_soft should be renamed to knee_error"
     assert 0.0 <= rep["human_score"] <= 100.0
-    assert 0.0 <= rep["elbow_error_soft"] <= 1.0
+    assert rep["knee_error"] in (0.0, 1.0)
 
 
-def test_seated_always_zero_knee(fake_workspace, fake_labels_dir, tmp_path):
+def test_knee_error_binary(fake_workspace, fake_labels_dir, tmp_path):
     ws_root, vid, _, _ = fake_workspace
+    # Give knee error overlapping the rep
+    knee_path = fake_labels_dir / "Labels" / "error_knees.json"
+    knee_path.write_text(json.dumps({"test_001": [[0.5, 1.5]]}))
+
     out_dir = tmp_path / "annotations"
     out_dir.mkdir()
-
-    # Give seated a knee error — should still be 0.0
-    knee_path = fake_labels_dir / "Labels" / "error_knees.json"
-    knee_path.write_text(json.dumps({"test_001": [[0.0, 3.0]]}))
 
     from prepare_dataset import run_preparation
     run_preparation(
@@ -145,14 +132,12 @@ def test_seated_always_zero_knee(fake_workspace, fake_labels_dir, tmp_path):
         output_dir=out_dir,
     )
 
-    seated = json.loads((out_dir / f"{vid}_seated.json").read_text())
-    for rep in seated["reps"]:
-        assert rep["knee_error_soft"] == 0.0
+    data = json.loads((out_dir / f"{vid}.json").read_text())
+    assert data["reps"][0]["knee_error"] == 1.0
 
 
 def test_missing_segmented_fallback(fake_workspace, fake_labels_dir, tmp_path):
-    ws_root, vid, fps, total_frames = fake_workspace
-    # Remove segmented JSON to trigger fallback
+    ws_root, vid, _, _ = fake_workspace
     (ws_root / "overhead_press" / "segmented_reps" / "raw_unfiltered" / f"{vid}_segmented.json").unlink()
 
     out_dir = tmp_path / "annotations"
@@ -168,5 +153,4 @@ def test_missing_segmented_fallback(fake_workspace, fake_labels_dir, tmp_path):
 
     data = json.loads((out_dir / f"{vid}.json").read_text())
     assert len(data["reps"]) == 1
-    rep = data["reps"][0]
-    assert rep["start_frame"] == 0
+    assert data["reps"][0]["start_frame"] == 0

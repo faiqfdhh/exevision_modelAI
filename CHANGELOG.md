@@ -3,6 +3,44 @@
 > Older sessions archived here from `CLAUDE.md` Appendix A.
 > Latest sessions are kept inline in `CLAUDE.md` Appendix A for quick reference.
 
+## 2026-05-08 — OHP Phase 2 Restrategy: Knee-Only Standing Fine-Tuning
+
+**Focus:** Drop elbow head and seated fine-tuning entirely. Phase 2 now scoped to standing OHP with knee error head only, using binary labels per FitnessAQA paper methodology.
+
+**Strategic decisions:**
+- **Drop elbow labels** — Manual inspection showed FitnessAQA elbow error labels are too subtle/strict (don't reflect visible errors)
+- **Keep knee labels** — Detect knee wobbling, which is observable and matches user expectations
+- **Drop seated OHP from Phase 2** — Legs are zeroed in seated variant, so FitnessAQA knee labels don't apply. Seated OHP keeps using pre-trained encoder + heuristic-only inference (no Phase 2 model)
+- **Binary labels with class weights** — Per FitnessAQA paper §5: "For imbalanced datasets, we used class weights (in cross-entropy loss) inversely proportional to the class size." Replaced soft overlap ratios with binary 0/1.
+
+**Files refactored:**
+- `label_derivation.py`: Single binary `compute_binary_overlap()`; `derive_rep_labels()` takes only `knee_windows`; `RepLabels` has only `knee_error` (no elbow)
+- `prepare_dataset.py`: Loads only `error_knees.json`; generates only standing annotation JSONs (no `_seated.json` variants); annotation schema uses `knee_error` (binary) instead of `elbow_error_soft`/`knee_error_soft`
+- `models.py`: `OHPBiLSTMScorer` and `OHPSTGCNScorer` no longer accept `include_knee_head`; both have only `quality_head` and `knee_error_head`; elbow head removed
+- `data.py`: Dataset returns `knee_error` (binary); no `elbow_error`; no `exercise` filter parameter (standing-only)
+- `finetune.py`: Single-loss path with knee BCE + class_weight=5.10 on positive class; no `--exercise` arg; checkpoints named `bilstm_ohp_phase2.pt` etc. (no seated suffix)
+- `evaluate.py`: Reports MAE + knee_auc only; no elbow metric
+- `inference.py`: `run_ohp_inference()` returns `{"status": "skipped", "neural_available": false}` for `seated_overhead_press`; for standing returns `knee_error_prob` only
+
+**Tests updated (all 26 passing):**
+- `test_label_derivation.py`: Tests `compute_binary_overlap()` returns 0.0/1.0; tests overall_score formula with knee-only penalty
+- `test_models_smoke.py`: Tests model outputs `knee_error` only, no `elbow_error`
+- `test_prepare_dataset.py`: Tests writes standing-only JSONs; tests `knee_error` binary value; tests no `_seated.json` is generated
+
+**Remaining work:**
+1. Re-run `prepare_dataset.py` to regenerate annotation JSONs with new schema (binary `knee_error`)
+2. Re-run `finetune.py` for standing OHP
+3. Evaluate and verify knee_auc passes (>0.65)
+4. If knee_auc still fails: error labels are inherently noisy → fall back to heuristic flags for knee feedback; revisit in Phase 3 with manual annotation
+
+**Why this is cleaner:**
+- Quality prediction (MAE 4.3) was already excellent — kept that
+- Error head burden reduced from 2 noisy heads to 1 cleaner head
+- Code is simpler — no per-variant branches, no conditional heads
+- Aligned with original FitnessAQA paper methodology (binary + class weights)
+
+---
+
 ## 2026-05-07 (Continued) — OHP Phase 2 Error Head Learning Problem & Diagnosis
 
 **Status:** Standing/seated OHP fine-tuning in progress with loss weight adjustments. **BLOCKED** on error head learning.

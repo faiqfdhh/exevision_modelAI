@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Optional
 
 import torch
 
@@ -18,45 +17,47 @@ from nn_utils import build_adjacency_matrix, _extract_stgcn_rep, _extract_rep_ma
 from ohp.models import OHPBiLSTMScorer, OHPSTGCNScorer
 from ohp.fusion import build_ohp_fusion
 from ohp.heuristic_vec import build_ohp_heuristic_vector
-from nn_models import HeuristicGuidedFusion   # fusion base class
 
 
-def _load_checkpoints(model_dir: Path, exercise: str):
-    """Load BiLSTM, ST-GCN, and fusion checkpoints for the given exercise."""
-    suffix = "overhead_press" if exercise == "overhead_press" else "seated_overhead_press"
-    # Prefer phase2 checkpoints; fall back to phase-labelled names
-    def _ckpt(name):
-        for candidate in [
-            model_dir / f"{name}_{suffix}.pt",
-            model_dir / f"{name}_ohp_phase2.pt",
-            model_dir / f"{name}_seated_ohp_phase2.pt",
-        ]:
-            if candidate.exists():
-                return candidate
-        return None
-
-    bilstm_path = _ckpt("bilstm")
-    stgcn_path = _ckpt("stgcn")
-    fusion_path = _ckpt("fusion")
-    return bilstm_path, stgcn_path, fusion_path
+def _load_checkpoints(model_dir: Path):
+    """Load standing OHP Phase 2 checkpoints (BiLSTM, ST-GCN, fusion)."""
+    bilstm = model_dir / "bilstm_ohp_phase2.pt"
+    stgcn = model_dir / "stgcn_ohp_phase2.pt"
+    fusion = model_dir / "fusion_ohp_phase2.pt"
+    return (
+        bilstm if bilstm.exists() else None,
+        stgcn if stgcn.exists() else None,
+        fusion if fusion.exists() else None,
+    )
 
 
 def run_ohp_inference(args) -> None:
-    """Entry point called from neural_fusion_inference.py for OHP exercises."""
+    """Entry point called from neural_fusion_inference.py for OHP exercises.
+
+    Standing overhead_press only — seated_overhead_press uses heuristic-only
+    inference (no Phase 2 model, leg landmarks are zeroed).
+    """
     workspace = Path(args.workspace_root)
     exercise = args.exercise
     video_id = args.video_id
     model_dir = Path(args.model_dir) if hasattr(args, "model_dir") else Path("models")
 
-    include_knee = exercise != "seated_overhead_press"
+    if exercise == "seated_overhead_press":
+        print(json.dumps({
+            "status": "skipped",
+            "reason": "seated_overhead_press uses heuristic-only inference (no Phase 2 model)",
+            "neural_available": False,
+        }))
+        return
+
     device = torch.device("cpu")
     A = torch.tensor(build_adjacency_matrix())
 
-    bilstm = OHPBiLSTMScorer(include_knee_head=include_knee).to(device)
-    stgcn = OHPSTGCNScorer(A, include_knee_head=include_knee).to(device)
+    bilstm = OHPBiLSTMScorer().to(device)
+    stgcn = OHPSTGCNScorer(A).to(device)
     fusion = build_ohp_fusion().to(device)
 
-    bilstm_path, stgcn_path, fusion_path = _load_checkpoints(model_dir, exercise)
+    bilstm_path, stgcn_path, fusion_path = _load_checkpoints(model_dir)
     if bilstm_path:
         bilstm.load_state_dict(torch.load(bilstm_path, map_location="cpu"))
     if stgcn_path:
@@ -95,7 +96,6 @@ def run_ohp_inference(args) -> None:
             np.transpose(stgcn_padded, (2, 0, 1)).astype("float32")
         ).unsqueeze(0)
 
-        # Get heuristic score for this rep from scoring JSON
         rep_score_data = next(
             (r for r in (score_data.get("reps") or []) if r.get("rep_id") == rep.get("rep_id")), {}
         )
@@ -110,8 +110,7 @@ def run_ohp_inference(args) -> None:
         rep_results.append({
             "rep_id": rep.get("rep_id"),
             "neural_score": round(float(final_score.item()), 2),
-            "elbow_error_prob": round(float(bilstm_out["elbow_error"].item()), 4),
-            "knee_error_prob": round(float(bilstm_out["knee_error"].item()), 4) if include_knee and "knee_error" in bilstm_out else None,
+            "knee_error_prob": round(float(bilstm_out["knee_error"].item()), 4),
             "neural_available": True,
         })
 

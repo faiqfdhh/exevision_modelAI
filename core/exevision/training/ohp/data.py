@@ -30,7 +30,7 @@ from ohp.heuristic_vec import build_ohp_heuristic_vector
 
 
 class OHPRepDataset(Dataset):
-    """Dataset of OHP reps sourced from FitnessAQA-derived annotation JSONs.
+    """Dataset of standing OHP reps sourced from FitnessAQA-derived annotation JSONs.
 
     Each item returns a dict with keys:
       bilstm_input   : float32 tensor (FIXED_SEQ_LEN, NUM_BILSTM_CHANNELS)
@@ -38,11 +38,10 @@ class OHPRepDataset(Dataset):
       heuristic_vec  : float32 tensor (16,)
       view_vec       : float32 tensor (5,)
       overall_score  : float32 scalar tensor
-      elbow_error    : float32 scalar tensor  [0, 1]
-      knee_error     : float32 scalar tensor  [0, 1]  (0.0 for seated)
+      knee_error     : float32 scalar tensor  [0.0 or 1.0]  (binary)
     """
 
-    def __init__(self, annotation_paths: List[Path], split: Optional[str] = None, exercise: Optional[str] = None) -> None:
+    def __init__(self, annotation_paths: List[Path], split: Optional[str] = None) -> None:
         """
         Args:
             annotation_paths: List of annotation JSON file paths to index.
@@ -55,8 +54,6 @@ class OHPRepDataset(Dataset):
             except Exception:
                 continue
             if split is not None and anno.get("fitnessaqa_split") != split:
-                continue
-            if exercise is not None and anno.get("exercise") != exercise:
                 continue
             feat_path = Path(anno.get("pipeline_outputs", {}).get("features_json", ""))
             seg_path = Path(anno.get("pipeline_outputs", {}).get("segmented_json", ""))
@@ -106,8 +103,7 @@ class OHPRepDataset(Dataset):
             "heuristic_vec": torch.from_numpy(hvec),
             "view_vec": torch.from_numpy(view_vec),
             "overall_score": torch.tensor(float(rep.get("human_score", 50.0)), dtype=torch.float32),
-            "elbow_error": torch.tensor(float(rep.get("elbow_error_soft", 0.0)), dtype=torch.float32),
-            "knee_error": torch.tensor(float(rep.get("knee_error_soft", 0.0)), dtype=torch.float32),
+            "knee_error": torch.tensor(float(rep.get("knee_error", 0.0)), dtype=torch.float32),
         }
 
 
@@ -115,13 +111,12 @@ def build_dataloaders(
     annotation_dir: Path,
     batch_size: int = 32,
     num_workers: int = 0,
-    exercise: Optional[str] = None,
 ) -> Dict[str, torch.utils.data.DataLoader]:
-    """Return train/val/test DataLoaders from all annotation JSONs in annotation_dir."""
+    """Return train/val/test DataLoaders from all standing OHP annotation JSONs."""
     all_paths = sorted(Path(annotation_dir).glob("*.json"))
     loaders = {}
     for split in ("train", "val", "test"):
-        ds = OHPRepDataset(all_paths, split=split, exercise=exercise)
+        ds = OHPRepDataset(all_paths, split=split)
         if len(ds) == 0:
             continue
         loaders[split] = torch.utils.data.DataLoader(

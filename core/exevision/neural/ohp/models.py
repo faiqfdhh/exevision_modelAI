@@ -41,17 +41,19 @@ def _error_head(in_dim: int) -> nn.Sequential:
 
 
 class OHPBiLSTMScorer(nn.Module):
-    """Temporal scorer for OHP with optional knee error head.
+    """Temporal scorer for standing OHP with knee error head.
 
     Encoder layer names (lstm1, lstm2, temporal_attention) match the pretrain
     checkpoint exactly so that load_pretrained() can transfer weights without
     key remapping.
 
+    Phase 2 fine-tunes standing OHP only — seated OHP uses pre-trained
+    encoder + heuristic-only inference (no Phase 2 model).
+
     Args:
         input_dim: Number of BiLSTM signal channels (default: NUM_BILSTM_CHANNELS = 4).
         hidden_dim: LSTM hidden size (default: 128, must match pretrained).
         dropout: Dropout rate (default: 0.3, must match pretrained).
-        include_knee_head: Set False for seated OHP — removes the knee error head.
     """
 
     def __init__(
@@ -59,7 +61,6 @@ class OHPBiLSTMScorer(nn.Module):
         input_dim: int = NUM_BILSTM_CHANNELS,
         hidden_dim: int = 128,
         dropout: float = 0.3,
-        include_knee_head: bool = True,
     ) -> None:
         super().__init__()
         self.lstm1 = nn.LSTM(input_dim, hidden_dim, batch_first=True, bidirectional=True)
@@ -70,8 +71,7 @@ class OHPBiLSTMScorer(nn.Module):
 
         embed_dim = hidden_dim * 2
         self.quality_head = _score_head(embed_dim)
-        self.elbow_error_head = _error_head(embed_dim)
-        self.knee_error_head = _error_head(embed_dim) if include_knee_head else None
+        self.knee_error_head = _error_head(embed_dim)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         out, _ = self.lstm1(x)
@@ -82,14 +82,11 @@ class OHPBiLSTMScorer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         emb = self.encode(x)
-        result: Dict[str, torch.Tensor] = {
+        return {
             "embedding": emb,
             "quality": self.quality_head(emb).squeeze(-1) * 100.0,
-            "elbow_error": self.elbow_error_head(emb).squeeze(-1),
+            "knee_error": self.knee_error_head(emb).squeeze(-1),
         }
-        if self.knee_error_head is not None:
-            result["knee_error"] = self.knee_error_head(emb).squeeze(-1)
-        return result
 
     def load_pretrained(self, path: str) -> Tuple[int, int]:
         """Load encoder weights from a pretrained checkpoint.
@@ -109,14 +106,16 @@ class OHPBiLSTMScorer(nn.Module):
 
 
 class OHPSTGCNScorer(nn.Module):
-    """Spatial scorer for OHP with optional knee error head.
+    """Spatial scorer for standing OHP with knee error head.
 
     Encoder block names (block1–block5) match the pretrain checkpoint exactly.
+
+    Phase 2 fine-tunes standing OHP only — seated OHP uses pre-trained
+    encoder + heuristic-only inference (no Phase 2 model).
 
     Args:
         A: Normalised adjacency matrix, shape (11, 11), float32 numpy array or tensor.
         dropout: Dropout rate (default: 0.2, must match pretrained).
-        include_knee_head: Set False for seated OHP.
     """
 
     _VIEW_DIM = 5   # size of view one-hot appended to embedding before quality head
@@ -125,7 +124,6 @@ class OHPSTGCNScorer(nn.Module):
         self,
         A,
         dropout: float = 0.2,
-        include_knee_head: bool = True,
     ) -> None:
         super().__init__()
         if not isinstance(A, torch.Tensor):
@@ -140,8 +138,7 @@ class OHPSTGCNScorer(nn.Module):
 
         embed_dim = 256
         self.quality_head = _score_head(embed_dim + self._VIEW_DIM)
-        self.elbow_error_head = _error_head(embed_dim)
-        self.knee_error_head = _error_head(embed_dim) if include_knee_head else None
+        self.knee_error_head = _error_head(embed_dim)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         x = self.block1(x)
@@ -161,14 +158,11 @@ class OHPSTGCNScorer(nn.Module):
             view_vec = torch.zeros(emb.shape[0], self._VIEW_DIM, device=emb.device)
         spatial_in = torch.cat([emb, view_vec], dim=-1)
 
-        result: Dict[str, torch.Tensor] = {
+        return {
             "embedding": emb,
             "quality": self.quality_head(spatial_in).squeeze(-1) * 100.0,
-            "elbow_error": self.elbow_error_head(emb).squeeze(-1),
+            "knee_error": self.knee_error_head(emb).squeeze(-1),
         }
-        if self.knee_error_head is not None:
-            result["knee_error"] = self.knee_error_head(emb).squeeze(-1)
-        return result
 
     def load_pretrained(self, path: str) -> Tuple[int, int]:
         """Load encoder weights from pretrained checkpoint (encoder-only .pt preferred).
