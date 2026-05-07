@@ -38,8 +38,8 @@ def test_derive_rep_labels_no_knee_error():
     )
     assert isinstance(labels, RepLabels)
     assert labels.knee_error == pytest.approx(0.0)
-    # error_score = 100, overall = 0.7*100 + 0.3*80 = 94
-    assert labels.overall_score == pytest.approx(94.0, abs=0.1)
+    # quality = heuristic directly
+    assert labels.overall_score == pytest.approx(80.0, abs=0.1)
 
 
 def test_derive_rep_labels_with_knee_error():
@@ -49,10 +49,9 @@ def test_derive_rep_labels_with_knee_error():
         knee_windows=[[0.0, 3.0]],
         heuristic_score=50.0,
     )
-    # knee_error = 1.0, error_score = 100*(1-1.0) = 0
-    # overall = 0.7*0 + 0.3*50 = 15
+    # knee_error = 1.0, quality = heuristic (decoupled from error)
     assert labels.knee_error == pytest.approx(1.0)
-    assert labels.overall_score == pytest.approx(15.0, abs=0.1)
+    assert labels.overall_score == pytest.approx(50.0, abs=0.1)
 
 
 def test_derive_rep_labels_score_clamped():

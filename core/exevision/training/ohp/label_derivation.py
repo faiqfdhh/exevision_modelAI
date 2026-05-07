@@ -3,10 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List
 
-# Knee-only formula (elbow labels in FitnessAQA dataset are too subtle/strict to be useful)
-_KNEE_PENALTY_WEIGHT = 1.0     # full penalty when knee error detected
-_FITNESSAQA_BLEND = 0.70       # weight for error_score in final blend
-_HEURISTIC_BLEND = 0.30        # weight for heuristic_score in final blend
+# Quality target uses heuristic score directly — decoupled from error labels.
+# Deriving quality from binary error labels creates bimodal targets that break
+# quality regression (MAE spikes to 25+). Error head is trained separately.
 
 
 @dataclass(frozen=True)
@@ -43,16 +42,16 @@ def derive_rep_labels(
     knee_windows: List[List[float]],
     heuristic_score: float,
 ) -> RepLabels:
-    """Derive binary knee error label and overall quality score for one standing OHP rep.
+    """Derive labels for one standing OHP rep.
 
-    Standing OHP only — seated variant is excluded from FitnessAQA fine-tuning
-    because leg landmarks are zeroed and there's no useful FitnessAQA signal.
+    Quality target = heuristic_score directly (neural model refines heuristic).
+    Knee error = binary 1.0/0.0 from FitnessAQA error windows.
+
+    Decoupling quality from error labels avoids bimodal targets that break
+    quality regression (MAE spikes when binary error → quality formula is used).
     """
     knee = compute_binary_overlap(rep_start_sec, rep_end_sec, knee_windows)
-
-    error_score = 100.0 * (1.0 - _KNEE_PENALTY_WEIGHT * knee)
-    overall = _FITNESSAQA_BLEND * error_score + _HEURISTIC_BLEND * heuristic_score
-    overall = max(0.0, min(100.0, overall))
+    overall = max(0.0, min(100.0, float(heuristic_score)))
 
     return RepLabels(
         overall_score=round(overall, 4),
