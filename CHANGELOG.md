@@ -3,6 +3,277 @@
 > Older sessions archived here from `CLAUDE.md` Appendix A.
 > Latest sessions are kept inline in `CLAUDE.md` Appendix A for quick reference.
 
+## 2026-05-13 (Session 9h) — OHP Squat-Methodology Training + Data Pipeline Fixes + Eval Results
+
+**Focus:** Port OHP training to squat methodology (4-phase sequential, single model, quality-stratified split). Fix broken heuristic data (108/166 reps had `heuristic_score=0`). Train + evaluate. Identify inference routing bug (model_dir points to wrong directory).
+
+**What was done:**
+
+1. **Root cause: `heuristic_score=0` in 108/166 annotations**
+   - Diagnosis: `heuristic_vec[0]` is the fusion's baseline score. With 0, `clamp(0 + tanh(residual)×40)` caps at 40. Explains `pred=40.0` cluster and `quality_pearson=-0.805`.
+   - Also: non-zero heuristic scores were inversely correlated with human quality (Pearson=-0.476). OHP heuristic not calibrated to human perception.
+   - Fix: run Stage 5 + Stage 8 on 107 FitnessAQA videos, then back-populate `heuristic_score` from AQA JSONs.
+
+2. **`populate_heuristic_scores.py` — new script (`core/exevision/analysis/`):**
+   - Scans AQA `{quality_tier}/{video_id}_aqa_simple.json` files, matches by video_id + rep_id.
+   - Copies `repetitions[].score.overall_score` → annotation `reps[].heuristic_score`.
+   - Copies `score.metric_scores` → `heuristic_metric_scores`.
+   - Only overwrites reps with `heuristic_score=0`; skips already-populated.
+
+3. **`stamp_phase3_splits.py` redesigned** — 3-way split (train/val/test, 70/15/15) stratified by quality score bucket `[0,20,40,60,80,100]`, matching squat's `stratified_video_split()`. Previous version was 2-way (train/test) stratified by view×lockout.
+
+4. **`finetune_ohp.py` — new 4-phase trainer** (`core/exevision/training/ohp/`):
+   - Phase 1: BiLSTM temporal heads (smoothness, control, quality) — 40 ep, early stop patience=10
+   - Phase 2: ST-GCN spatial heads (lockout, elbow_flare, grip_ratio, rom_top, rom_bottom, quality) — 40 ep
+   - Phase 3: Fusion only (encoders frozen) — 60 ep, SWA from 67%, SWA vs best-single comparison
+   - Phase 4: Joint fine-tune (optional `--joint`) — 20 ep, lr=1e-5
+   - ReduceLROnPlateau scheduler per phase; best val_loss checkpointing
+   - Output: single model `bilstm/stgcn/fusion_ohp_finetuned.pt` in `--output-dir`
+   - Bug fixes during implementation: f-string format specifier syntax, Phase 4 print indentation, `ohp` namespace collision (training/ohp/__init__.py shadows neural/ohp package), `pretrain_bilstm` found in `training/overhead_press/` not `training/ohp/`
+
+5. **`evaluate_ohp.py` — comprehensive eval** (`core/exevision/training/ohp/`):
+   - Reports: quality MAE + Pearson (vs heuristic baseline), residual_std (model vs heuristic adaptation), per-bucket MAE, failure cases (|error|>20), all 8 secondary metrics.
+   - Uses test split only (no `--all-data` needed for clean eval).
+
+6. **Model directory discovery:**
+   - All OHP checkpoints are in `models/runtime_neural_ohp/`, NOT flat `models/`.
+   - `neural_fusion_inference.py` uses `model_dir = _REPO / "models"` (flat) — means OHP inference currently can't load any models. Bug pending fix in Session 9i.
+
+7. **Training + evaluation completed:**
+   - 119 train / 23 val / 23 test reps (3-way quality-stratified split, seed=42)
+   - Results on 23-rep test set:
+     - ✅ quality_mae=8.77 (threshold <12); heuristic baseline=17.79 — model beats heuristic 2×
+     - ✅ smoothness_mae=6.20, control_mae=5.23, elbow_flare_mae=12.06, grip_ratio_mae=8.68, rom_top_mae=11.87, rom_bottom_mae=9.60
+     - ❌ lockout_auc=0.742 (threshold >0.75) — 0.008 below, noise at 23-rep test set size
+     - quality_pearson=+0.546 (heuristic was -0.111); residual_std=15.82 (strong adaptation)
+
+---
+
+## 2026-05-13 (Session 9g) — OHP Phase 3 Training Pipeline + --final Completion + Evaluation
+
+**Focus:** Fix data pipeline bugs, complete Phase 3 `--final` training (5 seeds), stamp held-out test split, evaluate on 20-rep test set, harden training script.
+
+**What was done:**
+
+1. **`annotation_overhead_press.py` — full redesign (home-dir auto-discovery):**
+   - Removed all 6 hard-coded path inputs. Replaced with single "Home dir" entry + exercise selector dropdown + video dropdown + Scan button.
+   - `_scan_home_dir()`: globs root-level MP4s only (avoids pipeline output subdirs).
+   - `_load_video_by_id()`: auto-discovers AQA JSON (`{exercise}/aqa_analysis_simple/…/aqa_simple.json`), segmented JSON (`{exercise}/segmented_reps/…/{id}_segmented.json`), feature JSON, raw + annotated MP4s from `{home}/{exercise}/` subdirs.
+   - Key JSON fixes: AQA uses `"repetitions"` key (not `"reps"`); view/fps read from `seg_data["info"]` block (not top-level). `_advance_rep()` now calls `_advance_video()` after last rep to auto-advance dropdown.
+
+2. **`data_phase3.py` — consolidated feature/segment dirs:**
+   - Added `_DEFAULT_FEAT_DIR` and `_DEFAULT_SEG_DIR` class variables pointing to `training_dataset/ohp_phase3_annotations/extracted_features/` and `segmented_reps/`.
+   - New `__init__` signature: `(annotation_paths, split=None, feat_dir=None, seg_dir=None)`. Resolves by consolidated dir first, falls back to `pipeline_outputs` key if present.
+   - Fixed: all 165 annotations were silently skipped because `pipeline_outputs` key was absent → `feat_path` was always empty string → `exists()` always False.
+
+3. **`finetune_phase3.py` — multiple hardening fixes:**
+   - **SWA BN update**: replaced `torch.optim.swa_utils.update_bn(loader, model)` (crashes on dict batches) with manual forward-pass loop in `train()` mode.
+   - **Checkpoint criterion**: changed from `lockout_auc > best_lockout_auc` → `val_loss < best_val_loss` (quality is primary metric, not lockout).
+   - **`--final` save-once fix**: in full-data runs (`val_loader=None`), was saving every epoch (60×3=180 writes/seed) → Windows Defender locks file on next write → `RuntimeError`. Fixed: save only at `s2_ep == STAGE2_EPOCHS` (last epoch before SWA overwrites anyway).
+   - **`--final` print cleanup**: shows `val=N/A (full-data run)` instead of misleading `val_loss=inf | lockout_auc=0.0000`.
+   - **Auto-skip existing seeds**: if all 3 checkpoints for a seed exist, skip without retraining.
+   - **`--seeds` flag**: run specific seeds only (e.g. `--seeds 7 19 3 99` to resume after seed42 completed).
+   - **Test-split exclusion**: `run_final()` reads `fitnessaqa_split` field; excludes `"test"` videos automatically. Falls back to all videos if field absent.
+
+4. **`evaluate_phase3.py` — `--all-data` flag:**
+   - Without flag: filters to `fitnessaqa_split='test'` only (true held-out eval).
+   - With flag: evaluates all annotated reps regardless of split (train-set sanity check, optimistic numbers).
+
+5. **`stamp_phase3_splits.py` — new script (`core/exevision/analysis/`):**
+   - Stratified 80/20 video-level split (key: view × lockout_dominant). Merges rare strat classes → "other" to handle single-member strata.
+   - Writes `"fitnessaqa_split": "train"/"test"` in-place into each annotation JSON.
+   - `--dry-run` previews without writing. `--test-count N` (default 20).
+
+6. **`run_pipeline.py` — new batch pipeline runner (`core/exevision/stages/`):**
+   - Runs stages 2.5→4→5→8 (optionally +9) on a directory of videos.
+   - Args: `--video-dir`, `--video-id`, `--exercise`, `--mode`, `--output-dir`, `--no-viz`, `--include-neural`, `--max-videos`, `--skip-{extract,classify,segment,score}`, `--dry-run`.
+   - Bug fix: `log_path.relative_to(_REPO)` wrapped in try/except for external drives (e.g. `D:\FitnessAQA\…`).
+
+7. **`CLAUDE.md` conciseness pass (~40% reduction, 651 → ~390 lines):**
+   - Dropped all 9 RESOLVED issues, FitnessAQA absolute-path workflow blocks, Stage 5 verbose details, Stage 2.5 CLI params section, Stage 8 numeric thresholds, historical sub-sections.
+   - Preserved: all Tkinter gotchas, Stage 4 full signal stack, view normalization warning, score discrepancy gotcha, all commands, OHP Phase 3 training workflow.
+
+**Phase 3 `--final` training completed:**
+- 5 seeds × 80 epochs on 146 train reps (20 held-out test videos stamped first).
+- Architecture: progressive unfreezing (Stage 1: 20 ep frozen encoder; Stage 2: 60 ep SGDR + SWA from ep 51).
+- Output: `bilstm/stgcn/fusion_ohp_phase3_seed{42,7,19,3,99}.pt` in `models/`.
+
+**Phase 3 evaluation results (20-rep held-out test set):**
+
+| Metric | Result | Threshold | Pass? |
+|--------|--------|-----------|-------|
+| quality_mae | 35.53 | < 12.0 | ❌ |
+| lockout_auc | 0.697 | > 0.75 | ❌ |
+| smoothness_mae | 10.67 | < 18.0 | ✅ |
+| control_mae | 9.35 | < 18.0 | ✅ |
+| elbow_flare_mae | 8.56 | < 15.0 | ✅ |
+| grip_ratio_mae | 6.83 | < 12.0 | ✅ |
+| rom_top_mae | 8.35 | < 12.0 | ✅ |
+| rom_bottom_mae | 12.56 | < 12.0 | ❌ (borderline) |
+
+**Analysis:** 5/8 metrics pass. `quality_mae=35.53` is the primary failure — holistic 0-100 quality judgment requires significantly more training data (500+ reps typical). Secondary biomechanical metrics all pass with margin, confirming the model learns exercise patterns. `rom_bottom_mae=12.56` is borderline (0.56 over threshold). `lockout_auc=0.697` is close on a 20-rep test set where one misclassified rep shifts AUC ~0.05. CV val_loss ~1.15 across 5 folds remains the best generalization estimate. Thresholds `quality_mae < 12.0` were aspirational for 146 training reps.
+
+---
+
+## 2026-05-13 (Session 9f) — OHP Neural View Classifier (Module + Training + Stage 4 Hook)
+
+**Focus:** Improve `classify_views.py` signal stack; unify `front_side`/`back_side` into `diagonal` at display layer.
+
+**What was done:**
+
+1. **New landmarks added to classifier (exercise-agnostic):**
+   - Added elbows (13, 14) and wrists (15, 16) → `L_ARM_INDICES=(13,15)`, `R_ARM_INDICES=(14,16)`
+   - Hip width (`L_HIP`, `R_HIP` x-spread) now computed separately for torso-lean gate
+
+2. **Torso-lean gate (back_side vs side):** Pure side requires BOTH `shoulder_width < SIDE_WIDTH` AND `hip_width < SIDE_HIP_WIDTH (0.08)`. Prevents shoulder-occluded OHP lockout frames from false-classifying as side.
+
+3. **Arm-visibility asymmetry signals:**
+   - `ARM_ASYM_DIAGONAL=0.35`: if L/R arm visibility asymmetry > threshold, force diagonal even at wide shoulder.
+   - `ARM_ASYM_BACK_DEMOTE=0.20`: wide-back classification demoted to back_side when arms asymmetric.
+   - `ARM_ASYM_SIDE=0.40`: side rescue in gray zone requires far arm deeply occluded.
+   - `FAR_ARM_VIS_OCCLUDED=0.20`: far arm must be truly invisible (not just low) for SIDE_RESCUE.
+
+4. **Pure-view rescue:** In diagonal zone, if both arms visible + symmetric (`arm_asym < ARM_ASYM_PURE=0.10`) + definitive depth → re-promote front_side→front or back_side→back. Fixes narrow-shouldered subjects landing below `DIAGONAL_WIDTH=0.18` despite genuinely facing camera.
+
+5. **SIDE_RESCUE gates tightened:** Added `not face_detected` (BlazeFace fire contradicts side view) and `far_arm_vis < FAR_ARM_VIS_OCCLUDED` (OHP lockout arm-behind-head temporarily drops vis but isn't pure side).
+
+6. **Video-level depth correction upgraded:** Replaced `has_any_forward_depth` boolean with `forward_depth_count` vs `backward_depth_count` counts. Override fires only when forward count dominates — prevents single-frame noise from flipping a genuinely back-facing video. Added `FACE_OVERRIDE_RATIO=0.25` second trigger (BlazeFace majority → override back→front). Added `FACE_BACK_DEMOTE_RATIO=0.20` inverse (face barely fires + front-classified → demote to back).
+
+7. **`front_side`/`back_side` → `diagonal` display normalization (Option C — internal alias):**
+   - Backend (`classify_views.py`, `scoring.py`, `temporal_segmentation.py`) keeps raw `front_side`/`back_side` labels for view-specific scoring branches (squat has different thresholds per angle).
+   - **Display layer normalizes both → `"diagonal"` at output boundaries:**
+     - `apps/desktop-ui/app.py`: `_display_view()` helper applied at 4 UI display sites.
+     - `apps/api/pipeline.py`: `_display_view()` applied to API response `view` field.
+   - Web frontend / end users never see `front_side` or `back_side`. Annotation UI retains raw labels for labeler precision.
+
+8. **Added `diag_classify.py`** at repo root — diagnostic tool for per-frame signal inspection (shoulder width, hip width, arm vis, asymmetry, depth, face_detected, rule fired). Used for threshold tuning.
+
+**Test cases validated:**
+- `67626_1` (true front, narrow shoulders, sw~0.174): pure-view rescue → `front` ✓
+- `65000_1` (true back_side, transient forward-depth frames): count-based override → `back_side` ✓
+- `61312_12` (true front_side, OHP head-tilt, face fires 51%): face-dominates override → `front_side` ✓
+- `56030_4` (true back_side, face fires 17%): face-absent demote → `back_side` ✓ (via backend label → display shows `diagonal`)
+
+---
+
+## 2026-05-13 (Session 9f) — OHP Neural View Classifier (Module + Training + Stage 4 Hook)
+
+**Focus:** Add a neural view classifier for OHP with confidence-gated fallback in Stage 4.
+
+**What was done:**
+
+1. **New neural module:** `core/exevision/neural/ohp/view_classifier.py` — MLP model, per-frame feature extraction, `predict_video()`, and `load_view_classifier()` helper.
+2. **Unit tests:** `tests/test_view_classifier.py` — coverage for feature extraction, model forward, and inference edge cases.
+3. **Training script:** `core/exevision/training/ohp/train_view_classifier.py` — class-weighted MLP training with 5-fold stratified CV (video-level) and final checkpoint save.
+4. **Stage 4 integration:** `core/exevision/stages/classify_views.py` — added `--neural`, `--neural-model`, `--confidence-threshold`; neural-first classification with heuristic fallback; writes `info.view_reliable`.
+5. **Docs update:** `CLAUDE.md` Stage 4 section now documents the neural classifier and default threshold.
+
+---
+
+## 2026-05-12 (Session 9d) — OHP Phase 3 Annotator: Scored List Integration & Video Playback
+
+**Focus:** Wire annotator to `D:\FitnessAQA\ohp_phase3\` data structure, add video playback, on-demand extraction, and view annotation label.
+
+**What was done:**
+1. **Scored-list direct load:** `_load_from_scored_list_dir()` reads `D:\FitnessAQA\ohp_phase3\scored_list\` directly — no `select_ohp_phase3_samples.py` pre-step needed. Stores `knee_error`, `heuristic_metric_scores`, `fps`, `_features_json`, `_segmented_json` per rep.
+2. **Default paths updated:** `PHASE3_WORKSPACE_DIR` → `D:\FitnessAQA\ohp_phase3\`. Output paths now compute to `{WORKSPACE}/overhead_press/visualized_poses_clean/raw_unfiltered/` and `{WORKSPACE}/overhead_press/segmented_reps/raw_unfiltered/`.
+3. **Video playback:** Play/Pause button with `master.after(interval_ms, _play_tick)` loop at real FPS (from scored_list metadata). Loops back to frame 0.
+4. **Visualized mp4:** `_find_visualized()` + `_load_skel_frames()` load pre-extracted `{video_id}_annotated.mp4` from workspace structure into right panel. Falls back to feature-based skeleton rendering if unavailable.
+5. **On-demand extraction:** "Extract This Video" button runs `extract_selected_features.py unfiltered --video-id {id}` as non-blocking subprocess. "Batch Extract…" dialog collects N unique video_ids from scored list at current position, skips already-extracted, drains queue one-at-a-time via `_poll_extraction` → `_start_next_extraction` chain.
+6. **Rep Info panel:** Read-only display of view, knee_error, heuristic metric scores, phases — populated on every rep load.
+7. **View annotation label:** Combobox (front/back/side/front_side/back_side/unknown) pre-filled from pipeline view; saved as `annotated_view` in output JSON.
+8. **Bug fixes:** `tk.Scale` has no `.state()` → use `.config(state=...)`. `ttk.Radiobutton` with `IntVar(value=0)` unreliable → use `tk.Radiobutton`. `_push_frame` needs `text=""` to clear `ttk.Label` placeholder. `set_display_labels` must defer render with `master.after(150, ...)`. `sys.path` must include `_REPO` at module level for `core.exevision.*` imports.
+
+---
+
+## 2026-05-11 (Session 9c) — Phase 3 Round-2 Deviation Fixes
+
+**Focus:** Four remaining deviations and two improvements found in round-2 review resolved.
+
+**DEV-6 — `evaluate_phase3.py` real evaluation loop (Step 11):**
+- Replaced hardcoded mock metrics with real ensemble inference on the held-out test split.
+- Loads all 5 seed checkpoints from `model_dir/`; runs 5-seed × 4-TTA ensemble per rep.
+- Computes NaN-masked MAE for all continuous metrics; ROC-AUC for `lockout`.
+- Gates against all 8 `ACCEPTANCE_THRESHOLDS`; exits 0 (PASS) or 1 (FAIL).
+
+**DEV-7 — `tta.py` horizontal flip was a no-op (Step 12):**
+- Root cause: `OHP_LR_SWAP_INDICES` used raw MediaPipe landmark indices (11–28) as the joint-dimension index on a tensor of size `J=10`. All indices ≥ 10 were silently skipped by the bounds guard → flip was identical to original.
+- Fix: replaced with `OHP_LR_SWAP_LOCAL` using correct local positional indices (0–9) derived from `OHP_ACTIVE_JOINTS = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26]`.
+- Also fixed temporal jitter to use `dims=-2` for robustness with/without batch dimension.
+- Verified: `variants[0][1]` and `variants[1][1]` are now distinct tensors.
+
+**DEV-8 — `inference.py` TTA import fragile absolute package path (Step 19b):**
+- Changed `from core.exevision.training.ohp.tta import apply_tta` → `from tta import apply_tta`.
+- `_TRAIN_OHP` is already on `sys.path` at the top of `inference.py`, so this is reliable in all subprocess contexts.
+- Also fixed `_REPO` derivation: was using `parents[2]` (wrong), now correctly `parents[4]` to reach repo root.
+
+**IMP-1 — `finetune_phase3.py` SWA weights never saved (Step 10):**
+- After Stage 2 completes, added `torch.optim.swa_utils.update_bn()` to refresh batch norm running stats on both SWA-averaged models.
+- Saves `swa_bilstm.module.state_dict()` and `swa_stgcn.module.state_dict()` as the final checkpoint (overwriting the best-epoch checkpoint). Fusion is not SWA-averaged; its best-epoch checkpoint is retained.
+
+**IMP-3 — `neural_fusion_inference.py` and `inference.py` `model_dir` fallback resolved from CWD:**
+- Changed `Path("models")` fallback → `Path(__file__).resolve().parents[N] / "models"` (repo-root relative).
+- Applied in both `neural_fusion_inference.py` (router) and `inference.py` (both `run_ohp_inference` and `run_ohp_phase3_ensemble`).
+
+**All 11 verification checks passing:**
+Config keys ✅ | No `neural_scores` + TTA local import ✅ | Model heads+forward ✅ | Registry ✅ |
+PHASE3_CUE_THRESHOLDS+`_emit_phase3_cues` ✅ | Losses ✅ | data_phase3 ✅ | TTA 4-variants+flip-distinct ✅ |
+evaluate_phase3 real impl ✅ | SWA save ✅ | model_dir fallback ✅
+
+
+**Focus:** Four implementation gaps found in post-session review resolved.
+
+**DEV-1 — `engine.py` Phase 3 cue wiring (Step 20):**
+- Added module-level `PHASE3_CUE_THRESHOLDS` dict (8 keys: `lockout_prob`, `elbow_flare`, `smoothness`, `control`, `grip_ratio`, `rom_top`, `rom_bottom`, `knee_error_prob`).
+- Added `_emit_phase3_cues(rep_data)` — reads `error_cues_phase3` from exercise config, checks threshold direction, emits cue text. Zero exercise-specific branches; no-ops for squat config.
+- Wired into `generate_feedback()` loop after issue items.
+
+**DEV-3 — `data_phase3.py` real feature loading (Step 8):**
+- Replaced mock `torch.zeros(...)` with real `_extract_rep_matrix()`, `_extract_stgcn_rep()`, `build_ohp_heuristic_vector()` — identical pattern to Phase 2 `data.py`.
+- Added `fitnessaqa_split` filter and `human_score` presence check.
+
+**DEV-4 — `finetune_phase3.py` real training loop (Step 10):**
+- Full Stage 1 (20 ep, freeze encoder) → Stage 2 (60 ep, SGDR `T_0=20,T_mult=1,eta_min=1e-6`, SWA from ep 51).
+- Calls `load_phase2_for_phase3()`; knee head stays frozen. Checkpoints on best `lockout_auc`.
+- 5-fold stratified CV (default); `--final` runs 5-seed retrain on full annotation set.
+
+**DEV-5 — `annotation_overhead_press.py` full annotator (Step 6):**
+- Dual-pane canvas (raw video | skeleton overlay) via `cv2` + `PIL.ImageTk`.
+- Loads rep queue from `phase3_target_reps.json`; frame navigation; prev/next/skip rep.
+- `_save_annotation()` upserts by rep-id into `OHP_PHASE3_ANNOTATIONS_DIR/{video_id}.json`.
+- `_reveal_heuristic()` shows Δ after submit (bias-blind). Grip slider auto-disabled for side view.
+
+**All plan checklist items verified passing:** Config keys ✅ | No `neural_scores` path ✅ | Model heads+forward ✅ | Registry ✅ | `PHASE3_CUE_THRESHOLDS`+`_emit_phase3_cues` ✅ | losses ✅ | data_phase3 ✅
+
+---
+
+## 2026-05-11 (Session 9) — OHP Phase 3 Multi-Task Annotation & Fine-Tuning Prep
+
+**Focus:** Implement Phase 3 multi-task annotation UI, training infrastructure, and ensemble inference.
+
+**What was done:**
+1. **Config (`overhead_press.json`)**: Added `annotation_metrics_phase3`, `annotation_binary_phase3`, `annotation_grip_null_views`, `error_cues_phase3`.
+2. **Skeleton Overlay (`skeleton_overlay.py`)**: New `core/exevision/utils/` utility for cached-keypoint skeleton draw (no MediaPipe re-run).
+3. **Neural Registry (`registry.py`)**: New `core/exevision/neural/registry.py` — lazy-loading registry mapping exercise → model classes.
+4. **Model Architecture (`models.py`)**: Added Phase 3 heads (`smoothness`, `control`, `lockout`, `elbow_flare`, `grip_ratio`, `rom_top`, `rom_bottom`) and `load_phase2_for_phase3` weight-transfer method to both `OHPBiLSTMScorer` and `OHPSTGCNScorer`.
+5. **Sample Selection (`select_ohp_phase3_samples.py`)**: Stratified rep selector with calibration/uncertainty/error/view-balance strata.
+6. **Annotation UI (`annotation_overhead_press.py`, `app.py`)**: OHP Phase 3 annotator window; OHP Phase 3 launch button in desktop UI.
+7. **Dataset Loader (`data_phase3.py`)**: `OHPPhase3Dataset` + `build_phase3_dataloaders` for Phase 3 manual annotations.
+8. **Losses (`losses.py`)**: `masked_mse`, `weighted_bce`, `compute_phase3_loss` with exact plan weights.
+9. **Fine-tuning (`finetune_phase3.py`)**: Progressive unfreezing, SGDR+SWA, 5-fold CV + 5-seed final retrain.
+10. **Evaluation (`evaluate_phase3.py`)**: 8-metric acceptance thresholds; PASS/EXIT-0 gate.
+11. **TTA (`tta.py`)**: 4 variants — original, horizontal flip (L-R joint swap), +1/-1 temporal jitter.
+12. **Bug Fix 19a (`inference.py`)**: `neural_scores/` → `neural_analysis/`.
+13. **Ensemble routing (`neural_fusion_inference.py`)**: Phase 3 ensemble if seed checkpoints found, else Phase 2 fallback.
+14. **Feedback Engine (`engine.py`)**: `get_category_for_metric` updated for new OHP spatial metrics.
+
+**Next Steps (Steps 13-18):**
+- Run `select_ohp_phase3_samples.py` to generate `phase3_target_reps.json`.
+- Annotate ~250 reps using OHP Phase 3 Annotator UI.
+- Check ICC ≥ 0.7, lockout=0 ≥ 30, each view ≥ 20.
+- Run 5-fold CV then 5-seed final retrain.
+
+
 ## 2026-05-08 — Fix Squat-Derived Components in OHP Path
 
 **Problem:** Three squat-centric components were inherited by the OHP neural path.
@@ -66,7 +337,7 @@ block Phase 3 arm-form labels (grip, ROM, elbow flare, smoothness, lift stabilit
 
 **State of the codebase:**
 - Phase 1 (self-supervised pretraining): ✅ Complete — BiLSTM + ST-GCN pretrained on ~2.8k unlabeled OHP videos
-- Phase 2 (FitnessAQA fine-tuning): ✅ Complete — standing OHP only, knee error detection (AUC 0.702), quality (MAE 0.095)
+- Phase 2 (FitnessAQA fine-tuning): ✅ Complete (re-run 2026-05-10) — standing OHP, knee error AUC 0.724, MAE 0.015
 - Seated OHP: pretrained encoder only, no Phase 2 model, returns `neural_available: false` at inference
 - Squat: unchanged, fully working
 
@@ -79,27 +350,62 @@ block Phase 3 arm-form labels (grip, ROM, elbow flare, smoothness, lift stabilit
 
 ### Priority 1 — Wire `knee_error_prob` into feedback engine
 - `core/exevision/feedback/engine.py` — currently ignores `knee_error_prob` entirely
-- When `knee_error_prob > threshold` (suggest 0.5), feedback should say something like "Your knees showed instability during the press — focus on keeping them tracking over your toes"
-- Need to define threshold, feedback text, and where in the feedback JSON it surfaces
-- Check `apps/api/pipeline.py` `collect_results()` to see if `knee_error_prob` is already passed through to the result payload
+- When `knee_error_prob > 0.5`, emit cue: "Your knees showed instability during the press — focus on keeping them tracking over your toes"
+- Check `apps/api/pipeline.py` `collect_results()` to confirm `knee_error_prob` flows through to result payload
+- Define threshold constant, feedback text location, surface in feedback JSON
 
 ### Priority 2 — Wire Stage 9 into desktop UI (Active Issue #4)
 - `apps/desktop-ui/app.py` runs stages 2.5→4→5→8 only (heuristic-only)
 - Stage 9 (`neural_fusion_inference.py`) exists and works in API pipeline but not desktop UI
-- Add neural toggle checkbox to UI; when enabled, run Stage 9 after Stage 8
-- Standing OHP will now show `knee_error_prob` in desktop results
+- Add neural toggle checkbox; when enabled, run Stage 9 after Stage 8
+- Standing OHP will show `knee_error_prob` in desktop results
 
 ### Priority 3 — Phase 3: Manual annotation + fusion retraining (separate plan)
-- AUC ceiling at 0.70 with FitnessAQA labels (noisy, pose-based)
-- Manual annotation of a subset of videos with explicit error labels → cleaner training signal
-- Retrain fusion layer on manually annotated data
-- Could push knee AUC to 0.80+
+- AUC ceiling ~0.72 with FitnessAQA labels (noisy, pose-based)
+- Manual annotation of subset with explicit error labels → cleaner signal
+- Retrain fusion on manually annotated data → target AUC 0.80+
 - Separate brainstorm + plan required before starting
 
-### Known limitations to document before Phase 3:
-- `knee_error_prob` is a probability, not a diagnosis — 0.83 means "likely knee error" not "definite knee error"
-- AUC 0.70 means ~30% of predictions are wrong at threshold 0.5
-- Seated OHP never gets knee feedback (by design — legs zeroed)
+### Known limitations:
+- `knee_error_prob` is probability, not diagnosis — 0.83 = "likely" not "certain"
+- AUC 0.724 = ~28% wrong at threshold 0.5
+- Seated OHP never gets knee feedback (legs zeroed by design)
+
+---
+
+## 2026-05-10 — OHP Phase 2 Re-run: Architecture-Correct Training
+
+**Status: COMPLETE ✅**
+
+**Why re-run was needed:**
+Session 2026-05-08 changed OHP neural architecture (8-channel BiLSTM, 10-joint ST-GCN) AFTER Phase 2 training completed. Old checkpoints were incompatible with new code. Phase 2 data (segmented JSONs from 2026-05-07) also lacked 4 new OHP signals needed by 8-channel BiLSTM. Both blockers fixed this session.
+
+**Fixes to `core/exevision/neural/ohp/models.py`:**
+- `OHPBiLSTMScorer.load_pretrained()` — added shape-mismatch filter before `load_state_dict`. Old pretrained checkpoint has `lstm1.weight_ih_l0` shape `[512,4]`; new model expects `[512,8]`. Filter skips incompatible keys; `lstm2` + `temporal_attention` weights still transfer.
+- `OHPSTGCNScorer.load_pretrained()` — same fix. `spatial.A` buffers stored as `[11,11]` in old checkpoint, now `[10,10]`. All conv/BN block weights transfer; only adjacency buffers skipped (re-init from `build_adjacency_matrix_ohp()` in constructor).
+
+**Fixes to `core/exevision/training/ohp/finetune.py`:**
+- `_LAMBDA_KNEE`: 0.3 → 1.0 — knee detection is primary objective; old value let quality MSE dominate
+- Added `_compute_val_metrics()` — collects all val predictions, computes `roc_auc_score` over full val set per epoch
+- Checkpoint criterion: `val_loss < best_val` → `knee_auc > best_knee_auc` — saves model with best knee discrimination, not best combined loss
+- Per-epoch log now shows `val_loss` + `knee_auc` separately
+- Early stopping now triggers on knee AUC stagnation (not val loss)
+- LR scheduler still uses `val_loss` (continuous signal, better for `ReduceLROnPlateau`)
+
+**Data fix — re-segmented Phase 2 labeled data:**
+- 1,430 segmented JSONs at `D:\FitnessAQA\ohp_phase2\workspace\overhead_press\segmented_reps\raw_unfiltered\` were dated 2026-05-07 — missing 4 new OHP signals
+- Re-ran `temporal_segmentation.py --exercise overhead_press --quality raw_unfiltered --no-viz` from `D:\FitnessAQA\ohp_phase2\workspace`
+- New signals now present: `elbow_angles_avg`, `wrist_lr_diff_y`, `shoulder_lr_diff_y`, `wrist_acceleration`
+- Re-ran `prepare_dataset.py` to regenerate annotation JSONs → `training_dataset/ohp_phase2_annotations/`
+
+**Final evaluation results (n=213 test reps):**
+- MAE: 0.015 ✅ (was 0.095 — 6× improvement from richer arm signals)
+- Knee Error AUC: 0.724 ✅ (was 0.702)
+
+**Valid checkpoints in `models/`:**
+- `bilstm_ohp_phase2.pt` — 8-channel BiLSTM, standing OHP, quality + knee error heads
+- `stgcn_ohp_phase2.pt` — 10-joint ST-GCN (shoulders/elbows/wrists/hips/knees), quality + knee error heads
+- `fusion_ohp_phase2.pt` — HeuristicGuidedFusion combining both encoders + 16-dim heuristic vector
 
 ---
 

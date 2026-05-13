@@ -3,6 +3,8 @@ import os
 import json
 import math
 import shutil
+import sys
+from pathlib import Path
 import numpy as np
 from collections import defaultdict, Counter
 from tqdm import tqdm
@@ -22,21 +24,71 @@ def _build_features_dirs(exercise: str):
     tiers = ["excellent", "good", "fair", "raw_unfiltered"]
     return [f"./{exercise}/extracted_features_clean/{tier}" for tier in tiers]
 
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+_NEURAL_MODEL_CACHE = {}
+
+
+def _try_neural_classify(
+    keypoints_img: list,
+    face_detected_list: list,
+    model_path: str,
+    confidence_threshold: float = 0.7,
+) -> tuple[str | None, float]:
+    """Return (label, confidence) or (None, 0.0) on failure or low confidence."""
+    if not model_path or not os.path.exists(model_path):
+        return None, 0.0
+    try:
+        from core.exevision.neural.ohp.view_classifier import load_view_classifier, predict_video
+
+        if model_path not in _NEURAL_MODEL_CACHE:
+            _NEURAL_MODEL_CACHE[model_path] = load_view_classifier(model_path)
+        model = _NEURAL_MODEL_CACHE[model_path]
+
+        label, conf = predict_video(model, keypoints_img, face_detected_list)
+        if label == "unknown" or conf < confidence_threshold:
+            return None, conf
+        return label, conf
+    except Exception:
+        return None, 0.0
+
 # BlazePose landmark indices
 NOSE = 0
 L_EYE = 2
 R_EYE = 5
 L_EAR = 7
 R_EAR = 8
-L_HIP = 23
-R_HIP = 24
 L_SHOULDER = 11
 R_SHOULDER = 12
+L_ELBOW = 13
+R_ELBOW = 14
+L_WRIST = 15
+R_WRIST = 16
+L_HIP = 23
+R_HIP = 24
+
+L_ARM_INDICES = (L_ELBOW, L_WRIST)
+R_ARM_INDICES = (R_ELBOW, R_WRIST)
 
 # Thresholds
 VIS_THRESHOLD = 0.5          # visibility score cutoff (if available)
-SIDE_WIDTH = 0.08            # shoulder x-spread below this → side
+SIDE_WIDTH = 0.08            # shoulder x-spread below this → side candidate
+SIDE_HIP_WIDTH = 0.08        # hip x-spread below this → side candidate (AND-gate with shoulders)
+SIDE_GRAY_WIDTH = 0.12       # shoulder x-spread below this + single-arm-visible → side rescue
 DIAGONAL_WIDTH = 0.18        # shoulder x-spread below this → diagonal
+
+# Arm visibility thresholds (exercise-agnostic occlusion physics)
+ARM_VIS_PRESENT = 0.5        # avg(elbow+wrist) visibility above this → arm clearly visible
+ARM_ASYM_PURE = 0.10         # L vs R arm vis diff below this → arms truly symmetric (pure-view rescue)
+ARM_ASYM_DIAGONAL = 0.35     # L vs R arm vis diff above this → force diagonal classification
+ARM_ASYM_SIDE = 0.40         # L vs R arm vis diff above this (in side gray zone) → side
+ARM_ASYM_BACK_DEMOTE = 0.20  # in wide-back zone, asymmetry above this → demote back → back_side
+FAR_ARM_VIS_OCCLUDED = 0.20  # far arm vis below this required for side rescue (deep occlusion only)
+FACE_OVERRIDE_RATIO = 0.25       # BlazeFace fires on >= this ratio of frames → override back/back_side
+FACE_BACK_DEMOTE_RATIO = 0.20    # BlazeFace fires on < this ratio + label is front/front_side → demote
 
 MAX_FRAMES = 60
 
@@ -53,6 +105,13 @@ def _face_score(frame, has_vis: bool) -> float:
     if not has_vis:
         return 0.0
     return frame[NOSE][3] + frame[L_EYE][3] + frame[R_EYE][3]
+
+
+def _arm_vis_avg(frame, has_vis: bool, indices) -> float:
+    """Mean visibility of arm landmarks (elbow+wrist). Returns 0.0 if vis scores absent."""
+    if not has_vis:
+        return 0.0
+    return sum(frame[i][3] for i in indices) / len(indices)
 
 
 def _facing_camera(frame, has_vis: bool) -> bool | None:
@@ -96,21 +155,63 @@ def _classify_frame(frame, face_detected: bool = False) -> str | None:
     any_face = nose_vis or l_eye_vis or r_eye_vis
     both_eyes = l_eye_vis and r_eye_vis
 
-    # --- Signal 2: Shoulder width (x-axis spread) ---
+    # --- Signal 2: Shoulder + hip width (x-axis spread) ---
     lsx = frame[L_SHOULDER][0]
     rsx = frame[R_SHOULDER][0]
     shoulder_width = abs(lsx - rsx)
 
+    lhx = frame[L_HIP][0]
+    rhx = frame[R_HIP][0]
+    hip_width = abs(lhx - rhx)
+
+    # --- Signal 3: Arm visibility (elbow + wrist avg per side) ---
+    # Pure back/front: both arms clearly visible (symmetric occlusion).
+    # Diagonal (back_side/front_side): one arm partially occluded by torso (asymmetric).
+    # Side: only one arm visible from camera perspective (far arm hidden behind torso).
+    l_arm_vis = _arm_vis_avg(frame, has_vis, L_ARM_INDICES)
+    r_arm_vis = _arm_vis_avg(frame, has_vis, R_ARM_INDICES)
+    arm_asym = abs(l_arm_vis - r_arm_vis)
+    both_arms_visible = l_arm_vis > ARM_VIS_PRESENT and r_arm_vis > ARM_VIS_PRESENT
+    single_arm_visible = (l_arm_vis > ARM_VIS_PRESENT) ^ (r_arm_vis > ARM_VIS_PRESENT)
+
     # --- Decision logic ---
 
-    # Side: shoulders nearly collapsed in x
-    if shoulder_width < SIDE_WIDTH:
+    # Strong side: BOTH shoulder + hip collapsed in x (torso = thin vertical slab)
+    if shoulder_width < SIDE_WIDTH and hip_width < SIDE_HIP_WIDTH:
+        return "side"
+
+    # Shoulder-only collapse with wide hips → NOT side (one shoulder occluded/raised).
+    # Fall through to diagonal/face/depth logic instead of false-positive side.
+    # (No early return here — control flow continues to diagonal check below.)
+
+    # Side rescue: gray-zone shoulder + hip narrow + single arm DEEPLY occluded + strong asymmetry
+    # Extra gates prevent OHP diagonal lockout (far arm behind head) from being mis-classified as side:
+    #   - face_detected=False: BlazeFace fires only on front-facing faces; side profile rarely detected
+    #   - far_arm_vis < FAR_ARM_VIS_OCCLUDED: pure side fully occludes far arm; diagonals only drop vis temporarily
+    far_arm_vis = min(l_arm_vis, r_arm_vis)
+    if (has_vis
+            and not face_detected
+            and shoulder_width < SIDE_GRAY_WIDTH
+            and hip_width < SIDE_GRAY_WIDTH
+            and single_arm_visible
+            and arm_asym > ARM_ASYM_SIDE
+            and far_arm_vis < FAR_ARM_VIS_OCCLUDED):
         return "side"
 
     # Depth signal: True=facing camera, False=back to camera, None=unreliable
     depth_forward = _facing_camera(frame, has_vis)
 
-    if shoulder_width < DIAGONAL_WIDTH:
+    # Diagonal zone: shoulder narrow OR arms strongly asymmetric (forces diagonal even at wide shoulder)
+    in_diagonal = shoulder_width < DIAGONAL_WIDTH or (has_vis and arm_asym > ARM_ASYM_DIAGONAL)
+
+    if in_diagonal:
+        # Pure-view rescue: arms truly symmetric + both visible + depth definitive → really pure view.
+        # Diagonals always occlude one arm partially (asym > ARM_ASYM_PURE); symmetric arms means
+        # subject just narrower than DIAGONAL_WIDTH threshold but body genuinely faces camera.
+        if (has_vis and both_arms_visible and arm_asym < ARM_ASYM_PURE
+                and depth_forward is not None):
+            return "front" if depth_forward else "back"
+
         if depth_forward is True:
             return "front_side"
         if depth_forward is False:
@@ -122,15 +223,22 @@ def _classify_frame(frame, face_detected: bool = False) -> str | None:
             return "front_side"
         return "back_side"
 
-    # Pure front vs back (wide-shoulder zone)
+    # Pure front vs back (wide-shoulder + symmetric arms)
     if depth_forward is True:
         return "front"
     if depth_forward is False:
+        # Demote pure back → back_side when one arm clearly more occluded than the other
+        # (pure back view shows both arms; asymmetry indicates rotation off-axis)
+        if has_vis and not both_arms_visible and arm_asym > ARM_ASYM_BACK_DEMOTE:
+            return "back_side"
         return "back"
     if face_detected:
         return "front"
     if any_face:
         return "front"
+    # No depth, no face: arms decide back vs back_side
+    if has_vis and not both_arms_visible and arm_asym > ARM_ASYM_BACK_DEMOTE:
+        return "back_side"
     return "back"
 
 
@@ -143,7 +251,10 @@ def get_view_label(keypoints_img: list, face_detected_list: list = None) -> str:
 def get_view_label_with_probs(keypoints_img: list, face_detected_list: list = None) -> tuple[str, dict]:
     """Classify with full vote distribution."""
     votes = []
-    has_any_forward_depth = False  # True if nose was ever definitively in front of hips
+    forward_depth_count = 0   # frames with nose definitively in front of hips
+    backward_depth_count = 0  # frames with nose definitively behind hips
+    face_detected_count = 0   # frames where BlazeFace fired
+    valid_face_frames = 0     # frames with usable BlazeFace signal
 
     for idx, frame in enumerate(keypoints_img or []):
         if len(votes) >= MAX_FRAMES:
@@ -154,14 +265,20 @@ def get_view_label_with_probs(keypoints_img: list, face_detected_list: list = No
         if label:
             votes.append(label)
 
-        # Track any frame where depth is definitively forward (nose closer than hips).
-        # A single True frame proves the person faced the camera at some point —
-        # back/back_side votes on other frames are OHP head-tilt noise, not actual
-        # back-facing orientation.
+        # Track depth signal per frame (count forward vs backward, not just any-forward).
         if frame and len(frame) > 24:
             has_vis = len(frame[0]) > 3
-            if _facing_camera(frame, has_vis) is True:
-                has_any_forward_depth = True
+            depth = _facing_camera(frame, has_vis)
+            if depth is True:
+                forward_depth_count += 1
+            elif depth is False:
+                backward_depth_count += 1
+
+        # Track BlazeFace fire rate across the video
+        if face_detected_list and idx < len(face_detected_list):
+            valid_face_frames += 1
+            if face_detected_list[idx]:
+                face_detected_count += 1
 
     if not votes:
         return "unknown", {"front": 0.0, "back": 0.0, "side": 0.0, "front_side": 0.0, "back_side": 0.0}
@@ -173,16 +290,39 @@ def get_view_label_with_probs(keypoints_img: list, face_detected_list: list = No
 
     label = max(probs, key=probs.get)
 
-    # Video-level correction: if any frame showed forward depth, the majority
-    # back/back_side vote is from head tilt — override to the front equivalent.
-    if has_any_forward_depth and label == "back_side":
+    # Video-level corrections.
+    #
+    # BACK → FRONT override (OHP head-tilt fix). Two independent triggers:
+    #   1. Forward depth dominates backward depth (depth signal contradicts back classification).
+    #   2. BlazeFace fires on >= FACE_OVERRIDE_RATIO of frames. Pure back never sees the face;
+    #      strong face presence means subject faces camera even when head-tilt pushes nose
+    #      behind hips during OHP lockout.
+    #
+    # FRONT → BACK demote (depth hallucination fix). MediaPipe sometimes places nose_z forward
+    # of hips even from back angles (face landmark hallucination, forward torso lean). When this
+    # happens, BlazeFace is the only reliable discriminator. If face barely fires (< 20% of
+    # frames), the subject is almost certainly back-facing despite the depth signal.
+    forward_dominates = forward_depth_count > backward_depth_count and forward_depth_count > 0
+    face_ratio = (face_detected_count / valid_face_frames) if valid_face_frames > 0 else None
+    face_dominates = face_ratio is not None and face_ratio >= FACE_OVERRIDE_RATIO
+    face_absent = face_ratio is not None and face_ratio < FACE_BACK_DEMOTE_RATIO
+
+    if (forward_dominates or face_dominates) and label == "back_side":
         label = "front_side"
-    elif has_any_forward_depth and label == "back":
+    elif (forward_dominates or face_dominates) and label == "back":
         label = "front"
+    elif face_absent and label == "front_side":
+        label = "back_side"
+    elif face_absent and label == "front":
+        label = "back"
 
     return label, probs
 
-def process_video_classification(json_path: str) -> tuple:
+def process_video_classification(
+    json_path: str,
+    neural_model_path: str = "",
+    confidence_threshold: float = 0.7,
+) -> tuple:
     """
     Read JSON, classify view, update JSON, return result
     """
@@ -197,13 +337,27 @@ def process_video_classification(json_path: str) -> tuple:
         keypoints_img = data.get('keypoints_img', [])
         face_detected_list = data.get('face_detected', [])
         
-        # Classify view
-        view = get_view_label(keypoints_img, face_detected_list)
+        # Classify view (neural first, fallback to heuristic)
+        view = None
+        neural_used = False
+        if neural_model_path:
+            neural_label, _conf = _try_neural_classify(
+                keypoints_img,
+                face_detected_list,
+                neural_model_path,
+                confidence_threshold,
+            )
+            if neural_label is not None:
+                view = neural_label
+                neural_used = True
+        if view is None:
+            view = get_view_label(keypoints_img, face_detected_list)
         
         # Update JSON with view classification
         if 'info' not in data:
             data['info'] = {}
         data['info']['view'] = view
+        data['info']['view_reliable'] = bool(neural_used or view != "unknown")
         
         # Write back to same file
         with open(json_path, 'w') as f:
@@ -215,7 +369,13 @@ def process_video_classification(json_path: str) -> tuple:
         return video_id, "Error", str(e)
 
 
-def run_classification(quality_filter=None, video_id_filter=None, exercise="squat"):
+def run_classification(
+    quality_filter=None,
+    video_id_filter=None,
+    exercise="squat",
+    neural_model_path: str = "",
+    confidence_threshold: float = 0.7,
+):
     """
     Process all extracted features and classify by view.
     Updates JSON files in place with view field.
@@ -269,7 +429,11 @@ def run_classification(quality_filter=None, video_id_filter=None, exercise="squa
     results = []
     
     for json_path in tqdm(json_files, desc="Classifying videos"):
-        video_id, status, view = process_video_classification(json_path)
+        video_id, status, view = process_video_classification(
+            json_path,
+            neural_model_path=neural_model_path,
+            confidence_threshold=confidence_threshold,
+        )
         
         if status == "Success":
             stats[view] += 1
@@ -305,6 +469,28 @@ if __name__ == "__main__":
     parser.add_argument("--quality", choices=["excellent", "good", "fair", "raw_unfiltered"], help="Filter by quality")
     parser.add_argument("--video-id", help="Process only one video id (e.g., 25709_1)")
     parser.add_argument("--exercise", default="squat", help="Exercise type (default: squat)")
+    parser.add_argument(
+        "--neural",
+        action="store_true",
+        help="Use neural view classifier (fallback to heuristic if low confidence)",
+    )
+    parser.add_argument(
+        "--neural-model",
+        default="models/view_classifier_ohp.pt",
+        help="Path to view_classifier_ohp.pt",
+    )
+    parser.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=0.7,
+        help="Neural confidence below this uses heuristic fallback",
+    )
     args = parser.parse_args()
 
-    run_classification(quality_filter=args.quality, video_id_filter=args.video_id, exercise=args.exercise)
+    run_classification(
+        quality_filter=args.quality,
+        video_id_filter=args.video_id,
+        exercise=args.exercise,
+        neural_model_path=args.neural_model if args.neural else "",
+        confidence_threshold=args.confidence_threshold,
+    )

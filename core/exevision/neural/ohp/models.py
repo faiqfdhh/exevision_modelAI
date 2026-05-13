@@ -72,6 +72,9 @@ class OHPBiLSTMScorer(nn.Module):
         embed_dim = hidden_dim * 2
         self.quality_head = _score_head(embed_dim)
         self.knee_error_head = _error_head(embed_dim)
+        # Phase 3 temporal heads
+        self.smoothness_head = _score_head(embed_dim)
+        self.control_head = _score_head(embed_dim)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         out, _ = self.lstm1(x)
@@ -83,26 +86,51 @@ class OHPBiLSTMScorer(nn.Module):
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         emb = self.encode(x)
         return {
-            "embedding": emb,
-            "quality": self.quality_head(emb).squeeze(-1) * 100.0,
+            "embedding":  emb,
+            "quality":    self.quality_head(emb).squeeze(-1) * 100.0,
             "knee_error": self.knee_error_head(emb).squeeze(-1),
+            "smoothness": self.smoothness_head(emb).squeeze(-1) * 100.0,
+            "control":    self.control_head(emb).squeeze(-1) * 100.0,
         }
 
     def load_pretrained(self, path: str) -> Tuple[int, int]:
         """Load encoder weights from a pretrained checkpoint.
 
-        Ignores reconstruction_head keys so this works with both the full
-        pretrain checkpoint and encoder-only variants.
-        Returns (n_missing, n_unexpected).
+        Ignores reconstruction_head keys and skips any key whose tensor shape
+        doesn't match the current model (e.g. lstm1 input weights when channel
+        count changed from 4 → 8). Returns (n_missing, n_unexpected).
         """
         ckpt = torch.load(path, map_location="cpu")
         state = ckpt.get("state_dict", ckpt)
-        encoder_keys = {
+        model_state = self.state_dict()
+        compatible = {
             k: v for k, v in state.items()
             if not k.startswith("reconstruction_head")
+            and k in model_state
+            and v.shape == model_state[k].shape
         }
-        missing, unexpected = self.load_state_dict(encoder_keys, strict=False)
+        missing, unexpected = self.load_state_dict(compatible, strict=False)
         return len(missing), len(unexpected)
+
+    def load_phase2_for_phase3(self, path: str) -> None:
+        """Transfer Phase 2 encoder + knee_error_head; re-init quality_head; freeze knee.
+
+        Encoder weights (lstm1, lstm2, temporal_attention) transfer if shapes match.
+        quality_head excluded — Phase 3 trains it from scratch on manual annotations.
+        knee_error_head transfers and is frozen (Phase 2 labels, not re-annotated).
+        """
+        ckpt = torch.load(path, map_location="cpu")
+        state = ckpt.get("state_dict", ckpt)
+        model_state = self.state_dict()
+        transfer = {
+            k: v for k, v in state.items()
+            if not k.startswith("quality_head")
+            and k in model_state
+            and v.shape == model_state[k].shape
+        }
+        self.load_state_dict(transfer, strict=False)
+        for p in self.knee_error_head.parameters():
+            p.requires_grad = False
 
 
 class OHPSTGCNScorer(nn.Module):
@@ -140,6 +168,12 @@ class OHPSTGCNScorer(nn.Module):
         embed_dim = 256
         self.quality_head = _score_head(embed_dim + self._VIEW_DIM)
         self.knee_error_head = _error_head(embed_dim)
+        # Phase 3 spatial heads (embed_dim only — no view concat needed)
+        self.lockout_head    = _error_head(embed_dim)
+        self.elbow_flare_head = _score_head(embed_dim)
+        self.grip_ratio_head  = _score_head(embed_dim)
+        self.rom_top_head     = _score_head(embed_dim)
+        self.rom_bottom_head  = _score_head(embed_dim)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         x = self.block1(x)
@@ -160,22 +194,51 @@ class OHPSTGCNScorer(nn.Module):
         spatial_in = torch.cat([emb, view_vec], dim=-1)
 
         return {
-            "embedding": emb,
-            "quality": self.quality_head(spatial_in).squeeze(-1) * 100.0,
-            "knee_error": self.knee_error_head(emb).squeeze(-1),
+            "embedding":   emb,
+            "quality":     self.quality_head(spatial_in).squeeze(-1) * 100.0,
+            "knee_error":  self.knee_error_head(emb).squeeze(-1),
+            "lockout":     self.lockout_head(emb).squeeze(-1),
+            "elbow_flare": self.elbow_flare_head(emb).squeeze(-1) * 100.0,
+            "grip_ratio":  self.grip_ratio_head(emb).squeeze(-1) * 100.0,
+            "rom_top":     self.rom_top_head(emb).squeeze(-1) * 100.0,
+            "rom_bottom":  self.rom_bottom_head(emb).squeeze(-1) * 100.0,
         }
 
     def load_pretrained(self, path: str) -> Tuple[int, int]:
         """Load encoder weights from pretrained checkpoint (encoder-only .pt preferred).
 
-        Accepts both full pretrain checkpoint and encoder-only file.
-        Returns (n_missing, n_unexpected).
+        Accepts both full pretrain checkpoint and encoder-only file. Skips keys
+        whose tensor shape doesn't match the current model (e.g. spatial.A when
+        joint count changed from 11 → 10). Returns (n_missing, n_unexpected).
         """
         ckpt = torch.load(path, map_location="cpu")
         state = ckpt.get("state_dict", ckpt)
-        encoder_keys = {
+        model_state = self.state_dict()
+        compatible = {
             k: v for k, v in state.items()
             if k.startswith(("block1", "block2", "block3", "block4", "block5"))
+            and k in model_state
+            and v.shape == model_state[k].shape
         }
-        missing, unexpected = self.load_state_dict(encoder_keys, strict=False)
+        missing, unexpected = self.load_state_dict(compatible, strict=False)
         return len(missing), len(unexpected)
+
+    def load_phase2_for_phase3(self, path: str) -> None:
+        """Transfer Phase 2 encoder + knee_error_head; re-init quality_head; freeze knee.
+
+        Encoder weights (lstm1, lstm2, temporal_attention) transfer if shapes match.
+        quality_head excluded — Phase 3 trains it from scratch on manual annotations.
+        knee_error_head transfers and is frozen (Phase 2 labels, not re-annotated).
+        """
+        ckpt = torch.load(path, map_location="cpu")
+        state = ckpt.get("state_dict", ckpt)
+        model_state = self.state_dict()
+        transfer = {
+            k: v for k, v in state.items()
+            if not k.startswith("quality_head")
+            and k in model_state
+            and v.shape == model_state[k].shape
+        }
+        self.load_state_dict(transfer, strict=False)
+        for p in self.knee_error_head.parameters():
+            p.requires_grad = False

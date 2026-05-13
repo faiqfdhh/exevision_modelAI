@@ -23,6 +23,19 @@ from core.exevision.feedback.engine import FeedbackEngine
 
 logger = logging.getLogger(__name__)
 
+_DIAGONAL_ALIASES = {"front_side", "back_side", "front-side", "back-side"}
+
+
+def _display_view(raw_view) -> str | None:
+    """User-facing view label. Collapses front_side/back_side → 'diagonal'.
+    Backend keeps raw labels; API consumers see a unified diagonal."""
+    if raw_view is None:
+        return None
+    v = str(raw_view).lower().strip()
+    if not v:
+        return raw_view
+    return "diagonal" if v in _DIAGONAL_ALIASES else v
+
 # ── Paths ──────────────────────────────────────────────────────────────────────
 # apps/api/ → apps/ → exevision_modelAI/
 _API_DIR = Path(__file__).resolve().parent
@@ -939,7 +952,7 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
 
     result = {
         "video_id": video_id,
-        "view": aqa.get("view"),
+        "view": _display_view(aqa.get("view")),
         "quality": aqa.get("source_quality"),
         "rep_count": len(merged_reps),
         "overall_heuristic_score": aqa.get("overall_score"),

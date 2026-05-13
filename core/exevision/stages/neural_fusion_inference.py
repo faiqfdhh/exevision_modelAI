@@ -542,8 +542,15 @@ def main() -> int:
         _ohp = str(_Path(__file__).resolve().parents[1] / "neural" / "ohp")
         if _ohp not in _sys.path:
             _sys.path.insert(0, _ohp)
-        from inference import run_ohp_inference
-        run_ohp_inference(args)
+        from inference import run_ohp_inference, run_ohp_phase3_ensemble
+        
+        _model_dir_default = Path(__file__).resolve().parents[3] / "models"
+        model_dir = Path(getattr(args, "model_dir", None) or _model_dir_default)
+        seed_paths = list(model_dir.glob("bilstm_ohp_phase3_seed*.pt"))
+        if seed_paths:
+            run_ohp_phase3_ensemble(args)
+        else:
+            run_ohp_inference(args)
         return 0
 
     workspace_root = Path(args.workspace_root).resolve()

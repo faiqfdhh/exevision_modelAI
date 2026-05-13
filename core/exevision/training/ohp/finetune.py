@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from sklearn.metrics import roc_auc_score
 
 _REPO = Path(__file__).resolve().parents[4]
 _NEURAL = _REPO / "core" / "exevision" / "neural"
@@ -25,7 +26,7 @@ from data import build_dataloaders
 
 # Loss weights — knee-only (elbow head dropped per Session 7 strategy)
 _LAMBDA_COMPONENT_QUALITY = 0.3   # weight for per-model quality loss vs fusion
-_LAMBDA_KNEE = 0.3                # weight for knee BCE
+_LAMBDA_KNEE = 1.0                # raised from 0.3 — knee detection is primary objective
 
 # Class weight: (n_negative / n_positive) — for binary class imbalance
 _KNEE_CLASS_WEIGHT = 5.10         # (2373 neg / 465 pos) from 2838 total reps
@@ -104,6 +105,53 @@ def _run_epoch(
     return total_loss / max(len(loader), 1)
 
 
+def _compute_val_metrics(
+    bilstm: OHPBiLSTMScorer,
+    stgcn: OHPSTGCNScorer,
+    fusion,
+    loader: DataLoader,
+    device: torch.device,
+) -> tuple[float, float]:
+    """Return (val_loss, knee_auc) over the full validation set.
+
+    LR scheduler uses val_loss (continuous, stable). Checkpoint saving uses
+    knee_auc — the actual objective for Phase 2.
+    """
+    bilstm.eval()
+    stgcn.eval()
+    fusion.eval()
+    total_loss = 0.0
+    all_preds: list[float] = []
+    all_labels: list[float] = []
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            bilstm_out = bilstm(batch["bilstm_input"])
+            stgcn_out = stgcn(batch["stgcn_input"], batch["view_vec"])
+            fusion_score, _ = fusion(
+                batch["heuristic_vec"],
+                stgcn_out["embedding"],
+                bilstm_out["embedding"],
+            )
+            total_loss += _compute_loss(bilstm_out, stgcn_out, fusion_score, batch).item()
+            knee_prob = (bilstm_out["knee_error"] + stgcn_out["knee_error"]) / 2.0
+            all_preds.extend(knee_prob.cpu().numpy().tolist())
+            all_labels.extend(batch["knee_error"].cpu().numpy().tolist())
+
+    val_loss = total_loss / max(len(loader), 1)
+
+    arr_labels = np.array(all_labels)
+    arr_preds = np.array(all_preds)
+    # roc_auc_score requires both classes present
+    if arr_labels.sum() > 0 and arr_labels.sum() < len(arr_labels):
+        knee_auc = float(roc_auc_score(arr_labels, arr_preds))
+    else:
+        knee_auc = 0.5  # undefined (no positive samples) — treat as chance
+
+    return val_loss, knee_auc
+
+
 def train(
     annotation_dir: Path,
     pretrain_bilstm: Path,
@@ -144,32 +192,42 @@ def train(
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
 
-    best_val = float("inf")
+    best_knee_auc = 0.0
     no_improve = 0
+    has_val = "val" in loaders
 
     for epoch in range(1, epochs + 1):
         train_loss = _run_epoch(bilstm, stgcn, fusion, loaders["train"], optimizer, device, train=True)
         val_loss = float("inf")
-        if "val" in loaders:
-            val_loss = _run_epoch(bilstm, stgcn, fusion, loaders["val"], optimizer, device, train=False)
+        val_knee_auc = 0.0
+
+        if has_val:
+            val_loss, val_knee_auc = _compute_val_metrics(bilstm, stgcn, fusion, loaders["val"], device)
             scheduler.step(val_loss)
 
-        print(f"Epoch {epoch:3d}/{epochs} | train={train_loss:.4f} | val={val_loss:.4f}")
+        print(
+            f"Epoch {epoch:3d}/{epochs} | train={train_loss:.4f}"
+            f" | val_loss={val_loss:.4f} | knee_auc={val_knee_auc:.4f}"
+        )
 
-        if val_loss < best_val:
-            best_val = val_loss
+        # Checkpoint on best knee AUC (primary objective); fall back to every epoch if no val set
+        improved = val_knee_auc > best_knee_auc if has_val else True
+        if improved:
+            best_knee_auc = val_knee_auc
             no_improve = 0
             output_dir.mkdir(parents=True, exist_ok=True)
             torch.save(bilstm.state_dict(), output_dir / "bilstm_ohp_phase2.pt")
             torch.save(stgcn.state_dict(), output_dir / "stgcn_ohp_phase2.pt")
             torch.save(fusion.state_dict(), output_dir / "fusion_ohp_phase2.pt")
+            if has_val:
+                print(f"  → best knee_auc={best_knee_auc:.4f} — checkpoints saved")
         else:
             no_improve += 1
             if no_improve >= PATIENCE:
-                print(f"Early stop at epoch {epoch} (no val improvement for {PATIENCE} epochs).")
+                print(f"Early stop at epoch {epoch} (no knee AUC improvement for {PATIENCE} epochs).")
                 break
 
-    print(f"Best val loss: {best_val:.4f}. Checkpoints saved to {output_dir}/")
+    print(f"Best knee AUC: {best_knee_auc:.4f}. Checkpoints saved to {output_dir}/")
 
 
 def main() -> None:

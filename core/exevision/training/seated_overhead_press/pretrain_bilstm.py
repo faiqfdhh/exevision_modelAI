@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import random
-import sys
 import time
 from pathlib import Path
 
@@ -12,11 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-
-
-NEURAL_DIR = Path(__file__).resolve().parents[2] / "neural"
-if str(NEURAL_DIR) not in sys.path:
-    sys.path.insert(0, str(NEURAL_DIR))
 
 from nn_utils import (
     FIXED_SEQ_LEN,
@@ -33,8 +27,8 @@ MASK_RATIO = 0.25
 MIN_MASK_LEN = 10
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SAVE_PATH = "models/bilstm_seated_ohp_pretrained.pt"
-DEFAULT_FEATURES_DIR = r"D:\FitnessAQA\ohp_phase1\workspace\seated_overhead_press\extracted_features_clean\raw_unfiltered"
-DEFAULT_SEGMENTED_DIR = r"D:\FitnessAQA\ohp_phase1\workspace\seated_overhead_press\segmented_reps\raw_unfiltered"
+DEFAULT_FEATURES_DIR = r"D:\FitnessAQA\ohp_phase1\workspace\seated_overhead_press"
+DEFAULT_SEGMENTED_DIR = r"D:\FitnessAQA\ohp_phase1\workspace\seated_overhead_press\segmented_reps"
 
 
 def set_seed(seed: int = 42) -> None:
@@ -149,16 +143,12 @@ def train(args):
     if not reps:
         raise RuntimeError("No BiLSTM reps were loaded. Check the segmented directory path.")
 
-    save_path = Path(args.save_path)
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-
     loader = build_dataloader(reps, args.batch_size)
     model = BiLSTMPretrainer().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.5)
 
     best_loss = float("inf")
-    no_improve = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
         epoch_loss = 0.0
@@ -175,8 +165,6 @@ def train(args):
             else:
                 loss = F.mse_loss(output, targets)
             loss.backward()
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
 
             epoch_loss += loss.item()
@@ -185,25 +173,16 @@ def train(args):
 
         epoch_loss = epoch_loss / max(1, batches)
         scheduler.step(epoch_loss)
+        best_loss = min(best_loss, epoch_loss)
+        print(f"Epoch {epoch:03d}/{args.epochs} | Loss: {epoch_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
 
-        improved = epoch_loss < best_loss
-        if improved:
-            best_loss = epoch_loss
-            no_improve = 0
-            torch.save(model.state_dict(), save_path)
-        else:
-            no_improve += 1
-
-        marker = " ✓" if improved else f" (no improve {no_improve}/{args.early_stop_patience})"
-        print(f"Epoch {epoch:03d}/{args.epochs} | Loss: {epoch_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.2e}{marker}")
-
-        if args.early_stop_patience > 0 and no_improve >= args.early_stop_patience:
-            print(f"Early stopping at epoch {epoch}.")
-            break
+    save_path = Path(args.save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), save_path)
 
     elapsed = time.time() - start_time
-    print(f"✓ Best BiLSTM weights saved to {save_path}")
-    print(f"Summary: reps={len(reps)} | best_loss={best_loss:.6f} | time={elapsed:.1f}s")
+    print(f"✓ Saved BiLSTM pretrained weights to {save_path}")
+    print(f"Summary: reps={len(reps)} | final_loss={best_loss:.6f} | time={elapsed:.1f}s")
 
 
 def parse_args():
@@ -220,10 +199,6 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-videos", type=int, default=None)
     parser.add_argument("--max-reps", type=int, default=None)
-    parser.add_argument("--early-stop-patience", type=int, default=10,
-                        help="Stop if no improvement for N epochs (0 = disabled)")
-    parser.add_argument("--grad-clip", type=float, default=1.0,
-                        help="Gradient clipping max norm (0 = disabled)")
     return parser.parse_args()
 
 

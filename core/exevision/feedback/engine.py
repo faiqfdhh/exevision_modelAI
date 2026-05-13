@@ -56,6 +56,21 @@ class FeedbackResult:
     session: SessionSummary
 
 
+# ── Phase 3 OHP: config-driven cue thresholds ──────────────────────────────
+# Key = field name in the neural output dict; direction = "below" or "above"; threshold = float.
+# If the key is present in `error_cues_phase3` of the exercise config, the cue fires.
+PHASE3_CUE_THRESHOLDS: dict[str, tuple[str, float]] = {
+    "lockout_prob":    ("below", 0.5),
+    "elbow_flare":     ("below", 50.0),
+    "smoothness":      ("below", 50.0),
+    "control":         ("below", 50.0),
+    "grip_ratio":      ("below", 40.0),
+    "rom_top":         ("below", 50.0),
+    "rom_bottom":      ("below", 50.0),
+    "knee_error_prob": ("above", 0.5),
+}
+
+
 class QualityChecker:
     """Detect mismatch between overall score and sub-metric breakdown."""
 
@@ -90,7 +105,7 @@ class FeedbackItemBuilder:
     @staticmethod
     def get_category_for_metric(metric_name: str) -> Literal["spatial", "temporal", "geometric"]:
         """Classify metric into category for frontend filtering."""
-        spatial_metrics = {"hip_depth", "depth", "knee_tracking"}
+        spatial_metrics = {"hip_depth", "depth", "knee_tracking", "elbow_flare", "grip_ratio", "rom_top", "rom_bottom", "lockout"}
         temporal_metrics = {"smoothness", "control"}
         
         if metric_name in spatial_metrics:
@@ -181,7 +196,7 @@ class FeedbackEngine:
                 threshold=threshold,
             )
 
-            # ── Phase 2: Build items with metric tracking, score them, and sort ──
+            # ── Build items with metric tracking, score them, and sort ──────
             all_item_dicts: list[dict[str, Any]] = []
 
             # Collect win items
@@ -196,6 +211,10 @@ class FeedbackEngine:
             issue_tone_mode = self._resolve_issue_tone_mode(score, mismatch_type)
             _, issue_items = self._group_issue_cues(issue_scores, tone_mode=issue_tone_mode)
             all_item_dicts.extend(issue_items)
+
+            # ── Phase 3 neural cues (config-driven, no exercise branch) ─────
+            phase3_items = self._emit_phase3_cues(rep_data)
+            all_item_dicts.extend(phase3_items)
 
             # Assign scores to all items based on their metric_name
             scored_items = self._item_builder.assign_item_scores(sub_scores, all_item_dicts)
@@ -229,6 +248,48 @@ class FeedbackEngine:
             reps=rep_feedbacks,
             session=session_summary,
         )
+
+    def _emit_phase3_cues(
+        self, rep_data: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Emit cue items for Phase 3 OHP neural outputs if thresholds breach.
+
+        Cue text is read from ``error_cues_phase3`` in the exercise config.
+        If that key is absent (e.g. squat config), this method returns [].
+        No exercise-specific branches — behaviour is purely config-driven.
+        """
+        cue_catalog: dict[str, str] = self.exercise_config.get("error_cues_phase3", {})
+        if not cue_catalog:
+            return []
+
+        items: list[dict[str, Any]] = []
+        for metric_key, (direction, threshold_val) in PHASE3_CUE_THRESHOLDS.items():
+            raw = rep_data.get(metric_key)
+            if raw is None:
+                continue
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                continue
+
+            triggered = (
+                (direction == "below" and val < threshold_val) or
+                (direction == "above" and val > threshold_val)
+            )
+            if not triggered:
+                continue
+
+            cue_text = cue_catalog.get(metric_key)
+            if not cue_text:
+                continue
+
+            items.append({
+                "text":        cue_text,
+                "metric_name": metric_key,
+                "type":        "issue",
+            })
+
+        return items
 
     def _sanitize_scores(self, sub_scores: dict[str, Any]) -> dict[str, float]:
         cleaned: dict[str, float] = {}

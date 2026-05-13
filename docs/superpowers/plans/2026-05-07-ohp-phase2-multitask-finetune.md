@@ -2,6 +2,80 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+---
+
+## ⚡ RESUME HERE (session ended 2026-05-08)
+
+**Branch:** `multiexercise` — all changes committed, all 29 tests passing.
+
+**What was completed this session:**
+1. Phase 2 FitnessAQA fine-tuning completed (MAE 0.095 ✅, Knee AUC 0.702 ✅)
+2. Fixed squat-derived components in OHP path — new OHP skeleton (10 joints: shoulders/elbows/wrists/hips/knees), 8-channel BiLSTM, OHP adjacency matrix
+3. Phase 2 models (`bilstm_ohp_phase2.pt`, `stgcn_ohp_phase2.pt`) are **INVALIDATED** by skeleton change — do NOT use for inference until re-run
+
+**Current state of `models/`:**
+- `bilstm_ohp_pretrained.pt` / `stgcn_ohp_pretrained.pt` — Phase 1 pretrained, OLD architecture (incompatible with current code)
+- `bilstm_ohp_phase2.pt` / `stgcn_ohp_phase2.pt` / `fusion_ohp_phase2.pt` — Phase 2 trained, OLD architecture (incompatible with current code)
+- `bilstm_seated_ohp_pretrained.pt` / `stgcn_seated_ohp_pretrained.pt` — Phase 1 pretrained only, untouched, not used
+- Squat models (`bilstm_finetuned.pt` etc.) — unchanged, fully working
+
+**Decision made:** Skip Phase 2 re-run. Go straight to Phase 3. Phase 3 training will produce new valid checkpoints.
+
+---
+
+**What to do tomorrow — Phase 3 start:**
+
+### Step 0: Config fix (5 minutes)
+Add missing Phase 3 annotation flags to `core/exevision/config/exercises/overhead_press.json`:
+```json
+"annotation_flags": {
+    "incomplete_lockout":   "Incomplete Lockout",
+    "elbow_flare":          "Elbow Flare / Winging",
+    "forward_lean":         "Excessive Layback",
+    "bar_drift":            "Bar Path Drift",
+    "wrist_deviation":      "Wrist Bent Back",
+    "knee_instability":     "Knee Instability (standing only)",
+    "lift_stability":       "Lift Instability (lateral lean / bar tilt)",
+    "grip_too_wide":        "Grip Too Wide",
+    "grip_too_narrow":      "Grip Too Narrow",
+    "rom_bottom_incomplete":"ROM Bottom Incomplete (elbows not below shoulders)"
+}
+```
+The annotation tab dynamically loads these — no UI code change needed.
+
+### Step 1: Brainstorm Phase 3
+Run `/brainstorm` with this context:
+- Project: ExeVision — hybrid three-judge AQA system (Heuristic + BiLSTM + ST-GCN)
+- Thesis goal: fusion of rule-based + temporal + spatial models is more robust than any single judge
+- Phase 3 goal: **fusion score ≈ human-annotated score** (manual annotation → retrain fusion)
+- Branch: `multiexercise`
+
+Phase 3 label-to-judge assignment (already decided):
+
+| Label | BiLSTM | ST-GCN | Heuristic |
+|-------|--------|--------|-----------|
+| Smoothness | ✅ Primary | | |
+| Control | ✅ Primary | | |
+| Lift stability | ✅ Cross-val | ✅ Primary | |
+| Knee error | ✅ (Phase 2) | ✅ (Phase 2) | |
+| Grip ratio | | | ✅ Primary |
+| ROM top/bottom | ✅ Cross-val | | ✅ Primary |
+| Elbow flare | | | ✅ Primary |
+
+BiLSTM new channels available: `elbow_angles_avg`, `wrist_lr_diff_y`, `shoulder_lr_diff_y`, `wrist_acceleration`
+ST-GCN new joint set: shoulders, elbows, wrists, hips, knees (10 joints) — can now see arm form
+
+Key architecture decisions for Phase 3:
+- Two-stage fusion: encoders FROZEN (Phase 2+ weights), train fusion to match human_score
+- Active learning for annotation: annotate videos where judges disagree most first
+- Binary error labels (what worked in Phase 2) for error heads
+- Continuous human_score (0-100) as quality regression target
+- Target: 100-150 annotated reps, fusion MAE < 8.0, Pearson > 0.75
+
+### Step 2: After brainstorm → `/writing-plans` for Phase 3 implementation plan
+
+---
+
 **Goal:** Fine-tune pre-trained BiLSTM and ST-GCN encoders on 2,260 FitnessAQA labeled OHP videos using a multi-task objective — simultaneously predict overall quality score and soft elbow/knee error probabilities — then wire the error heads into inference-time feedback.
 
 **Architecture:** New exercise-isolated modules under `core/exevision/neural/ohp/` and `core/exevision/training/ohp/` contain all OHP-specific neural code. Nothing in the squat path (`nn_models.py`, `finetune_models.py`, `evaluate_model.py`) is modified. FitnessAQA's error-window timestamps are converted to soft per-rep labels by a pure-function `label_derivation` module, then consumed by `OHPRepDataset`. Two models are trained: one for `overhead_press` (with knee error head) and one for `seated_overhead_press` (elbow error head only). The fusion layer reuses `HeuristicGuidedFusion(heuristic_dim=16)` unchanged.

@@ -91,5 +91,27 @@
         "focus_here": "Your lockout needs significant work — incomplete extension and insufficient height."
       }
     }
+  },
+  "annotation_metrics_phase3": {
+    "smoothness":  "Smoothness",
+    "control":     "Control",
+    "elbow_flare": "Elbow Flare (high=clean)",
+    "grip_ratio":  "Grip Width",
+    "rom_top":     "ROM Top Extension",
+    "rom_bottom":  "ROM Bottom Depth"
+  },
+  "annotation_binary_phase3": {
+    "lockout": "Full Lockout Achieved"
+  },
+  "annotation_grip_null_views": ["side"],
+  "error_cues_phase3": {
+    "lockout":     "Press fully overhead — finish each rep with elbows locked.",
+    "elbow_flare": "Elbows flared wide — keep them under the bar.",
+    "smoothness":  "Press tempo was jerky — drive smoothly through the movement.",
+    "control":     "Bar wandered — control the path top to bottom.",
+    "grip_ratio":  "Grip width is off — aim for just outside shoulder width.",
+    "rom_top":     "Incomplete top extension — press to full lockout overhead.",
+    "rom_bottom":  "Incomplete bottom depth — lower the bar to chin/upper chest level.",
+    "knee_error":  "Knees buckled during the press — brace and stabilise your stance."
   }
 }

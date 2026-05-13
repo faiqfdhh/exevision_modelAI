@@ -96,6 +96,18 @@ LEGACY_RUNS_ROOT = RUNTIME_ROOT / "pipeline_ui_runs"
 CONFIG_EXERCISES_DIR = WORKSPACE_ROOT / "core" / "exevision" / "config" / "exercises"
 
 
+_DIAGONAL_ALIASES = {"front_side", "back_side", "front-side", "back-side"}
+
+
+def _display_view(raw_view) -> str:
+    """User-facing view label. Collapses front_side/back_side → 'diagonal'.
+    Backend keeps raw labels for view-specific scoring; user sees a unified diagonal."""
+    if not raw_view:
+        return "unknown"
+    v = str(raw_view).lower().strip()
+    return "diagonal" if v in _DIAGONAL_ALIASES else v
+
+
 def _config_file_for_exercise(exercise: str) -> str:
     """Return config JSON stem for the given exercise.
     seated_overhead_press shares its config with overhead_press.
@@ -1298,7 +1310,7 @@ class PipelineRunnerUI:
         lines = []
         lines.append(f"Video ID: {data.get('video_id', 'Unknown')}")
         lines.append(f"Overall Score: {data.get('overall_score', 0):.1f}/100")
-        lines.append(f"View: {str(data.get('view', 'Unknown')).replace('_', ' ').title()}")
+        lines.append(f"View: {_display_view(data.get('view')).replace('_', ' ').title()}")
         lines.append(f"Repetitions: {data.get('rep_count', 0)}")
         lines.append(f"Source Quality: {str(data.get('source_quality', 'Unknown')).title()}")
         if data.get("message"):
@@ -1621,13 +1633,13 @@ class PipelineRunnerUI:
                 if json_path.exists():
                     with open(json_path, "r") as f:
                         data = json.load(f)
-                        view = data.get("info", {}).get("view", "Unknown")
+                        view = _display_view(data.get("info", {}).get("view", "Unknown"))
                         self.view_type_var.set(f"View: {view.replace('_', ' ').title()}")
                 else:
                     self.view_type_var.set("View: Not found")
 
             if self.current_score_data and not self.current_analysis_data:
-                score_view = str(self.current_score_data.get("view", "Unknown")).replace("_", " ").title()
+                score_view = _display_view(self.current_score_data.get("view", "Unknown")).replace("_", " ").title()
                 score_reps = self.current_score_data.get("rep_count", 0)
                 score_value = self.current_score_data.get("overall_score", 0)
                 self.view_type_var.set(f"View: {score_view} | Reps: {score_reps} | Score: {score_value:.1f}")
@@ -1851,7 +1863,7 @@ class PipelineRunnerUI:
             lines = []
             lines.append(f"Video ID: {data.get('video_id', 'Unknown')}")
             lines.append(f"Quality: {info.get('quality_rating', 'Unknown').upper()}")
-            lines.append(f"View: {info.get('view', 'Unknown').title()}")
+            lines.append(f"View: {_display_view(info.get('view', 'Unknown')).title()}")
             lines.append("-" * 40)
             lines.append(f"Total Reps: {info.get('total_reps', 0)}")
             lines.append("-" * 40)
@@ -1982,6 +1994,7 @@ class AnnotationToolUI:
         paned.add(left_outer, width=320, minsize=280)
 
         left = ttk.Frame(left_outer, padding=8)
+        self._squat_left = left   # referenced by _on_annotation_exercise_changed for panel swapping
         left.pack(fill=tk.BOTH, expand=True)
         left.columnconfigure(0, weight=1)
         # Weight will be set later for the video list row (row 3)
@@ -2011,6 +2024,7 @@ class AnnotationToolUI:
             "<<ComboboxSelected>>",
             lambda e: self._on_annotation_exercise_changed(),
         )
+
 
         # -- Status
         self.status_var = tk.StringVar(value="Pick a folder of videos to begin.")
@@ -2228,6 +2242,31 @@ class AnnotationToolUI:
         self.progress_var_label.grid_remove()
         btn_frame.grid_remove()
 
+        # ---- OHP Phase 3 Annotator panel (sibling to 'left', hidden by default) ----
+        self._ohp_panel = ttk.Frame(left_outer, padding=0)
+        # Not packed yet — shown only when overhead_press/seated_overhead_press selected
+        self._ohp_annotator: object = None   # lazy-initialised on first switch
+
+        # OHP panel header so users can switch exercises back
+        self._ohp_header = ttk.Frame(self._ohp_panel, padding=8)
+        self._ohp_header.pack(fill=tk.X)
+        ttk.Label(self._ohp_header, text="Exercise:").pack(side=tk.LEFT)
+        self._ohp_exercise_combo = ttk.Combobox(
+            self._ohp_header,
+            textvariable=self._annotation_exercise_var,
+            values=["squat", "overhead_press", "seated_overhead_press"],
+            state="readonly",
+            width=22,
+        )
+        self._ohp_exercise_combo.pack(side=tk.LEFT, padx=(6, 0))
+        self._ohp_exercise_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self._on_annotation_exercise_changed(),
+        )
+
+        self._ohp_body = ttk.Frame(self._ohp_panel, padding=0)
+        self._ohp_body.pack(fill=tk.BOTH, expand=True)
+
         # ---- RIGHT PANEL: dual side-by-side video + info ----
         right = ttk.Frame(paned, padding=8)
         paned.add(right)
@@ -2346,15 +2385,42 @@ class AnnotationToolUI:
         for idx in range(min(7, len(flag_keys_list))):
             self.root.bind(f"<F{idx + 1}>", lambda e, k=flag_keys_list[idx]: self._toggle_flag(k))
 
+    def _launch_ohp_phase3_annotator(self) -> None:
+        """No longer used — OHP Phase 3 annotator is embedded in the annotation tab.
+        Kept for backward compatibility; selecting OHP in the exercise combo switches to it.
+        """
+        self._annotation_exercise_var.set("overhead_press")
+        self._on_annotation_exercise_changed()
+
     def _on_annotation_exercise_changed(self) -> None:
-        """Rebuild annotation flags when exercise selection changes in annotation tab."""
-        self._rebuild_annotation_flags()
+        """Rebuild annotation flags and swap annotation panel when exercise changes."""
         exercise = self._annotation_exercise_var.get()
-        self.status_var.set(f"Exercise changed to {exercise}. Pick a folder of videos.")
-        self.video_files = []
-        self.folder_var.set("")
-        if hasattr(self, "_video_listbox"):
-            self._video_listbox.delete(0, tk.END)
+        is_ohp = exercise in ("overhead_press", "seated_overhead_press")
+
+        if is_ohp:
+            # Hide squat left panel, show OHP annotator panel
+            self._squat_left.pack_forget()
+            self._ohp_panel.pack(fill=tk.BOTH, expand=True)
+            # Lazy-initialise the annotator widget once
+            if self._ohp_annotator is None:
+                import sys as _sys
+                ui_dir = Path(__file__).parent
+                if str(ui_dir) not in _sys.path:
+                    _sys.path.insert(0, str(ui_dir))
+                from annotation_overhead_press import OHPPhase3AnnotatorWindow
+                self._ohp_annotator = OHPPhase3AnnotatorWindow(self._ohp_body)
+                # Wire the annotator to the existing big right-panel video displays
+                self._ohp_annotator.set_display_labels(self.raw_label, self.vis_label)
+        else:
+            # Hide OHP panel, show squat left panel
+            self._ohp_panel.pack_forget()
+            self._squat_left.pack(fill=tk.BOTH, expand=True)
+            self._rebuild_annotation_flags()
+            self.status_var.set(f"Exercise changed to {exercise}. Pick a folder of videos.")
+            self.video_files = []
+            self.folder_var.set("")
+            if hasattr(self, "_video_listbox"):
+                self._video_listbox.delete(0, tk.END)
 
     def _pick_folder(self) -> None:
         exercise = self._annotation_exercise_var.get()

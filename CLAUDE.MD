@@ -2,436 +2,202 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-_Last updated: 2026-05-06 (Session 6) — See [CHANGELOG.md](CHANGELOG.md) for full session history._
+_Last updated: 2026-05-13 — See [CHANGELOG.md](CHANGELOG.md) for full session history._
 
 ---
 
-## Current Top-Level Structure
+## Top-Level Structure
 
-- `apps/` — application layer (`desktop-ui/` multi-exercise UI, `api/` inference server, `web/` scaffold)
-- `core/exevision/` — modularized logic (`stages/` exercise-parameterized, `neural/`, `training/`, `analysis/`, `feedback/`, `config/` with per-exercise configs)
-- `adapters/legacy-cli/` — compatibility bridge (⚠️ `run_stage.py` broken — see Active Issues #8)
-- `models/` — model/checkpoint artifacts (per-exercise neural models: `bilstm_{exercise}.pt`, `stgcn_{exercise}.pt`, `fusion_{exercise}.pt`)
-- `training_dataset/annotations/` — annotation store
-- `_hidden_legacy/` — archived legacy code and 50+ historical run artifacts
+- `apps/` — `desktop-ui/` multi-exercise UI, `api/` inference server, `web/` scaffold
+- `core/exevision/` — `stages/` (exercise-parameterized), `neural/`, `training/`, `analysis/`, `feedback/`, `config/`
+- `models/` — per-exercise checkpoints: `bilstm_{ex}.pt`, `stgcn_{ex}.pt`, `fusion_{ex}.pt`
+- `training_dataset/annotations/` — squat; `training_dataset/ohp_phase3_annotations/` — OHP Phase 3 (165 reps)
+- `_hidden_legacy/` — archived; do not edit
 
 ---
 
 ## Quick Start
 
-### Launch Desktop UI (Multi-Exercise)
+### Desktop UI
 ```bash
 python apps/desktop-ui/app.py
-# Exercises: squat, overhead_press, seated_overhead_press — all fully supported
-# Inference tab: routes output to {exercise}/ workspace subdirectory; analyze_results stage squat-only
-# Annotation tab: independent exercise selector (_annotation_exercise_var); flags loaded from {exercise}.json
-# _config_file_for_exercise() in app.py: routes seated_overhead_press → overhead_press.json for config/flags
+# Exercises: squat, overhead_press, seated_overhead_press
+# OHP Phase 3 Annotator: button in Annotation tab → annotation_overhead_press.py (auto-discovers videos from home dir)
+# _config_file_for_exercise(): seated_overhead_press → overhead_press.json for config/flags
 ```
 
-### Launch Inference API Server
+**Tkinter gotchas (annotation UI):**
+- `tk.Scale` has no `.state()` — use `.config(state="disabled"/"normal")`
+- `ttk.Radiobutton` with `IntVar(value=0)` unreliable — use `tk.Radiobutton` for binary flags
+- `ttk.Label` keeps text when `image=` set — pass `text=""` simultaneously
+- `set_display_labels()` called before widget mapped — defer with `master.after(150, fn)`
+- `core.exevision.*` imports fail unless `sys.path.insert(0, str(_REPO))` at module level
+
+### Inference API
 ```bash
 pip install -r apps/api/requirements.txt
-
-# PowerShell (Windows):
+# PowerShell:
 $env:INFERENCE_API_SECRET="your-secret"; .\.venv\Scripts\python.exe -m uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
-
-# cmd.exe (Windows):
-set INFERENCE_API_SECRET=your-secret && .venv\Scripts\python.exe -m uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
-
-# bash/Linux:
-INFERENCE_API_SECRET=your-secret python -m uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
-
-# With --reload for development:
-INFERENCE_API_SECRET=your-secret python -m uvicorn apps.api.main:app --host 0.0.0.0 --port 8000 --reload
-
-# Health check:
-curl http://localhost:8000/health
-# Submit job (squat inference):
-curl -X POST http://localhost:8000/infer -H "Authorization: Bearer your-secret" \
-     -d '{"video_url":"<url>","job_id":"<uuid>","exercise":"squat"}'
-
-# Submit job (overhead press or other exercise):
+# Test:
 curl -X POST http://localhost:8000/infer -H "Authorization: Bearer your-secret" \
      -d '{"video_url":"<url>","job_id":"<uuid>","exercise":"overhead_press"}'
 ```
+**Env vars** (`apps/api/.env`): `INFERENCE_API_SECRET` (required), `SUPABASE_URL`+`SUPABASE_SERVICE_KEY` (production upload), `CORS_ORIGINS` (default `*`).
 
-### Run a Single Stage Directly (for debugging)
+### Run a Single Stage
 ```bash
-# PowerShell tip: paths containing apostrophes (e.g. "Faiq's FYP") break with inline quoting.
-# Use variables instead:
-#   $py = "C:\Users\faiqf\Documents\Faiq's FYP\exevision_modelAI\.venv\Scripts\python.exe"
-#   $script = "C:\...\classify_views.py"
-#   & $py $script --exercise overhead_press --video-id 80863_1 --quality raw_unfiltered
-#
-# Stages use CWD as the workspace (pipeline.py runs them with cwd=workspace_root).
-# Set env vars that pipeline.py normally provides:
+# PowerShell: apostrophe in "Faiq's FYP" breaks inline quoting — use $py/$script variables
+# All stages expect CWD = workspace root; accept --exercise (default: squat)
 export EXEVISION_MODEL_PATH=models/pose_landmarker_heavy.task
-export EXEVISION_FACE_MODEL_PATH=models/blaze_face_short_range.tflite
-
 cd pipeline_ui_runs/{run_id}/workspace/
-# All stages accept --exercise parameter (defaults to "squat")
-python ../../../core/exevision/stages/extract_selected_features.py filtered --video-id <id> --exercise squat
-python ../../../core/exevision/stages/classify_views.py --video-id <id> --exercise squat
-python ../../../core/exevision/stages/temporal_segmentation.py --video-id <id> --exercise squat
-python ../../../core/exevision/stages/scoring.py <id> --exercise squat
-python ../../../core/exevision/stages/neural_fusion_inference.py --workspace-root . --exercise squat
-
-# For overhead press:
-python ../../../core/exevision/stages/extract_selected_features.py filtered --video-id <id> --exercise overhead_press
-# ... etc. (paths and models automatically adapt to exercise)
-
-# Add --no-viz --no-report to skip video/image generation.
-# Check an existing workspace for the expected {exercise}/ directory layout.
+python .../extract_selected_features.py filtered --video-id <id> --exercise overhead_press
+python .../classify_views.py --video-id <id> --exercise overhead_press  [--neural]
+python .../temporal_segmentation.py --video-id <id> --exercise overhead_press [--debug-phases]
+python .../scoring.py <id> --exercise overhead_press
+python .../neural_fusion_inference.py --workspace-root . --exercise overhead_press
 ```
 
-### Run Tests
+### Batch Pipeline (new)
 ```bash
-pip install pytest
-
-pytest tests/                                          # all tests
-pytest tests/test_feedback_e2e.py -v                  # single file
-pytest tests/test_feedback_e2e.py::test_feedback_e2e_squat -v  # single test
+python core/exevision/stages/run_pipeline.py \
+  --video-dir /path/to/videos --exercise overhead_press \
+  --output-dir /output [--mode unfiltered] [--include-neural] [--max-videos N]
 ```
 
-> Tests do NOT require video files or model checkpoints — they test config loading and feedback engine logic only.
-
-### Deploy to Google Cloud Run
+### Tests
 ```bash
-export GCP_PROJECT="your-gcp-project-id"
-export GCR_REGION="asia-southeast1"
-export IMAGE_NAME="exevision-modelai"
-export REGISTRY="${GCR_REGION}-docker.pkg.dev/${GCP_PROJECT}/${IMAGE_NAME}"
-
-# Build + push via Cloud Build (no local model upload required)
-gcloud builds submit --tag "${REGISTRY}/${IMAGE_NAME}:latest" --project=$GCP_PROJECT .
-
-# Deploy
-gcloud run deploy $IMAGE_NAME \
-  --image="${REGISTRY}/${IMAGE_NAME}:latest" \
-  --region=$GCR_REGION --memory=4Gi --cpu=2 --timeout=600 \
-  --concurrency=1 --min-instances=0 --max-instances=3 \
-  --set-env-vars="INFERENCE_API_SECRET=<secret>,CORS_ORIGINS=https://your-app.vercel.app,SUPABASE_URL=https://your-project.supabase.co,SUPABASE_SERVICE_KEY=<service-role-key>"
-
-# Local Docker test (no Supabase — uses local file serving)
-docker build -t exevision-modelai:local .
-docker run --rm -p 8000:8000 -e INFERENCE_API_SECRET=test-secret exevision-modelai:local
+pytest tests/   # no videos or checkpoints needed — tests config + feedback engine only
 ```
 
-### Run Training (Step 2 Neural)
+### OHP Training (squat methodology — current recommended approach)
+```powershell
+$py = ".\.venv\Scripts\python.exe"
+# Step 0: Populate heuristic scores from AQA JSONs (MUST run before training)
+& $py core\exevision\analysis\populate_heuristic_scores.py `
+    --aqa-root "D:\FitnessAQA\ohp_phase3\overhead_press\aqa_analysis_simple"
+
+# Step 1: Stamp 3-way quality-stratified split (70/15/15, quality bucket)
+& $py core\exevision\analysis\stamp_phase3_splits.py --dry-run   # preview
+& $py core\exevision\analysis\stamp_phase3_splits.py             # write
+
+# Step 2: Train (4 phases: BiLSTM → ST-GCN → Fusion → optional Joint)
+& $py core\exevision\training\ohp\finetune_ohp.py `
+    --annotation-dir training_dataset\ohp_phase3_annotations `
+    --pretrain-bilstm models\runtime_neural_ohp\bilstm_ohp_phase2.pt `
+    --pretrain-stgcn  models\runtime_neural_ohp\stgcn_ohp_phase2.pt `
+    --output-dir      models\runtime_neural_ohp\
+
+# Step 3: Evaluate on held-out test split
+& $py core\exevision\training\ohp\evaluate_ohp.py `
+    --annotation-dir training_dataset\ohp_phase3_annotations `
+    --model-dir      models\runtime_neural_ohp\ `
+    --output         results\ohp_eval.json
+```
+
+**Current eval results (Session 9h, 23-rep held-out test):**
+- ✅ quality_mae=8.77 (threshold <12) — beats heuristic baseline (17.79) by 2×
+- ✅ smoothness_mae=6.20, control_mae=5.23, elbow_flare_mae=12.06, grip_ratio_mae=8.68, rom_top_mae=11.87, rom_bottom_mae=9.60
+- ❌ lockout_auc=0.742 (threshold >0.75) — misses by 0.008 on 23-rep test set (1 rep = threshold)
+- `quality_pearson=0.546` vs heuristic `-0.111`; `residual_std=15.82` (model adapts beyond heuristic)
+
+**⚠️ heuristic_score must be populated** in annotation JSONs before training. 108/166 reps had `heuristic_score=0` (AQA not run). Use `populate_heuristic_scores.py` after running Stage 5+8 on source videos.
+
+**Phase 3 5-seed ensemble (legacy, superseded):**
+```powershell
+# Old approach — kept for reference only. finetune_ohp.py is now recommended.
+& $py core\exevision\training\ohp\finetune_phase3.py `
+    --annotation-dir training_dataset\ohp_phase3_annotations `
+    --pretrain-bilstm models\runtime_neural_ohp\bilstm_ohp_phase2.pt `
+    --pretrain-stgcn  models\runtime_neural_ohp\stgcn_ohp_phase2.pt `
+    --output-dir      models\runtime_neural_ohp\ --final
+```
+
+### Deploy (GCR)
 ```bash
-python core/exevision/training/finetune_models.py   # BiLSTM → ST-GCN → Fusion
-python core/exevision/training/evaluate_model.py    # → results/evaluation_report.json
+gcloud builds submit --tag "${GCR_REGION}-docker.pkg.dev/${GCP_PROJECT}/exevision-modelai/exevision-modelai:latest" .
+gcloud run deploy exevision-modelai --image=... --memory=4Gi --cpu=2 --timeout=600 \
+  --set-env-vars="INFERENCE_API_SECRET=<secret>,SUPABASE_URL=...,SUPABASE_SERVICE_KEY=..."
 ```
-
-### Annotation Quality Check
-```bash
-python core/exevision/analysis/analyze_annotations.py
-```
-
-### Environment
-- **Python:** 3.10+ recommended (MediaPipe may require <3.12 on some builds)
-- **Dependencies for full pipeline:** `requirements-runtime.txt` (mediapipe, torch, opencv, scipy, etc.)
-- **Dependencies for API server only:** `apps/api/requirements.txt` (fastapi, uvicorn, httpx, pydantic)
-- **When adding a new pipeline dep:** add to `requirements-runtime.txt` (used in Docker), not just `apps/api/requirements.txt`
-- **MediaPipe model:** `models/pose_landmarker_heavy.task` must be present before running Stage 2.5
-- **Dataset videos:** `squat/dataset_videos_all/` (not tracked in git; required for pipeline runs)
-
-**API Server Environment Variables (see `apps/api/.env`):**
-- `INFERENCE_API_SECRET` — shared secret (required)
-- `API_PUBLIC_URL` — defaults to `http://localhost:8000`
-- `CORS_ORIGINS` — comma-separated allowed origins, defaults to `*` (unsafe in production)
-- `SUPABASE_URL` — if unset, visualizations are served locally via `/results/{job_id}/workspace/...`
-- `SUPABASE_SERVICE_KEY` — required only when `SUPABASE_URL` is set
-
-**Visualization Setup:**
-- **Local testing:** leave Supabase vars unset → annotated videos served locally
-- **Production on Cloud Run:** set both Supabase vars → videos uploaded to Supabase Storage bucket `inference-results` → `result.videos.with_landmarks` is a signed URL (1h expiry)
 
 ---
 
 ## Architecture & Data Flow
 
 ```
-Video file/URL
-    │
-    ▼
-Stage 2.5 — extract_selected_features.py
-  MediaPipe landmarks → squat/extracted_features_clean/{quality}/{video_id}.json
-    │
-    ▼
-Stage 4 — classify_views.py
-  Visibility + Z-depth heuristics → updates feature JSON with view label
-    │
-    ▼
-Stage 5 — temporal_segmentation.py
-  FSM phase detection → squat/segmented_reps/{quality}/{video_id}_segmented.json
-    │
-    ▼
-Stage 8 — scoring.py
-  Rule-based AQA (knee/depth/lean metrics) → squat/aqa_analysis_simple/.../aqa_simple.json
-    │
-    ▼
-Stage 9 — neural_fusion_inference.py  ← API pipeline only; NOT in desktop UI
-  HeuristicGuidedFusion: clamp(heuristic + tanh(residual)×40, 0, 100)
-  Loads: bilstm_finetuned.pt + stgcn_finetuned.pt + fusion_layer.pt
-    │
-    ▼
-FeedbackEngine — core/exevision/feedback/engine.py
-  Consumes AQA scores + config JSONs → narrative coaching text
-    │
-    ▼
-Result payload — apps/api/pipeline.py → collect_results()
-  → POST to callback_url  OR  return via GET /jobs/{id}
-  → Supabase upload (annotated video) or local file serving fallback
+Video → Stage 2.5 (MediaPipe pose) → Stage 4 (view classify) → Stage 5 (FSM segment)
+      → Stage 8 (rule-based AQA)  → Stage 9 (neural fusion, API only)
+      → FeedbackEngine → result payload (POST callback or GET /jobs/{id})
 ```
 
-Each stage runs as a **subprocess** inside an isolated workspace under `pipeline_ui_runs/{run_id}/workspace/`. Logs land at `pipeline_ui_runs/{run_id}/logs/{stage_key}.log`. The `RunPaths` dataclass in `core/exevision/config/paths.py` defines this layout.
+Stages run as **subprocesses** in `pipeline_ui_runs/{run_id}/workspace/`. Logs at `logs/{stage_key}.log`. Layout defined by `RunPaths` in `core/exevision/config/paths.py`.
 
 ---
 
-## Multi-Exercise Support (2026-04-09)
+## Multi-Exercise Support
 
-### Architecture
-- **Exercise Parameter Threading:** API request → pipeline → all stage scripts
-- **Config-Driven Metrics:** Each exercise has `core/exevision/config/exercises/{exercise}.json` with thresholds, issue groups, field mappings
-- **Workspace Isolation:** `workspace_root/{exercise}/extracted_features_clean/`, `{exercise}/segmented_reps/`, etc.
-- **Per-Exercise Models:** `models/bilstm_{exercise}.pt`, `models/stgcn_{exercise}.pt`, `models/fusion_{exercise}.pt` (with fallback to shared models during transition)
-- **Dynamic Stages:** `_build_stage_specs(exercise)` in pipeline.py, `_build_stages(exercise)` in app.py
-
-### Current Exercises
-1. **Squat** — Fully implemented, backward compatible
-2. **Overhead Press** — Config exists (`overhead_press.json`), infrastructure ready for Phase 1 dataset prep; see [OVERHEAD_PRESS_PLAN.md](OVERHEAD_PRESS_PLAN.md) for 3-phase training roadmap
-
-### Desktop UI Changes
-- Exercise selector dropdown (new)
-- `_on_exercise_changed()` handler rebuilds stage specs dynamically
-- All stage invocations pass `--exercise` parameter
-
-### API Changes
-- `InferRequest` includes `exercise: str = "squat"`
-- `/infer` endpoint validates exercise config exists
-- Field mapping loaded per-exercise (metric name normalization)
-- Model paths constructed with exercise context
-
-### To Add Another Exercise
-1. Create `core/exevision/config/exercises/{exercise_name}.json` with correct schema
-2. (Optional) Create per-exercise models: `bilstm_{exercise_name}.pt`, etc.
-3. Test: `POST /infer` with `"exercise": "{exercise_name}"`
-4. Dockerfile validates automatically (checks all *.json files exist)
-
-### FitnessAQA Dataset Integration (Overhead Press Phase 1)
-**Context:** FitnessAQA dataset (~5,490 unlabeled + ~2,260 labeled videos) is being integrated for overhead press pre-training.
-
-**Workflow (Phase 1 self-supervised pre-training):**
-1. Run batch extraction on FitnessAQA unlabeled videos:
-```powershell
-Set-Location "D:\FitnessAQA\ohp_phase1\workspace"
-$env:EXEVISION_MODEL_PATH = "C:\Users\faiqf\Documents\Faiq's FYP\exevision_modelAI\models\pose_landmarker_heavy.task"
-$env:EXEVISION_FACE_MODEL_PATH = "C:\Users\faiqf\Documents\Faiq's FYP\exevision_modelAI\models\blaze_face_short_range.tflite"
-
-& "C:\Users\faiqf\Documents\Faiq's FYP\exevision_modelAI\.venv\Scripts\python.exe" `
-    "C:\Users\faiqf\Documents\Faiq's FYP\exevision_modelAI\core\exevision\stages\extract_selected_features.py" `
-    unfiltered `
-    --exercise overhead_press `
-    --video-dir "D:\FitnessAQA\Overhead Press\Unlabeled_Dataset-OHP\Unlabeled_Dataset\videos\videos" `
-    --max-videos 100 `
-    --no-viz
-```
-2. Scale `--max-videos` parameter: start with 10–100 for testing, then run full dataset (5490 videos)
-2. Outputs land in `overhead_press/extracted_features_clean/raw_unfiltered/` (one Euro filtering only; no squat-specific post-processing)
-3. Seated variant (`seated_overhead_press/extracted_features_clean/raw_unfiltered/`) auto-generated for models robust to knee-occluded views
-4. Non-fatal extraction: `--include-poor` saves marginal-quality videos; downstream models filter by confidence thresholds
-5. Run stages 4→5→8 (classify_views, temporal_segmentation, scoring) with `--exercise overhead_press` to populate temporal/biomechanical annotations
-6. Feed segmented reps + heuristic scores into BiLSTM/ST-GCN fine-tuning pipeline (Phase 2)
-
-**Quality gates:**
-- Frames with overall landmark visibility <0.60: entire video skipped
-- Videos with >10% of frames showing 2+ people detected: skipped (training expects single-subject)
-- Poor-quality frames within otherwise-good videos: included (scoring stage applies per-frame confidence gates)
-
-**Data distribution targets:**
-- Unlabeled pre-training: all 5,490 (maximize diversity)
-- Labeled fine-tuning: 2,260 (via `prepare_ohp_dataset.py`, Phase 3)
-- Seated variant: mirrors all extractions; enables knee-invariant model training
+- **Config-driven:** `core/exevision/config/exercises/{exercise}.json` — thresholds, issue groups, field mappings
+- **Workspace isolation:** all outputs under `workspace_root/{exercise}/`
+- **Models** (all OHP models in `models/runtime_neural_ohp/`):
+  - Squat: `models/bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt`
+  - **OHP finetuned (current, squat methodology):** `bilstm_ohp_finetuned.pt`, `stgcn_ohp_finetuned.pt`, `fusion_ohp_finetuned.pt` — single model, 8 heads, quality_mae=8.77
+  - OHP Phase 3 ensemble (legacy): `bilstm/stgcn/fusion_ohp_phase3_seed{42,7,19,3,99}.pt` — superseded by finetuned
+  - OHP Phase 2 (fallback): `bilstm/stgcn/fusion_ohp_phase2.pt` — quality + knee_error only
+  - OHP Seated: heuristic-only; leg landmarks zeroed (indices 25–32)
+- **Inference routing priority** (Stage 9, OHP): finetuned → Phase 3 ensemble → Phase 2 fallback (⚠️ pending update to `neural_fusion_inference.py` — currently uses flat `models/` path, not subdir)
+- **To add exercise:** create `config/exercises/{name}.json`, optionally add model checkpoints
 
 ---
 
-## Active Components
+## Stage Reference
 
-**Core pipeline stages:**
-- `core/exevision/stages/extract_selected_features.py` — MediaPipe pose extraction + quality gating
-- `core/exevision/stages/classify_views.py` — Visibility-based view classification
-- `core/exevision/stages/temporal_segmentation.py` — FSM phase segmentation with strict legal sequences (squat + OHP paths)
-- `core/exevision/stages/scoring.py` — Rule-based AQA scoring and metrics
-  - **Squat scoring:** View-dependent weights, 4 metrics (knee valgus, forward lean, depth, below_parallel)
-  - **OHP scoring:** 3–4 biomechanical metrics depending on view. View-aware rules (Session 6):
-    - `grip_ratio`: excluded for `side` view only (shoulder width ≈ 0 from side → unreliable)
-    - `rom`: 2-component score — 50% top extension (`max_elbow_angle` vs `rom_top` thresholds) + 50% elbow-below-shoulder (raw Y comparison first, fallback `min_angle ≤ 110°`)
-    - `lockout`: all views; uses `use_2d=True` for `side` view (MediaPipe Z unreliable from side — arm extends toward/away from camera)
-    - `elbow_flare`: excluded from ALL diagonal views (`front_side`, `back_side`, `side`) — foreshortening effect
-    - `_ohp_rom()` returns `(min_angle, max_angle)` tuple; `_ohp_lockout()` and `_ohp_rom()` accept `use_2d` flag
-  - **Score discrepancy gotcha:** Desktop UI runs Stage 4 (classify_views) before scoring; CLI run without Stage 4 uses `view=unknown` which includes all 4 metrics. `front_side` view excludes grip_ratio + lockout → scores can differ dramatically for the same video
-- `core/exevision/stages/neural_fusion_inference.py` — Neural fusion stage (Step 9)
+**Stage 2.5 — Pose Extraction** (`extract_selected_features.py`)
+- Visibility <0.60 any frame → skip video; >10% multi-person → skip
+- `--exercise overhead_press` auto-generates seated variant (legs zeroed) alongside main output
+- Output: `{exercise}/extracted_features_clean/{quality}/{video_id}.json`
 
-**UI & Orchestration:**
-- `apps/desktop-ui/app.py` — Desktop UI (Inference + Annotation tabs); heuristic-only (Stage 9 not wired yet)
-- `apps/api/main.py` — FastAPI inference server (`POST /infer`, `GET /jobs/{id}`, `GET /health`)
-- `apps/api/pipeline.py` — Pipeline execution; calls all 5 stages in sequence including Stage 9
+**Stage 4 — View Classification** (`classify_views.py`)
+- Writes `info.view` in-place. `--neural` activates `view_classifier_ohp.pt`; falls back to heuristic if confidence < 0.7.
+- Landmarks: nose (0), eyes (2,5), ears (7,8), shoulders (11,12), elbows (13,14), wrists (15,16), hips (23,24)
 
-**Annotation/Data:**
-- `core/exevision/analysis/select_annotation_samples.py` — Strategic rep subset selection
-- `core/exevision/analysis/analyze_annotations.py` — Annotation quality self-check
-- `training_dataset/annotations/index.json` — Master annotation list + stats
+**Signal stack (priority order):**
+1. **Torso-lean gate:** `shoulder_width < 0.08` AND `hip_width < 0.08` → `side` (AND-gate prevents false-side on OHP lockout frames where shoulders occlude)
+2. **Side gray-zone rescue:** both widths < 0.12 + single arm visible + asym > 0.40 + no face + far arm vis < 0.20 → `side` (face gate + far-arm gate both required)
+3. **Arm-asymmetry diagonal forcing:** `arm_asym > 0.35` → diagonal branch even in wide-shoulder zone
+4. **Pure-view rescue:** inside diagonal, both arms visible + `arm_asym < 0.10` + definitive depth → re-promote to pure front/back
+5. **Back demotion:** wide+back+`arm_asym > 0.20`, not both arms visible → `back_side`
+6. **Nose-Z depth:** `nose_z < hip_z` → facing camera; primary front/back discriminator
+7. **BlazeFace fallback:** depth=None → `face_detected` flag, then `any_face` (nose/eye vis)
 
-**Feedback:**
-- `core/exevision/feedback/engine.py` — Rep + session coaching text; score-band tone policy (80-100=soft, 70-79=strict, <70=very_strict); tier language (excellent/strong/okay/needs_work/focus_here)
+**Video-level overrides** in `get_view_label_with_probs()`:
+- `forward_depth_count > backward_depth_count` → override majority back/* → front/* (OHP head-tilt fix)
+- `face_detected / valid_frames ≥ 0.25` → override back/* → front/*
+- `face_detected / valid_frames < 0.20` → demote front/* → back/* (MediaPipe hallucinates nose-Z forward from back angles)
 
-**Training:**
-- `core/exevision/training/finetune_models.py` — Phased fine-tuning (BiLSTM → ST-GCN → Fusion); stratified split seed 42; train=121, test=26
-- `core/exevision/training/evaluate_model.py` → `results/evaluation_report.json`
+**⚠️ `front_side`/`back_side` → `diagonal` display normalization:**
+Backend keeps raw labels. `app.py` and `pipeline.py` normalize both → `"diagonal"` via `_display_view()` at user-facing boundaries. API consumers/web/desktop UI always see `"diagonal"`. Annotation UI retains raw. Always pass new display sites through `_display_view()`.
 
-> `_hidden_legacy/` contains archived legacy code and historical run workspaces — do not edit. `adapters/legacy-cli/run_stage.py` is broken post-migration (see Active Issues #8).
+**⚠️ Score discrepancy:** Desktop UI runs Stage 4 before scoring; CLI without Stage 4 uses `view=unknown` (includes all metrics). `front_side` excludes grip_ratio + lockout → scores can differ dramatically for the same video.
 
----
+**Stage 5 — Temporal Segmentation** (`temporal_segmentation.py`)
 
-## Production Flow
+| Exercise | FSM Cycle | Primary signal | Knee check |
+|----------|-----------|----------------|-----------|
+| squat | IDLE→ECC→[ISO]→CONC→IDLE | hip Y descent | required |
+| overhead_press / seated | IDLE→CONC→[ISO]→ECC→IDLE | wrist Y ascent | none |
 
-### Inference Tab (Desktop UI + API Server)
+Key params: `DOWNWARD_VELOCITY_THRESHOLD=0.0015`, `UPWARD_VELOCITY_THRESHOLD=-0.0015`, `MOTION_CONFIRM_FRAMES=2`. Use `--debug-phases` for per-rep acceptance logs.
 
-Both entry points execute core stages (2.5→4→5→8) with Stage 9 (neural fusion) in API only:
+**Stage 8 — Scoring** (`scoring.py`)
+- **Squat:** knee_angle, knee_valgus_ratio, forward_lean_deg, squat_depth (view-dependent thresholds)
+- **OHP:** `grip_ratio` (excluded for `side`), `rom` (2-component: top extension + elbow-below-shoulder), `lockout` (2D angles for `side` view), `elbow_flare` (front/back only — foreshortening on diagonals)
+- Output: `{exercise}/aqa_analysis_simple/{quality}/{video_id}/aqa_simple.json`
 
-```
-Input video/folder
-  → workspace created under pipeline_ui_runs/{run_id}/
-  → stages 2.5 → 4 → 5 → 8 → 9 (neural_fusion, API only) execute as subprocesses
-  → JSON outputs + video overlays written to workspace
-  → logs at logs/{stage_key}.log
-```
-
-**Extraction Mode:** Stage 2.5 supports `Filtered` (default: Savitzky-Golay smoothing + quality gating) or `Unfiltered (raw)` (One Euro Filter only). The desktop UI exposes a dropdown selector (~line 200 in `app.py`).
-
-### Annotation Tab (Desktop UI Only)
-
-```
-Folder scan → color-coded listbox (green=processed, red=unprocessed, ✓=annotated)
-  → user double-clicks video
-    → if pipeline outputs exist: load immediately
-    → if not: auto-run stages 2.5→4→5→8 in background
-  → dual video display (raw + visualized)
-  → human scores 0–100 + flags (F1–F6) + confidence + notes
-  → heuristic score hidden until submission (bias-blind)
-  → save to training_dataset/annotations/videos/{video_id}.json
-  → auto-advance to next rep
-```
-
----
-
-## Pipeline Stage Reference
-
-**Stage 2.5 — Pose Extraction:** `core/exevision/stages/extract_selected_features.py`
-
-Key thresholds: `MIN_LANDMARK_CONFIDENCE=0.4`, `MIN_KEY_JOINT_CONFIDENCE=0.5` (hip/knee/ankle), `MANDATORY_CHAIN_MIN_RATIO=80%`, `MIN_FRAME_VISIBILITY=0.50` (skip if any frame below this), `MAX_MULTI_PERSON_RATIO=10%` (skip if >10% of frames detect 2+ people). Output: `{exercise}/extracted_features_clean/{quality}/{video_id}.json`
-
-**Stage 2.5 CLI Parameters** (in addition to mode `filtered|unfiltered` and `--video-id`):
-- `--exercise {name}` — Target exercise config (default: "squat"); controls output path routing and seated variant behavior
-- `--video-dir /path/to/videos` — Override default dataset root (e.g., for non-NTFS drives; default: `{exercise}/dataset_videos_all/`)
-- `--max-videos N` — Stop after processing N unprocessed videos (cap before already-processed filter; useful for iteration)
-- `--include-poor` — Save videos with poor-but-detectable landmarks to `raw_unfiltered/` output folder (default: skip)
-- `--no-viz` — Skip visualization video generation (saves disk)
-- `--no-report` — Skip HTML report generation
-
-**Rejection Registry:** Skipped videos are recorded in `.skipped_videos_registry.json` (sibling to output folders). Stores reason + timestamp for each rejection. On re-runs, rejected videos are skipped immediately without re-processing. Registry survives across sessions/interruptions.
-
-**Stage 2.5 Seated Variant** (Overhead Press only):
-- When `--exercise overhead_press`, stage creates dual outputs:
-  - Main: `overhead_press/extracted_features_clean/{quality}/{video_id}.json` (full landmarks)
-  - Seated: `seated_overhead_press/extracted_features_clean/{quality}/{video_id}.json` (leg landmarks zeroed: indices 25–32, maintaining array shape)
-- Both sets receive identical preprocessing (MediaPipe extraction, One Euro filtering, post-processing) except leg landmark nullification happens after segmentation
-- Visualizations mirror to `{exercise}/visualized_poses_clean/{quality}/` and `seated_{exercise}/visualized_poses_clean/{quality}/`
-- Use seated variant for training models robust to knee-occluded camera angles (common in seated shoulder press form videos)
-
-**Stage 4 — View Classification:** `core/exevision/stages/classify_views.py`
-Accepts `--exercise` param; scans `{exercise}/extracted_features_clean/{tier}/` and writes `info.view` in-place. `run_classification()` derives dirs internally from `exercise` param (no module-level global dependency).
-**OHP head-tilt fix:** During overhead press, the lifter's head tilts back at lockout, pushing `nose_z` behind hips and falsely signalling back-facing. Fix: video-level `has_any_forward_depth` flag in `get_view_label_with_probs` — if ANY frame had the nose in front of the hips, a majority back/back_side vote is overridden to front/front_side. MediaPipe visibility scores are unreliable for front/back discrimination (reports 1.00 for all landmarks regardless of facing direction); `face_detected` (BlazeFace) is used only when depth is ambiguous (None), not as a hard override.
-
-**Stage 5 — Temporal Segmentation:** `core/exevision/stages/temporal_segmentation.py` (Refactored 2026-05-05)
-
-Exercise-parameterized phase detection with biomechanical control signals:
-- **Squat:** normalized hip Y-displacement (positive = descending). FSM cycle: `IDLE → ECCENTRIC → [ISOMETRIC] → CONCENTRIC → IDLE`. Knee-angle gate for ECCENTRIC entry and IDLE return.
-- **Overhead Press / Seated OHP:** inverted wrist Y-displacement (positive = wrists rising). FSM cycle: `IDLE → CONCENTRIC → [ISOMETRIC] → ECCENTRIC → IDLE`. No knee-angle checks — fully wrist/elbow signal driven.
-
-**FSM Cycles:**
-| Exercise | Cycle | Primary signal | Knee check |
-|----------|-------|---------------|-----------|
-| squat | IDLE→ECC→[ISO]→CONC→IDLE | hip Y descent | ✅ required |
-| overhead_press / seated_overhead_press | IDLE→CONC→[ISO]→ECC→IDLE | wrist Y ascent | ❌ removed |
-
-**Key Features:**
-- Separate `_detect_phases_squat()` and `_detect_phases_ohp()` — zero shared squat logic in OHP path
-- Exercise-specific valid transitions: `VALID_TRANSITIONS` (squat), `OHP_VALID_TRANSITIONS` (OHP)
-- `_detect_repetitions()` and `_detect_repetitions_phase_only()` both route to exercise-specific implementations
-- `_is_ohp` property on `SquatStateMachine` drives all routing
-- Debug mode: `--debug-phases` outputs per-rep acceptance reasoning
-- Backward compatible: all defaults remain "squat"
-
-**CLI Parameters:**
-```bash
-python core/exevision/stages/temporal_segmentation.py \
-  --video-id <id> \
-  --exercise overhead_press \          # squat (default), overhead_press, seated_overhead_press
-  --video-dir "/path/to/videos" \      # Search custom directory for videos (recursive)
-  --debug-phases \                     # Enable phase detection debug logs
-  --quality excellent \                # Filter by quality tier
-  --no-viz                             # Skip visualization generation
-```
-
-**Video Discovery (Priority Order):**
-1. Annotated poses from Stage 2.5 (if quality specified): `{exercise}/visualized_poses_clean/{quality}/{video_id}_annotated.mp4`
-2. Custom video directory (if `--video-dir` provided): searches recursively
-3. Default dataset directory: `{exercise}/dataset_videos_all/`
-
-**Example Usage (FitnessAQA Dataset):**
-```powershell
-cd D:\FitnessAQA\ohp_phase1\workspace
-& "path\to\venv\Scripts\Activate.ps1"
-python "path\to\temporal_segmentation.py" `
-  --video-id 80830_5 `
-  --exercise seated_overhead_press `
-  --video-dir "D:\FitnessAQA\Overhead Press\Unlabeled_Dataset-OHP\Unlabeled_Dataset\videos\videos" `
-  --debug-phases
-```
-
-**Output:**
-- Main: `{exercise}/segmented_reps/{quality}/{video_id}_segmented.json` — reps with phase breakdown
-- Visualization: `{exercise}/visualized_segmentation/{quality}/{video_id}_phases.mp4` — phase annotations on video (if `--no-viz` not set)
-- Debug: `{exercise}/debug_phases/{quality}/{video_id}_phases.json` — per-rep acceptance reasoning (if `--debug-phases` enabled)
-
-Key params: `DOWNWARD_VELOCITY_THRESHOLD=0.0015`, `UPWARD_VELOCITY_THRESHOLD=-0.0015`, `MOTION_CONFIRM_FRAMES=2`
-
-**Stage 8 — Scoring & AQA:** `core/exevision/stages/scoring.py`
-- **Squat:** knee_angle, knee_valgus_ratio, forward_lean_deg, squat_depth. Thresholds view-dependent. Per-leg independent depth to avoid diagonal-view Z-drift. Output: `squat/aqa_analysis_simple/{quality}/{video_id}/aqa_simple.json`
-- **OHP / Seated OHP:** View-aware scoring, 3–4 metrics depending on view:
-  - `grip_ratio`: all views except `side`; thresholds: ideal [0.20, 1.20], perfect 0.65, tolerance 0.90
-  - `rom`: all views; **2-component** — 50% top extension (`rom_top`: good=157°, bad=110°) + 50% elbow-below-shoulder (Y-coord check, fallback `min_elbow ≤ 110°`)
-  - `lockout`: all views; `max_elbow_angle`: good=150°, bad=135°; uses 2D angles for `side` view
-  - `elbow_flare`: `front`/`back` only — excluded from `side`, `front_side`, `back_side`
-  - `_ohp_rom()` → `(min_angle, max_angle)` tuple; angles use 2D (X,Y) for `side` view to avoid Z-depth noise
-  - Output: `{exercise}/aqa_analysis_simple/{quality}/{video_id}/aqa_simple.json`
-
-**Stage 9 — Neural Fusion:** `core/exevision/stages/neural_fusion_inference.py`
-`neural_score = clamp(heuristic + tanh(residual) × 40, 0, 100)`. Requires `bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt`. Output: merged AQA with neural scores + three-judge breakdown (BiLSTM/ST-GCN/Heuristic).
-
----
-
-## Annotation & Data
-
-**Flow:** Raw video → stages 2.5/4/5/8 → Annotation Tab → `training_dataset/annotations/videos/{video_id}.json`
-
-**Per-video JSON contains:** video metadata, per-rep (rep_id, start/end frames, phases, heuristic metrics, human score, flags, severity scales 0–5, confidence, notes).
-
-**Master index:** `training_dataset/annotations/index.json` — tracks all annotated videos + summary statistics.
-
-**Bias-blind design:** heuristic score hidden until human score submitted; revealed with Δ disagreement.
+**Stage 9 — Neural Fusion** (`neural_fusion_inference.py`)
+- `neural_score = clamp(heuristic + tanh(residual)×40, 0, 100)`
+- OHP routing (priority): `bilstm_ohp_finetuned.pt` → Phase 3 ensemble seeds → Phase 2 fallback
+- ⚠️ `model_dir` defaults to `_REPO/models/` (flat) — pending fix to `_REPO/models/runtime_neural_ohp/`
+- `seated_overhead_press`: returns `{"neural_available": false}` — heuristic-only
+- Stage 9 failure is non-fatal: pipeline continues with heuristic scores
 
 ---
 
@@ -439,70 +205,46 @@ Key params: `DOWNWARD_VELOCITY_THRESHOLD=0.0015`, `UPWARD_VELOCITY_THRESHOLD=-0.
 
 | Path | Purpose |
 |------|---------|
-| `apps/desktop-ui/app.py` | Desktop UI (Inference + Annotation tabs) |
-| `apps/api/main.py` | FastAPI server entry point |
-| `apps/api/pipeline.py` | Pipeline execution (all 5 stages + result collection) |
-| `core/exevision/stages/` | Pipeline stage scripts (2.5, 4, 5, 8, 9) |
-| `core/exevision/neural/nn_models.py` | BiLSTMScorer, STGCNScorer, HeuristicGuidedFusion |
-| `core/exevision/neural/nn_utils.py` | Skeleton graph, tensor contracts |
-| `core/exevision/training/finetune_models.py` | Phased fine-tuning (BiLSTM → ST-GCN → Fusion) |
-| `core/exevision/training/evaluate_model.py` | Test evaluation → `results/evaluation_report.json` |
-| `core/exevision/feedback/engine.py` | Rep + session coaching text generator |
-| `core/exevision/config/exercises/squat.json` | Score brackets & thresholds (required at runtime) |
-| `core/exevision/config/templates/feedback_templates.json` | Phrase catalogs (required at runtime) |
-| `core/exevision/config/paths.py` | `RunPaths` dataclass — workspace directory layout |
-| `training_dataset/annotations/` | Annotation store (index.json + per-video JSONs) |
-| `models/` | Checkpoints (bilstm_finetuned.pt, stgcn_finetuned.pt, fusion_layer.pt) |
-| `results/evaluation_report.json` | Latest neural model test metrics |
-| `Dockerfile` | Python 3.10-slim + OpenGL ES libs + models baked in |
-| `requirements-runtime.txt` | Full pipeline deps for Docker (fastapi + mediapipe + torch cpu, etc.) |
-| `apps/api/requirements.txt` | API server only (fastapi, uvicorn, httpx, pydantic) |
-| `cloudbuild.yaml` | GCP Cloud Build CI/CD (build + push + deploy) |
-| `apps/web/INTEGRATION_PROMPT.md` | Web app integration spec (handoff to Next.js repo) |
-| `apps/web/FEEDBACK_INTEGRATION_PROMPT.md` | Feedback narrative UI contract (rep card layout) |
-| `docs/superpowers/plans/` | Implementation plans (GCR deployment, web app integration) |
+| `apps/desktop-ui/app.py` | Desktop UI — Inference + Annotation tabs |
+| `apps/desktop-ui/annotation_overhead_press.py` | OHP Phase 3 annotator (8 multi-task metrics, auto-discovery) |
+| `apps/api/main.py` + `pipeline.py` | FastAPI server + pipeline execution (all 5 stages) |
+| `core/exevision/stages/run_pipeline.py` | Batch pipeline runner (stages 2.5→4→5→8) |
+| `core/exevision/neural/nn_models.py` | Squat: BiLSTMScorer, STGCNScorer, HeuristicGuidedFusion |
+| `core/exevision/neural/ohp/models.py` | OHPBiLSTMScorer, OHPSTGCNScorer (Phase 2/3 multi-task) |
+| `core/exevision/neural/ohp/inference.py` | Phase 2 + Phase 3 ensemble + finetuned single-model inference |
+| `core/exevision/neural/ohp/view_classifier.py` | ViewClassifierMLP (planned — see plan doc) |
+| `core/exevision/neural/registry.py` | Exercise → model class registry |
+| `core/exevision/training/ohp/finetune_ohp.py` | **Current**: 4-phase squat-methodology trainer (BiLSTM→ST-GCN→Fusion→Joint) |
+| `core/exevision/training/ohp/evaluate_ohp.py` | **Current**: comprehensive eval — quality Pearson, residual diagnostics, per-bucket MAE |
+| `core/exevision/training/ohp/finetune_phase3.py` | Legacy 5-seed ensemble trainer (kept for reference) |
+| `core/exevision/training/ohp/evaluate_phase3.py` | Legacy 8-metric eval; `--all-data` flag |
+| `core/exevision/training/ohp/data_phase3.py` | Dataset loader; default feat/seg dirs under `ohp_phase3_annotations/` |
+| `core/exevision/analysis/stamp_phase3_splits.py` | Stamps `fitnessaqa_split=train/val/test` — 70/15/15, stratified by quality bucket |
+| `core/exevision/analysis/populate_heuristic_scores.py` | Back-fills `heuristic_score` from AQA JSONs into annotation files |
+| `core/exevision/feedback/engine.py` | Coaching text; tone: 80-100=soft, 70-79=strict, <70=very_strict |
+| `core/exevision/config/exercises/{ex}.json` | Per-exercise thresholds + Phase 3 annotation schema |
+| `core/exevision/config/paths.py` | `RunPaths` — workspace layout |
+| `models/` | Squat: `bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt` |
+| `models/runtime_neural_ohp/` | OHP finetuned + Phase 2 + Phase 3 seeds + Phase 3 CV folds |
+| `training_dataset/ohp_phase3_annotations/` | 165 annotations + `extracted_features/` + `segmented_reps/` (consolidated) |
+| `Dockerfile` / `requirements-runtime.txt` | Container; asserts config JSONs at build time |
+| `docs/superpowers/plans/` | Implementation plans |
+| `apps/web/INTEGRATION_PROMPT.md` | Web app integration spec |
 
 ---
 
-## Technical Risks & Active Issues
+## Active Issues
 
-1. **`adapters/legacy-cli/run_stage.py` broken:** Maps stage keys to deleted `scripts/*.py` paths. Fails with "Stage script not found". Use `apps/desktop-ui/app.py` or invoke `core/exevision/stages/` directly.
-
-2. **`extract_selected_features.py` silent exit-0 on failure:** When all videos fail, `run_extraction()` returns normally without `sys.exit(1)` (line 1624). Pipeline continues with empty output dirs; downstream stages fail with misleading "Features JSON not found". Fix: `sys.exit(1)` when all videos fail, or validate non-empty output after each stage.
-
-3. **Error message truncated to 100 chars:** Line 1581 prints `error[:100]`; full traceback in `error_details` is never logged. When diagnosing extraction failures, run the stage script directly with the `.venv` Python to see full output.
-
-4. **Stage 9 not in desktop UI:** Desktop UI (`apps/desktop-ui/app.py`) is heuristic-only; infrastructure ready for neural toggle. Stage 9 is fully active in `apps/api/pipeline.py`. Wire in desktop neural mode with explicit toggle before launch (deferred).
-
-5. **GCR cold starts (~30–60s):** `--min-instances=0` triggers cold starts. Set `--min-instances=1` to eliminate (~$10/month). The web integration plan handles this with a "Warming up…" state + 90s retry.
-
-6. **Feedback config JSONs must exist in image:** Both `core/exevision/config/exercises/squat.json` and `core/exevision/config/templates/feedback_templates.json` must be present. The Dockerfile now asserts this at build time and discovers available exercise configs.
-
-7. **Callback URL must be public:** `callback_url` pointing to `http://localhost:3000/...` from Cloud Run will fail with "connection refused".
-
-8. **Result payload shape:** Supabase callback stores `payload.result`. Frontend must read `result_json.feedback`, not `result_json.result.feedback`. Normalize with `result_json?.result ?? result_json` before reads.
-
-9. **Rep feedback alignment:** Bind rep narratives by `rep_id` (not array index). Guard rendering by `status === "done"` to avoid false "no feedback" states.
-
-10. **Single vs multi-rep rendering:** For `rep_count == 1`, bypass rep tabs; render one card directly. For `rep_count > 1`, show selector tabs.
-
-11. **`neural_available` flag:** If `feedback` is missing, do not assume neural was skipped unless `neural_available === false` is explicitly set in the result.
-
-12. **API schema optional fields:** `phase_timeline` and `kinematic_data` are optional in the result payload (emitted by Stage 5). Frontend rendering must be conditional on their presence.
-
-13. **Dataset distribution risk:** Test set is 26 reps with no 0–20 coverage. Neural model generalization to poor-form squats remains unvalidated.
-
-14. **Per-metric spatial MAE high (≈24):** On diagonal views, ST-GCN depth/knee-tracking predictions are noisy. Would benefit from more training data or view-conditioned normalization.
-
-15. **Path coupling risk (RESOLVED 2026-04-07):** Stage scripts now fully parameterized. Paths computed at startup from exercise name; works correctly in container CWD `/app` and local workspaces.
-
-16. **Neural fusion non-fatal policy:** Stage 9 failure does not abort the pipeline. Result is returned with `neural_available: false` and heuristic-only scores.
-
-17. **Missing pyproject.toml / lockfile:** No frozen dependency manifest yet. `requirements-runtime.txt` covers runtime but is unpinned. Reproducibility risk.
-
-18. **Analysis tooling:** Core analysis scripts are in `core/exevision/analysis/` (e.g., `analyze_annotations.py`, `select_annotation_samples.py`). Historical `analyze_results.py` may exist only in workspace snapshots.
-
-19. **Single-exercise assumption (RESOLVED 2026-04-07):** Multi-exercise infrastructure now complete. Each exercise has config; workspace paths parameterized; all stages accept `--exercise` CLI arg with defaults for backward compat.
+1. **`adapters/legacy-cli/run_stage.py` broken** — maps to deleted `scripts/*.py`. Use `core/exevision/stages/` directly.
+2. **`extract_selected_features.py` silent exit-0** — when all videos fail, returns exit-0; downstream stages fail with misleading "Features JSON not found". Run stage directly with `.venv` Python for full traceback.
+3. **Error message truncated 100 chars** — `error[:100]` at line 1581; run stage directly for full output.
+4. **GCR cold starts (~30–60s)** — `--min-instances=0`; set `=1` to eliminate (~$10/month).
+5. **Feedback config JSONs must exist in image** — `squat.json` + `feedback_templates.json` must be in container; Dockerfile asserts at build time.
+6. **Callback URL must be public** — `localhost` callback from Cloud Run → "connection refused".
+7. **Result payload shape** — Supabase stores `payload.result`; normalize with `result_json?.result ?? result_json` before reading `.feedback`.
+8. **Rep feedback alignment** — bind by `rep_id`, not array index; guard by `status === "done"`.
+9. **Squat dataset distribution** — test set (26 reps) has no 0–20 coverage; poor-form generalization unvalidated.
+10. **No lockfile** — `requirements-runtime.txt` unpinned; reproducibility risk.
 
 ---
 
@@ -512,10 +254,7 @@ Full history in [CHANGELOG.md](CHANGELOG.md).
 
 ## graphify
 
-This project has a graphify knowledge graph at graphify-out/.
-
-Rules:
-- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
-- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
-- For cross-module "how does X relate to Y" questions, prefer `graphify query "<question>"`, `graphify path "<A>" "<B>"`, or `graphify explain "<concept>"` over grep — these traverse the graph's EXTRACTED + INFERRED edges instead of scanning files
-- After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)
+Knowledge graph at `graphify-out/`.
+- Before architecture/cross-module questions, read `graphify-out/GRAPH_REPORT.md`
+- Use `graphify query/path/explain` for "how does X relate to Y" (traverses EXTRACTED + INFERRED edges)
+- After modifying code files, run `graphify update .` (AST-only, no API cost)
