@@ -1,5 +1,33 @@
 # ExeVision AI — Development Session Log
 
+## 2026-05-14 — Dead Code Audit
+
+**Focus:** Systematic scan of the repo for 100% unreferenced code. Verified each finding via cross-references to provably have zero importers or consumers.
+
+**What was done:**
+1. **Confirmed dead (zero importers across entire codebase):**
+   - `core/exevision/config/paths.py` + `settings.py` — entire config Python package never imported
+   - `core/exevision/neural/ohp/inference.py` — self-described legacy shim, zero importers
+   - `core/exevision/rules/squat_analysis/` (2 files) — unreferenced
+   - `core/exevision/legacy_src_reference/` (6 files) — unreferenced copies of pre-refactor code
+2. **Superseded training files (documented legacy):**
+   - `training/ohp/finetune.py`, `evaluate.py`, `data.py` — Phase 2 knee-only, replaced by `finetune_ohp.py`/`evaluate_ohp.py`/`data_phase3.py`
+   - `training/ohp/finetune_phase3.py`, `evaluate_phase3.py`, `tta.py` — 5-seed ensemble, superseded by squat-methodology
+3. **Standalone scripts (never imported, CLI-only):**
+   - `training/squat/`, `training/overhead_press/`, `training/seated_overhead_press/` (8 files total) — duplicated pretrain scripts, 4 copies of same `TemporalAttention`/`STGCNBlock` class each
+   - `analysis/analyze_annotations.py`, `select_annotation_samples.py`, `select_ohp_phase3_samples.py` — no documented consumers
+4. **Unused imports cleaned from CLAUDE.md:**
+   - Removed `RunPaths`/`config/paths.py` references from Architecture and File Structure sections
+   - Marked `neural/ohp/inference.py` entry removed from File Structure table
+5. **Unused Python imports flagged (no behavioral impact):**
+   - `import math` + `import shutil` in `classify_views.py` — zero usage in file
+   - `import tempfile` in `apps/api/pipeline.py` — zero usage in file
+   - Duplicate `from pathlib import Path` in `apps/api/main.py` (lines 30 and 43)
+
+**Impact:** Zero runtime effect — all identified dead code is never loaded during normal execution. The `except: pass` blocks (6 instances across stages) are the only items that could cause silent debugging pain.
+
+**Verdict:** Safe to delete all listed items. Training is complete; `populate_heuristic_scores.py` and `stamp_phase3_splits.py` are the only CLI tools worth keeping for reproducibility.
+
 ## 2026-05-14 — View Display Normalization: front/back → "straight"
 
 **Focus:** Add `front`/`back` → `"straight"` to `_display_view()` in both app.py and pipeline.py. No backend logic changes — purely cosmetic display normalization at user-facing boundaries.

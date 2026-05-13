@@ -131,7 +131,7 @@ Video → Stage 2.5 (MediaPipe pose) → Stage 4 (view classify) → Stage 5 (FS
       → FeedbackEngine → result payload (POST callback or GET /jobs/{id})
 ```
 
-Stages run as **subprocesses** in `pipeline_ui_runs/{run_id}/workspace/`. Logs at `logs/{stage_key}.log`. Layout defined by `RunPaths` in `core/exevision/config/paths.py`.
+Stages run as **subprocesses** in `pipeline_ui_runs/{run_id}/workspace/`. Logs at `logs/{stage_key}.log`.
 
 ---
 
@@ -213,19 +213,17 @@ Key params: `DOWNWARD_VELOCITY_THRESHOLD=0.0015`, `UPWARD_VELOCITY_THRESHOLD=-0.
 | `core/exevision/stages/run_pipeline.py` | Batch pipeline runner (stages 2.5→4→5→8) |
 | `core/exevision/neural/nn_models.py` | Squat: BiLSTMScorer, STGCNScorer, HeuristicGuidedFusion |
 | `core/exevision/neural/ohp/models.py` | OHPBiLSTMScorer, OHPSTGCNScorer (Phase 2/3 multi-task) |
-| `core/exevision/neural/ohp/inference.py` | Legacy — re-exports only; runtime moved to `neural_fusion_inference.py` via handler pattern |
-| `core/exevision/neural/ohp/view_classifier.py` | ViewClassifierMLP (planned — see plan doc) |
+| `core/exevision/neural/ohp/view_classifier.py` | Neural view classifier MLP for OHP |
 | `core/exevision/neural/registry.py` | Exercise → model class + inference handler registry (add entry + model file = new exercise) |
 | `core/exevision/training/ohp/finetune_ohp.py` | **Current**: 4-phase squat-methodology trainer (BiLSTM→ST-GCN→Fusion→Joint) |
 | `core/exevision/training/ohp/evaluate_ohp.py` | **Current**: comprehensive eval — quality Pearson, residual diagnostics, per-bucket MAE |
 | `core/exevision/training/ohp/finetune_phase3.py` | Legacy 5-seed ensemble trainer (kept for reference) |
 | `core/exevision/training/ohp/evaluate_phase3.py` | Legacy 8-metric eval; `--all-data` flag |
 | `core/exevision/training/ohp/data_phase3.py` | Dataset loader; default feat/seg dirs under `ohp_phase3_annotations/` |
-| `core/exevision/analysis/stamp_phase3_splits.py` | Stamps `fitnessaqa_split=train/val/test` — 70/15/15, stratified by quality bucket |
-| `core/exevision/analysis/populate_heuristic_scores.py` | Back-fills `heuristic_score` from AQA JSONs into annotation files |
+| `core/exevision/analysis/stamp_phase3_splits.py` | CLI tool — stamps `fitnessaqa_split=train/val/test`, stratified by quality bucket |
+| `core/exevision/analysis/populate_heuristic_scores.py` | CLI tool — back-fills `heuristic_score` from AQA JSONs into annotation files |
 | `core/exevision/feedback/engine.py` | Coaching text; tone: 80-100=soft, 70-79=strict, <70=very_strict |
 | `core/exevision/config/exercises/{ex}.json` | Per-exercise thresholds + Phase 3 annotation schema |
-| `core/exevision/config/paths.py` | `RunPaths` — workspace layout |
 | `models/` | Squat: `bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt` |
 | `models/runtime_neural_ohp/` | OHP finetuned + Phase 2 + Phase 3 seeds + Phase 3 CV folds |
 | `training_dataset/ohp_phase3_annotations/` | 165 annotations + `extracted_features/` + `segmented_reps/` (consolidated) |
@@ -247,6 +245,7 @@ Key params: `DOWNWARD_VELOCITY_THRESHOLD=0.0015`, `UPWARD_VELOCITY_THRESHOLD=-0.
 8. **Rep feedback alignment** — bind by `rep_id`, not array index; guard by `status === "done"`.
 9. **Squat dataset distribution** — test set (26 reps) has no 0–20 coverage; poor-form generalization unvalidated.
 10. **No lockfile** — `requirements-runtime.txt` unpinned; reproducibility risk.
+11. **Dead code audit** — Several modules confirmed unused: `core/exevision/config/paths.py` + `settings.py` (never imported), `neural/ohp/inference.py` (zero importers), `rules/squat_analysis/` (unreferenced), `legacy_src_reference/` (unreferenced), `training/ohp/{finetune.py,evaluate.py,data.py,finetune_phase3.py,evaluate_phase3.py,tta.py}` (superseded), `training/squat/` + `training/overhead_press/` + `training/seated_overhead_press/` (standalone, never imported). See CHANGELOG 2026-05-14 for full details.
 
 ---
 
