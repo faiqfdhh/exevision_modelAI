@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-_Last updated: 2026-05-13 — See [CHANGELOG.md](CHANGELOG.md) for full session history._
+_Last updated: 2026-05-14 — See [CHANGELOG.md](CHANGELOG.md) for full session history._
 
 ---
 
@@ -22,7 +22,9 @@ _Last updated: 2026-05-13 — See [CHANGELOG.md](CHANGELOG.md) for full session 
 ```bash
 python apps/desktop-ui/app.py
 # Exercises: squat, overhead_press, seated_overhead_press
-# OHP Phase 3 Annotator: button in Annotation tab → annotation_overhead_press.py (auto-discovers videos from home dir)
+# Inference Tab: Select exercise → pick video → "Full Neural Pipeline" runs all 5 stages
+#   OHP neural output (lockout, elbow_flare, grip_ratio, ROM) shown in score report
+# Annotation Tab: OHP Phase 3 annotator button → annotation_overhead_press.py
 # _config_file_for_exercise(): seated_overhead_press → overhead_press.json for config/flags
 ```
 
@@ -143,7 +145,7 @@ Stages run as **subprocesses** in `pipeline_ui_runs/{run_id}/workspace/`. Logs a
   - OHP Phase 3 ensemble (legacy): `bilstm/stgcn/fusion_ohp_phase3_seed{42,7,19,3,99}.pt` — superseded by finetuned
   - OHP Phase 2 (fallback): `bilstm/stgcn/fusion_ohp_phase2.pt` — quality + knee_error only
   - OHP Seated: heuristic-only; leg landmarks zeroed (indices 25–32)
-- **Inference routing priority** (Stage 9, OHP): finetuned → Phase 3 ensemble → Phase 2 fallback (⚠️ pending update to `neural_fusion_inference.py` — currently uses flat `models/` path, not subdir)
+- **Inference routing** (Stage 9): exercise handler from `registry.py` uses handler-defined default checkpoint paths. OHP defaults to `models/runtime_neural_ohp/{model}_ohp_finetuned.pt`. No manual routing needed — handler pattern handles it.
 - **To add exercise:** create `config/exercises/{name}.json`, optionally add model checkpoints
 
 ---
@@ -173,8 +175,8 @@ Stages run as **subprocesses** in `pipeline_ui_runs/{run_id}/workspace/`. Logs a
 - `face_detected / valid_frames ≥ 0.25` → override back/* → front/*
 - `face_detected / valid_frames < 0.20` → demote front/* → back/* (MediaPipe hallucinates nose-Z forward from back angles)
 
-**⚠️ `front_side`/`back_side` → `diagonal` display normalization:**
-Backend keeps raw labels. `app.py` and `pipeline.py` normalize both → `"diagonal"` via `_display_view()` at user-facing boundaries. API consumers/web/desktop UI always see `"diagonal"`. Annotation UI retains raw. Always pass new display sites through `_display_view()`.
+**⚠️ `front_side`/`back_side` → `diagonal`, `front`/`back` → `straight` display normalization:**
+Backend keeps raw labels. `app.py` and `pipeline.py` normalize via `_display_view()` at user-facing boundaries: `front_side`/`back_side` → `"diagonal"`, `front`/`back` → `"straight"`. API consumers/web/desktop UI always see display labels. Annotation UI retains raw. Always pass new display sites through `_display_view()`.
 
 **⚠️ Score discrepancy:** Desktop UI runs Stage 4 before scoring; CLI without Stage 4 uses `view=unknown` (includes all metrics). `front_side` excludes grip_ratio + lockout → scores can differ dramatically for the same video.
 
@@ -194,9 +196,9 @@ Key params: `DOWNWARD_VELOCITY_THRESHOLD=0.0015`, `UPWARD_VELOCITY_THRESHOLD=-0.
 
 **Stage 9 — Neural Fusion** (`neural_fusion_inference.py`)
 - `neural_score = clamp(heuristic + tanh(residual)×40, 0, 100)`
-- OHP routing (priority): `bilstm_ohp_finetuned.pt` → Phase 3 ensemble seeds → Phase 2 fallback
-- ⚠️ `model_dir` defaults to `_REPO/models/` (flat) — pending fix to `_REPO/models/runtime_neural_ohp/`
-- `seated_overhead_press`: returns `{"neural_available": false}` — heuristic-only
+- Exercise-agnostic handler pattern: `get_exercise_handler(exercise)` from `registry.py` returns adjacency, fusion, heuristic builders + default checkpoint paths
+- To add an exercise: one entry in `_EXERCISE_HANDLER_FACTORIES` + model classes in `_REGISTRY_FACTORIES` in `registry.py`
+- `seated_overhead_press`: `suppress_knee=True` in handler, same OHP model
 - Stage 9 failure is non-fatal: pipeline continues with heuristic scores
 
 ---
@@ -211,9 +213,9 @@ Key params: `DOWNWARD_VELOCITY_THRESHOLD=0.0015`, `UPWARD_VELOCITY_THRESHOLD=-0.
 | `core/exevision/stages/run_pipeline.py` | Batch pipeline runner (stages 2.5→4→5→8) |
 | `core/exevision/neural/nn_models.py` | Squat: BiLSTMScorer, STGCNScorer, HeuristicGuidedFusion |
 | `core/exevision/neural/ohp/models.py` | OHPBiLSTMScorer, OHPSTGCNScorer (Phase 2/3 multi-task) |
-| `core/exevision/neural/ohp/inference.py` | Phase 2 + Phase 3 ensemble + finetuned single-model inference |
+| `core/exevision/neural/ohp/inference.py` | Legacy — re-exports only; runtime moved to `neural_fusion_inference.py` via handler pattern |
 | `core/exevision/neural/ohp/view_classifier.py` | ViewClassifierMLP (planned — see plan doc) |
-| `core/exevision/neural/registry.py` | Exercise → model class registry |
+| `core/exevision/neural/registry.py` | Exercise → model class + inference handler registry (add entry + model file = new exercise) |
 | `core/exevision/training/ohp/finetune_ohp.py` | **Current**: 4-phase squat-methodology trainer (BiLSTM→ST-GCN→Fusion→Joint) |
 | `core/exevision/training/ohp/evaluate_ohp.py` | **Current**: comprehensive eval — quality Pearson, residual diagnostics, per-bucket MAE |
 | `core/exevision/training/ohp/finetune_phase3.py` | Legacy 5-seed ensemble trainer (kept for reference) |

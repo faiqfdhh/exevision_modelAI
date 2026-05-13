@@ -90,7 +90,9 @@ When `status === "done"`, `result` contains:
 ```typescript
 interface AnalysisResult {
   video_id: string;           // filename stem (e.g. "user_squat_1")
-  view: "front" | "back" | "side" | "front_side" | "back_side" | "unknown";
+  view: "front" | "back" | "side" | "diagonal" | "straight" | "unknown";
+  // NOTE: Backend normalizes front/back → "straight", front_side/back_side → "diagonal"
+  // Raw labels kept internally for view-specific scoring. This field always shows display labels.
   quality: "excellent" | "good" | "fair" | "poor" | "unknown";
   rep_count: number;
   overall_heuristic_score: number;   // 0–100 rule-based score averaged over reps

@@ -97,15 +97,21 @@ CONFIG_EXERCISES_DIR = WORKSPACE_ROOT / "core" / "exevision" / "config" / "exerc
 
 
 _DIAGONAL_ALIASES = {"front_side", "back_side", "front-side", "back-side"}
+_STRAIGHT_ALIASES = {"front", "back"}
 
 
 def _display_view(raw_view) -> str:
-    """User-facing view label. Collapses front_side/back_side → 'diagonal'.
-    Backend keeps raw labels for view-specific scoring; user sees a unified diagonal."""
+    """User-facing view label. Collapses front_side/back_side → 'diagonal',
+    and front/back → 'straight'. Backend keeps raw labels for view-specific
+    scoring; user sees unified display labels."""
     if not raw_view:
         return "unknown"
     v = str(raw_view).lower().strip()
-    return "diagonal" if v in _DIAGONAL_ALIASES else v
+    if v in _DIAGONAL_ALIASES:
+        return "diagonal"
+    if v in _STRAIGHT_ALIASES:
+        return "straight"
+    return v
 
 
 def _config_file_for_exercise(exercise: str) -> str:
@@ -117,8 +123,8 @@ def _config_file_for_exercise(exercise: str) -> str:
     return exercise
 
 
-SHARED_MODEL_PATH = WORKSPACE_ROOT / "models" / "pose_landmarker_heavy.task"
-SHARED_FACE_MODEL_PATH = WORKSPACE_ROOT / "models" / "blaze_face_short_range.tflite"
+SHARED_MODEL_PATH = WORKSPACE_ROOT / "models" / "runtime_pose_and_face" / "pose_landmarker_heavy.task"
+SHARED_FACE_MODEL_PATH = WORKSPACE_ROOT / "models" / "runtime_pose_and_face" / "blaze_face_short_range.tflite"
 
 
 # Default stages for squat (backward compatibility); can be overridden by exercise selector
@@ -1309,7 +1315,12 @@ class PipelineRunnerUI:
     def _format_score_report(self, data: dict, analysis_summary: dict | None = None, neural_data: dict | None = None) -> str:
         lines = []
         lines.append(f"Video ID: {data.get('video_id', 'Unknown')}")
-        lines.append(f"Overall Score: {data.get('overall_score', 0):.1f}/100")
+        overall_score = data.get('overall_score', 0)
+        if neural_data and neural_data.get('reps'):
+            agg_scores = [r.get('aggregated_score') for r in neural_data['reps'] if r.get('aggregated_score') is not None]
+            if agg_scores:
+                overall_score = round(sum(agg_scores) / len(agg_scores), 1)
+        lines.append(f"Overall Score: {overall_score:.1f}/100")
         lines.append(f"View: {_display_view(data.get('view')).replace('_', ' ').title()}")
         lines.append(f"Repetitions: {data.get('rep_count', 0)}")
         lines.append(f"Source Quality: {str(data.get('source_quality', 'Unknown')).title()}")
@@ -1342,19 +1353,34 @@ class PipelineRunnerUI:
             metric_scores = rep_score.get("metric_scores", {})
             rep_id = rep.get("rep_id", "?")
 
-            lines.append(f"Rep {rep_id}: {rep_score.get('overall_score', 0):.1f}/100")
+            rep_neural = neural_reps_by_id.get(rep_id)
+            rep_agg_score = rep_neural.get('aggregated_score') if rep_neural else None
+            rep_display_score = rep_agg_score if rep_agg_score is not None else rep_score.get('overall_score', 0)
+            score_label = "Aggregated" if rep_agg_score is not None else "Heuristic"
+            lines.append(f"Rep {rep_id}: {rep_display_score:.1f}/100 [{score_label}]")
             lines.append(
                 f"  Frames: {rep.get('start_frame', '?')} -> {rep.get('end_frame', '?')} | "
                 f"Duration: {rep.get('duration_seconds', 0):.2f}s"
             )
-            lines.append(
-                f"  Depth: {self._format_optional_metric(metrics.get('squat_depth'))} | "
-                f"Knee Angle: {self._format_optional_metric(metrics.get('min_knee_angle'))}"
-            )
-            lines.append(
-                f"  Knee Valgus: {self._format_optional_metric(metrics.get('knee_valgus'))} | "
-                f"Forward Lean: {self._format_optional_metric(metrics.get('forward_lean'))}"
-            )
+            ohp_exercises = ("overhead_press", "seated_overhead_press")
+            if self.exercise_var.get() in ohp_exercises:
+                lines.append(
+                    f"  Grip Ratio: {self._format_optional_metric(metrics.get('grip_ratio'))} | "
+                    f"ROM: {self._format_optional_metric(metrics.get('rom'))}"
+                )
+                lines.append(
+                    f"  Lockout: {self._format_optional_metric(metrics.get('lockout'))} | "
+                    f"Elbow Flare: {self._format_optional_metric(metrics.get('elbow_flare'))}"
+                )
+            else:
+                lines.append(
+                    f"  Depth: {self._format_optional_metric(metrics.get('squat_depth'))} | "
+                    f"Knee Angle: {self._format_optional_metric(metrics.get('min_knee_angle'))}"
+                )
+                lines.append(
+                    f"  Knee Valgus: {self._format_optional_metric(metrics.get('knee_valgus'))} | "
+                    f"Forward Lean: {self._format_optional_metric(metrics.get('forward_lean'))}"
+                )
             if metric_scores:
                 score_parts = [
                     f"{name.replace('_', ' ').title()}: {value:.1f}"
@@ -1368,6 +1394,9 @@ class PipelineRunnerUI:
                 neural_score = neural_rep.get("neural_score", None)
                 if neural_score is not None:
                     lines.append(f"  [NEURAL] Score: {neural_score:.1f}/100 | Pre-clamp: {neural_rep.get('neural_score_pre_clamp', neural_score):.1f}")
+                    agg = neural_rep.get("aggregated_score")
+                    if agg is not None:
+                        lines.append(f"  [NEURAL] Aggregated: {agg:.1f}/100 (blend: heuristic + neural, pessimistic toward lower)")
                     
                     # Sub-metrics
                     sub_metrics = []
@@ -1375,12 +1404,24 @@ class PipelineRunnerUI:
                         sub_metrics.append(f"Smoothness: {neural_rep['smoothness']:.1f}")
                     if neural_rep.get("control") is not None:
                         sub_metrics.append(f"Control: {neural_rep['control']:.1f}")
-                    if neural_rep.get("depth") is not None:
-                        sub_metrics.append(f"Depth: {neural_rep['depth']:.1f}")
-                    if neural_rep.get("forward_lean") is not None:
-                        sub_metrics.append(f"Forward Lean: {neural_rep['forward_lean']:.1f}")
-                    if neural_rep.get("knee_tracking") is not None:
-                        sub_metrics.append(f"Knee Tracking: {neural_rep['knee_tracking']:.1f}")
+                    ohp_exercises = ("overhead_press", "seated_overhead_press")
+                    if self.exercise_var.get() in ohp_exercises:
+                        for key, label in [
+                            ("lockout_prob", "Lockout"), ("elbow_flare", "Elbow Flare"),
+                            ("grip_ratio", "Grip Ratio"), ("rom_top", "ROM Top"),
+                            ("rom_bottom", "ROM Bottom"), ("knee_error_prob", "Knee Error"),
+                        ]:
+                            val = neural_rep.get(key)
+                            if val is not None:
+                                sub_metrics.append(f"{label}: {val:.2f}")
+                    else:
+                        for key, label in [
+                            ("depth", "Depth"), ("forward_lean", "Forward Lean"),
+                            ("knee_tracking", "Knee Tracking"),
+                        ]:
+                            val = neural_rep.get(key)
+                            if val is not None:
+                                sub_metrics.append(f"{label}: {val:.1f}")
                     
                     if sub_metrics:
                         lines.append(f"  [NEURAL] Metrics: {' | '.join(sub_metrics)}")
@@ -1642,6 +1683,10 @@ class PipelineRunnerUI:
                 score_view = _display_view(self.current_score_data.get("view", "Unknown")).replace("_", " ").title()
                 score_reps = self.current_score_data.get("rep_count", 0)
                 score_value = self.current_score_data.get("overall_score", 0)
+                if self.current_neural_data and self.current_neural_data.get("reps"):
+                    agg_scores = [r.get("aggregated_score") for r in self.current_neural_data["reps"] if r.get("aggregated_score") is not None]
+                    if agg_scores:
+                        score_value = round(sum(agg_scores) / len(agg_scores), 1)
                 self.view_type_var.set(f"View: {score_view} | Reps: {score_reps} | Score: {score_value:.1f}")
 
         except Exception as e:
@@ -1854,7 +1899,11 @@ class PipelineRunnerUI:
 
     def _show_report(self) -> None:
         if self.current_score_data:
-            report_text = self._format_score_report(self.current_score_data, self.current_analysis_summary_data)
+            report_text = self._format_score_report(
+                self.current_score_data,
+                self.current_analysis_summary_data,
+                self.current_neural_data,
+            )
         elif self.current_analysis_data:
             data = self.current_analysis_data
             info = data.get("info", {})

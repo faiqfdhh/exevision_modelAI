@@ -24,17 +24,23 @@ from core.exevision.feedback.engine import FeedbackEngine
 logger = logging.getLogger(__name__)
 
 _DIAGONAL_ALIASES = {"front_side", "back_side", "front-side", "back-side"}
+_STRAIGHT_ALIASES = {"front", "back"}
 
 
 def _display_view(raw_view) -> str | None:
-    """User-facing view label. Collapses front_side/back_side → 'diagonal'.
-    Backend keeps raw labels; API consumers see a unified diagonal."""
+    """User-facing view label. Collapses front_side/back_side → 'diagonal',
+    and front/back → 'straight'. Backend keeps raw labels; API consumers
+    see unified display labels."""
     if raw_view is None:
         return None
     v = str(raw_view).lower().strip()
     if not v:
         return raw_view
-    return "diagonal" if v in _DIAGONAL_ALIASES else v
+    if v in _DIAGONAL_ALIASES:
+        return "diagonal"
+    if v in _STRAIGHT_ALIASES:
+        return "straight"
+    return v
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 # apps/api/ → apps/ → exevision_modelAI/
@@ -47,12 +53,17 @@ SHARED_FACE_MODEL_PATH = WORKSPACE_ROOT / "models" / "blaze_face_short_range.tfl
 
 
 def _get_model_path(model_name: str, exercise: str) -> Path:
-    """Construct exercise-specific model path, with fallback to generic names for compatibility."""
-    # First try exercise-specific: bilstm_squat.pt
+    """Construct exercise-specific model path, with fallback chain."""
+    if exercise in ("overhead_press", "seated_overhead_press"):
+        ohp_finetuned = WORKSPACE_ROOT / "models" / "runtime_neural_ohp" / f"{model_name}_ohp_finetuned.pt"
+        if ohp_finetuned.exists():
+            return ohp_finetuned
+        ohp_specific = WORKSPACE_ROOT / "models" / f"{model_name}_{exercise}.pt"
+        if ohp_specific.exists():
+            return ohp_specific
     specific = WORKSPACE_ROOT / "models" / f"{model_name}_{exercise}.pt"
     if specific.exists():
         return specific
-    # Fallback to generic: bilstm_finetuned.pt (for now, during transition)
     if model_name in ["bilstm", "stgcn", "fusion"]:
         return WORKSPACE_ROOT / "models" / f"{model_name}_finetuned.pt"
     return WORKSPACE_ROOT / "models" / f"{model_name}.pt"

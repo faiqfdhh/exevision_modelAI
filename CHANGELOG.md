@@ -1,5 +1,23 @@
 # ExeVision AI — Development Session Log
 
+## 2026-05-14 — View Display Normalization: front/back → "straight"
+
+**Focus:** Add `front`/`back` → `"straight"` to `_display_view()` in both app.py and pipeline.py. No backend logic changes — purely cosmetic display normalization at user-facing boundaries.
+
+**What was done:**
+1. **`apps/desktop-ui/app.py`**: Added `_STRAIGHT_ALIASES = {"front", "back"}` and a `"straight"` branch in `_display_view()`. Existing `_DIAGONAL_ALIASES` unchanged.
+2. **`apps/api/pipeline.py`**: Same change — `_STRAIGHT_ALIASES` + `"straight"` branch.
+3. **`CLAUDE.md`**: Updated view normalization docs to document both `→ "diagonal"` and `→ "straight"`.
+4. Backend raw labels (`front`, `back`, `front_side`, `back_side`, `side`) untouched. Annotation UI retains raw labels. All downstream scoring unaffected.
+
+**Display mapping:**
+- `front_side`, `back_side` → `"diagonal"`
+- `front`, `back` → `"straight"`
+- `side` → `"side"` (pass-through)
+- `None`/falsy → `"unknown"` (or `None` in pipeline.py)
+
+
+
 > Older sessions archived here from `CLAUDE.md` Appendix A.
 > Latest sessions are kept inline in `CLAUDE.md` Appendix A for quick reference.
 
@@ -1702,6 +1720,71 @@ Residual std went from ≈ 0.05 → ≈ 14–15, confirming genuine per-rep corr
 5. **Code review completed:** Implementation matches spec (95% compliant, minor hyphen/em-dash punctuation variance, zero functional impact).
 
 **Implementation plan saved to:** `docs/superpowers/plans/2026-03-29-tier-language.md` (4 tasks, no tests/git per user instruction)
+
+---
+
+## 2026-05-13 (Session 10a) — Restructure OHP Inference to Exercise-Handler Pattern
+
+**Focus:** Wire `bilstm_ohp_finetuned.pt`/`stgcn_ohp_finetuned.pt`/`fusion_ohp_finetuned.pt` into Stage 9. Refactor OHP inference to follow squat's modular conventions. Fix model_dir bug (flat `models/` → `models/runtime_neural_ohp/`). Make architecture extensible for future exercises.
+
+**What was done:**
+
+1. **Extended `registry.py` with `get_exercise_handler()`:**
+   - Each exercise returns a handler dict with adjacency builder, fusion builder, heuristic builder, checkpoint paths, view_vec_slice, suppress_knee flag, grip_ratio_side_exclude, and post_process hook.
+   - Lazy factory pattern (matching existing `_REGISTRY_FACTORIES`) — imports deferred to avoid circular deps.
+   - Handler for `seated_overhead_press` reuses OHP handler but sets `suppress_knee=True`.
+
+2. **Restructured `neural_fusion_inference.py`:**
+   - Removed OHP early-return block (lines 539–554) and monolithic `run_ohp_inference`/`run_ohp_phase3_ensemble` external calls.
+   - Added `_load_models(handler, device, paths)` — generic model loader using registry's `get_model_classes()` + handler's adjacency_fn/fusion_builder.
+   - Added `_infer_rep()` — generic per-rep inference, reads model output dicts dynamically, applies handler post_process hook.
+   - Extracted squat-specific logic (depth gating, safety clamps, sub-score ceiling) into `_squat_post_process()`.
+   - Updated `process_video()` to accept handler instead of exercise string.
+   - Updated `parse_args()` to default checkpoints to `None` — resolved after parsing via handler defaults.
+   - `main()` now has single code path: handler → load → discover → process → save.
+
+3. **Fixed `apps/api/pipeline.py` `_get_model_path()`:**
+   - OHP exercises now resolve to `models/runtime_neural_ohp/{model}_ohp_finetuned.pt` first.
+   - Falls back to existing `models/{model}_{exercise}.pt` or `models/{model}_finetuned.pt`.
+
+4. **Cleaned up `core/exevision/neural/ohp/inference.py`:**
+   - Removed `run_ohp_inference()`, `run_ohp_phase3_ensemble()`, `_load_checkpoints()`.
+   - Module now serves as backward-compatible re-export facade.
+
+5. **Updated `CLAUDE.md`:** Handler pattern documented, inference routing section updated, model_dir warning removed.
+
+---
+
+## 2026-05-13 (Session 10b) — Wire OHP Neural Inference into Desktop UI Inference Tab
+
+**Focus:** Make the desktop UI's "Full Neural Pipeline" button work end-to-end for OHP videos. Fix score report display to show OHP-specific metrics and neural sub-metrics instead of squat-biased hardcoded keys.
+
+**What was done:**
+
+1. **Exercise-aware per-rep metric display in `_format_score_report()`:**
+   - Line 1346–1357: Replaced hardcoded `squat_depth`/`knee_valgus`/etc. keys with exercise-conditional branch.
+   - OHP shows grip_ratio, rom, lockout, elbow_flare (read from AQA `metrics` dict).
+   - Squat keeps existing depth, knee_angle, knee_valgus, forward_lean display.
+
+2. **Exercise-aware neural sub-metrics in `_format_score_report()`:**
+   - Lines 1383–1394: Replaced hardcoded squat neural keys (depth, forward_lean, knee_tracking) with exercise-conditional branch.
+   - OHP shows lockout_prob, elbow_flare, grip_ratio, rom_top, rom_bottom, knee_error_prob.
+   - Squat keeps existing depth, forward_lean, knee_tracking display.
+
+3. **Fixed `_show_report()` popup:**
+   - Line 1880: Was calling `_format_score_report(data, analysis_summary)` without `neural_data` — a pre-existing bug.
+   - Now passes `self.current_neural_data` as third argument, so the popup report window shows neural scores.
+
+4. **Added `aggregate_scores()` heuristic–neural score blend:**
+   - Added `aggregate_scores(heuristic, neural)` in `neural_fusion_inference.py` — only 100 if both are 100, otherwise pessimistic blend weighted toward the lower score.
+   - `process_video()` writes `aggregated_score` per rep to neural JSON.
+   - Desktop UI `_format_score_report()` prefers aggregated score for overall and per-rep display, falling back to heuristic when neural unavailable.
+
+5. **No changes needed to stage execution:**
+   - `_build_stages()` already includes `neural_fusion` for all exercises.
+   - `_run_stage()` already passes `--exercise` to every stage.
+   - `_find_neural_json()` already searches exercise-specific `neural_analysis/` dir.
+   - The refactored `neural_fusion_inference.py` (Session 10a) handles OHP checkpoints via handler pattern.
 
 ---
 
