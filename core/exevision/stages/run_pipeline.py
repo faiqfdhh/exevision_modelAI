@@ -51,8 +51,8 @@ _RUNS = _REPO / "batch_runs"
 
 def _make_env() -> dict:
     env = os.environ.copy()
-    env["EXEVISION_MODEL_PATH"] = str(_MODELS / "pose_landmarker_heavy.task")
-    env["EXEVISION_FACE_MODEL_PATH"] = str(_MODELS / "blaze_face_short_range.tflite")
+    env["EXEVISION_MODEL_PATH"] = str(_MODELS / "runtime_pose_and_face" / "pose_landmarker_heavy.task")
+    env["EXEVISION_FACE_MODEL_PATH"] = str(_MODELS / "runtime_pose_and_face" / "blaze_face_short_range.tflite")
     return env
 
 
@@ -108,9 +108,9 @@ def _model(name: str, exercise: str) -> Path:
     if specific.exists():
         return specific
     generic_map = {
-        "bilstm": "bilstm_finetuned.pt",
-        "stgcn": "stgcn_finetuned.pt",
-        "fusion": "fusion_layer.pt",
+        "bilstm": "runtime_neural_squat/bilstm_finetuned.pt",
+        "stgcn": "runtime_neural_squat/stgcn_finetuned.pt",
+        "fusion": "runtime_neural_squat/fusion_layer.pt",
     }
     return _MODELS / generic_map.get(name, f"{name}.pt")
 

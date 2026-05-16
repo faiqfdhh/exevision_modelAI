@@ -60,8 +60,8 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
 # Model paths (resolved relative to /app which is the repo root)
-ENV EXEVISION_MODEL_PATH=/app/models/pose_landmarker_heavy.task
-ENV EXEVISION_FACE_MODEL_PATH=/app/models/blaze_face_short_range.tflite
+ENV EXEVISION_MODEL_PATH=/app/models/runtime_pose_and_face/pose_landmarker_heavy.task
+ENV EXEVISION_FACE_MODEL_PATH=/app/models/runtime_pose_and_face/blaze_face_short_range.tflite
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 # Working directory /app = repo root. This ensures `core.exevision.*` imports work

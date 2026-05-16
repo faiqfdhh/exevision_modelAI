@@ -342,7 +342,11 @@ def find_feature_json(video_id: str) -> Optional[str]:
     if not FEATURES_ROOT.exists():
         return None
 
-    exact_matches = sorted(FEATURES_ROOT.rglob(f"{video_id}.json"))
+    # Prefer raw_unfiltered to match the tier used by find_segmented_json.
+    exact_matches = sorted(
+        FEATURES_ROOT.rglob(f"{video_id}.json"),
+        key=lambda p: (0 if "raw_unfiltered" in str(p) else 1),
+    )
     if exact_matches:
         return str(exact_matches[0])
 
@@ -353,7 +357,13 @@ def find_segmented_json(video_id: str) -> Optional[str]:
     if not SEGMENTED_ROOT.exists():
         return None
 
-    exact_matches = sorted(SEGMENTED_ROOT.rglob(f"{video_id}_segmented.json"))
+    # Prefer raw_unfiltered tier: it retains all reps without stability filtering.
+    # Quality-tiered paths (excellent/good/fair) use smoothed features whose dampened
+    # velocity can drop below the FSM threshold for slow/controlled movements.
+    exact_matches = sorted(
+        SEGMENTED_ROOT.rglob(f"{video_id}_segmented.json"),
+        key=lambda p: (0 if "raw_unfiltered" in str(p) else 1),
+    )
     if exact_matches:
         return str(exact_matches[0])
 

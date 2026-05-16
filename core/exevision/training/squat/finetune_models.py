@@ -978,12 +978,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--cpu", action="store_true")
 
-    parser.add_argument("--bilstm-pretrained", type=str, default="models/bilstm_pretrained.pt")
-    parser.add_argument("--stgcn-pretrained", type=str, default="models/stgcn_pretrained.pt")
-    parser.add_argument("--bilstm-out", type=str, default="models/bilstm_finetuned.pt")
-    parser.add_argument("--stgcn-out", type=str, default="models/stgcn_finetuned.pt")
-    parser.add_argument("--fusion-out", type=str, default="models/fusion_layer.pt")
-    parser.add_argument("--joint-out", type=str, default="models/joint_finetuned.pt")
+    parser.add_argument("--bilstm-pretrained", type=str, default="models/pretrain_squat/bilstm_pretrained.pt")
+    parser.add_argument("--stgcn-pretrained", type=str, default="models/pretrain_squat/stgcn_pretrained.pt")
+    parser.add_argument("--bilstm-out", type=str, default="models/runtime_neural_squat/bilstm_finetuned.pt")
+    parser.add_argument("--stgcn-out", type=str, default="models/runtime_neural_squat/stgcn_finetuned.pt")
+    parser.add_argument("--fusion-out", type=str, default="models/runtime_neural_squat/fusion_layer.pt")
+    parser.add_argument("--joint-out", type=str, default="models/runtime_neural_squat/joint_finetuned.pt")
 
     parser.add_argument("--epochs-bilstm", type=int, default=20)
     parser.add_argument("--epochs-stgcn", type=int, default=20)

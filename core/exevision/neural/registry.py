@@ -53,7 +53,7 @@ def _handler_squat() -> ExerciseHandler:
         "heuristic_fn": build_heuristic_vector,
         "heuristic_dim": 15,
         "view_vec_slice": (10, 15),
-        "ckpt_dir": "models",
+        "ckpt_dir": "models/runtime_neural_squat",
         "bilstm_ckpt_name": "bilstm_finetuned.pt",
         "stgcn_ckpt_name": "stgcn_finetuned.pt",
         "fusion_ckpt_name": "fusion_layer.pt",

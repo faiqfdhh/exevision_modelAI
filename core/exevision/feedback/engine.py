@@ -11,13 +11,14 @@ from core.exevision.feedback.session_aggregator import SessionAggregator
 from core.exevision.feedback.template_renderer import TemplateRenderer
 
 
-class FeedbackItem(TypedDict):
+class FeedbackItem(TypedDict, total=False):
     """Individual feedback item with score for color-coding."""
 
     text: str
     score: int  # 0-100, for frontend color-coding
     category: Literal["spatial", "temporal", "geometric"]
     type: Literal["issue", "win"]
+    metric_key: str  # originating metric name, used by frontend for boolean display
 
 
 @dataclass
@@ -56,19 +57,7 @@ class FeedbackResult:
     session: SessionSummary
 
 
-# ── Phase 3 OHP: config-driven cue thresholds ──────────────────────────────
-# Key = field name in the neural output dict; direction = "below" or "above"; threshold = float.
-# If the key is present in `error_cues_phase3` of the exercise config, the cue fires.
-PHASE3_CUE_THRESHOLDS: dict[str, tuple[str, float]] = {
-    "lockout_prob":    ("below", 0.5),
-    "elbow_flare":     ("below", 50.0),
-    "smoothness":      ("below", 50.0),
-    "control":         ("below", 50.0),
-    "grip_ratio":      ("below", 40.0),
-    "rom_top":         ("below", 50.0),
-    "rom_bottom":      ("below", 50.0),
-    "knee_error_prob": ("above", 0.5),
-}
+
 
 
 class QualityChecker:
@@ -95,17 +84,30 @@ class QualityChecker:
 class FeedbackItemBuilder:
     """Helper class for building and scoring feedback items."""
 
+    # Metrics stored on a 0-1 probability scale where higher = worse (direction: above).
+    # Invert and scale to produce a 0-100 quality score.
+    _INVERTED_PROB_METRICS: frozenset[str] = frozenset({"knee_error"})
+    # Metrics stored on a 0-1 quality scale where higher = better (direction: below).
+    _PROB_METRICS: frozenset[str] = frozenset({"lockout"})
+
     @staticmethod
     def score_for_metric(metric_name: str, metric_value: float | None) -> int:
         """Map a metric name and value to a 0-100 score."""
         if metric_value is None:
             return 50
-        return int(max(0, min(100, metric_value)))
+        val = float(metric_value)
+        if metric_name in FeedbackItemBuilder._INVERTED_PROB_METRICS:
+            # 0-1 probability where high = bad: invert and scale
+            val = (1.0 - val) * 100.0
+        elif metric_name in FeedbackItemBuilder._PROB_METRICS:
+            # 0-1 quality where high = good: scale directly
+            val = val * 100.0
+        return round(int(max(0, min(100, val))))
 
     @staticmethod
     def get_category_for_metric(metric_name: str) -> Literal["spatial", "temporal", "geometric"]:
         """Classify metric into category for frontend filtering."""
-        spatial_metrics = {"hip_depth", "depth", "knee_tracking", "elbow_flare", "grip_ratio", "rom_top", "rom_bottom", "lockout"}
+        spatial_metrics = {"hip_depth", "depth", "knee_tracking", "elbow_flare", "grip_ratio", "rom_top", "rom_bottom", "lockout", "knee_error"}
         temporal_metrics = {"smoothness", "control"}
         
         if metric_name in spatial_metrics:
@@ -133,6 +135,7 @@ class FeedbackItemBuilder:
                 "score": score,
                 "category": category,
                 "type": item.get("type", "issue"),
+                "metric_key": metric_key,
             }
             scored_items.append(scored_item)
         
@@ -207,14 +210,15 @@ class FeedbackEngine:
             _, stable_items = self._build_stable_texts(video_id, rep_id, sub_scores, wins, issues, threshold)
             all_item_dicts.extend(stable_items)
 
-            # Collect issue items
+            # Collect issue items — exclude metrics with metric_cues (handled by _emit_metric_cues)
             issue_tone_mode = self._resolve_issue_tone_mode(score, mismatch_type)
-            _, issue_items = self._group_issue_cues(issue_scores, tone_mode=issue_tone_mode)
+            metric_cues_config = self.exercise_config.get("metric_cues", {})
+            filtered_issue_scores = {k: v for k, v in issue_scores.items() if k not in metric_cues_config}
+            _, issue_items = self._group_issue_cues(filtered_issue_scores, tone_mode=issue_tone_mode)
             all_item_dicts.extend(issue_items)
 
-            # ── Phase 3 neural cues (config-driven, no exercise branch) ─────
-            phase3_items = self._emit_phase3_cues(rep_data)
-            all_item_dicts.extend(phase3_items)
+            metric_cue_items = self._emit_metric_cues(rep_data)
+            all_item_dicts.extend(metric_cue_items)
 
             # Assign scores to all items based on their metric_name
             scored_items = self._item_builder.assign_item_scores(sub_scores, all_item_dicts)
@@ -249,21 +253,28 @@ class FeedbackEngine:
             session=session_summary,
         )
 
-    def _emit_phase3_cues(
+    def _emit_metric_cues(
         self, rep_data: dict[str, Any]
     ) -> list[dict[str, Any]]:
-        """Emit cue items for Phase 3 OHP neural outputs if thresholds breach.
+        """Emit severity-graded cue items from ``metric_cues`` exercise config.
 
-        Cue text is read from ``error_cues_phase3`` in the exercise config.
-        If that key is absent (e.g. squat config), this method returns [].
-        No exercise-specific branches — behaviour is purely config-driven.
+        Each entry in ``metric_cues`` specifies:
+          - ``direction``: "below" (lower score is worse) or "above" (higher is worse)
+          - ``issue_at``: boundary above/below which the metric is not an issue
+          - ``mild_at`` / ``moderate_at``: tier boundaries
+          - ``tiers``: {mild, moderate, severe} cue text
+
+        If ``metric_cues`` is absent (squat config), returns [].
+        No exercise-specific branches — purely config-driven.
         """
-        cue_catalog: dict[str, str] = self.exercise_config.get("error_cues_phase3", {})
-        if not cue_catalog:
+        metric_cues: dict[str, Any] = self.exercise_config.get("metric_cues", {})
+        if not metric_cues:
             return []
 
         items: list[dict[str, Any]] = []
-        for metric_key, (direction, threshold_val) in PHASE3_CUE_THRESHOLDS.items():
+        for metric_key, cue_config in metric_cues.items():
+            if not cue_config.get("enabled", True):
+                continue
             raw = rep_data.get(metric_key)
             if raw is None:
                 continue
@@ -272,21 +283,40 @@ class FeedbackEngine:
             except (TypeError, ValueError):
                 continue
 
-            triggered = (
-                (direction == "below" and val < threshold_val) or
-                (direction == "above" and val > threshold_val)
-            )
-            if not triggered:
-                continue
+            direction = cue_config.get("direction", "below")
+            issue_at = float(cue_config.get("issue_at", 75))
+            mild_at = float(cue_config.get("mild_at", 65))
+            moderate_at = float(cue_config.get("moderate_at", 40))
+            tiers = cue_config.get("tiers", {})
 
-            cue_text = cue_catalog.get(metric_key)
+            if direction == "below":
+                if val >= issue_at:
+                    continue
+                if val < moderate_at:
+                    tier = "severe"
+                elif val < mild_at:
+                    tier = "moderate"
+                else:
+                    tier = "mild"
+            else:
+                if val <= issue_at:
+                    continue
+                if val > moderate_at:
+                    tier = "severe"
+                elif val > mild_at:
+                    tier = "moderate"
+                else:
+                    tier = "mild"
+
+            cue_text = tiers.get(tier, "")
             if not cue_text:
                 continue
 
             items.append({
-                "text":        cue_text,
                 "metric_name": metric_key,
+                "score":       val,
                 "type":        "issue",
+                "text":        cue_text,
             })
 
         return items

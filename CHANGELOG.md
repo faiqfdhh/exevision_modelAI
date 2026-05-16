@@ -1,5 +1,54 @@
 # ExeVision AI — Development Session Log
 
+## 2026-05-14 — Critical Security + API Fixes
+
+**Focus:** Fix two critical issues found in full audit: secrets leaking into Docker image, and `seated_overhead_press` returning HTTP 400.
+
+**Bugs fixed (2):**
+
+1. **`.dockerignore` missing `.env` exclusion (Critical):** `apps/api/.env` (contains real Supabase credentials) was not excluded from Docker build context. Any `gcloud builds submit` or `docker build` from local workspace would bake the secrets into image layers. Added `.env`, `**/.env`, `*.env.local`, `**/*.env.local` to `.dockerignore`.
+
+2. **`seated_overhead_press` HTTP 400 on `/infer` (Critical, `main.py:287-294`):** Validation checked `EXERCISES_CONFIG_DIR / f"{req.exercise}.json"` directly — `seated_overhead_press.json` doesn't exist. The alias mapping (`seated_overhead_press → overhead_press`) only existed in `pipeline.py:_resolve_exercise_config()`, never reached from `main.py`. Fixed by replacing raw file check with `_resolve_exercise_config(req.exercise)`, catching `FileNotFoundError` and re-raising as HTTP 400. Single source of truth for alias mapping preserved.
+
+**No behavior change for valid exercises (squat, overhead_press).** `seated_overhead_press` now routes correctly through the full pipeline.
+
+---
+
+## 2026-05-14 — GCR Deployment: Fix Model Paths
+
+**Focus:** Restore GCR deployability after commit `169a40d` moved all model files into subdirectories but `apps/api/pipeline.py` was never updated.
+
+**Bugs fixed (3):**
+
+1. **MediaPipe model paths (Bug 2, `pipeline.py:51-52`):** `SHARED_MODEL_PATH` and `SHARED_FACE_MODEL_PATH` pointed to `models/pose_landmarker_heavy.task` and `models/blaze_face_short_range.tflite`. Actual files at `models/runtime_pose_and_face/`. Also fixed Dockerfile `ENV EXEVISION_MODEL_PATH` / `ENV EXEVISION_FACE_MODEL_PATH`.
+
+2. **Missing constants (Bug 1, `pipeline.py`):** `BILSTM_CKPT`, `STGCN_CKPT`, `FUSION_CKPT` were deleted in commit `34e3b26` but `apps/api/main.py:52-63` still imports them, causing `ImportError` on startup. Re-added using `_get_model_path("bilstm", "squat")` etc.
+
+3. **Squat neural model paths (Bug 3, `_get_model_path()` + `registry.py`):** Squat fallback pointed to `models/bilstm_finetuned.pt` (now at `models/runtime_neural_squat/`). Fixed `_get_model_path()` to check `runtime_neural_squat/` first. Fixed squat handler `ckpt_dir` from `"models"` to `"models/runtime_neural_squat"`.
+
+**Verification:**
+- All model files confirmed present at correct subdirectory locations
+- `_get_model_path()` now resolves squat → `runtime_neural_squat/`, OHP → `runtime_neural_ohp/`, MediaPipe → `runtime_pose_and_face/`
+- Both exercises should deploy to GCR after these fixes
+
+## 2026-05-14 — Flat Model Path Sweep: 6 Remaining Files
+
+**Focus:** Fix all remaining hardcoded flat `models/` paths so squat + OHP both work in GCR without manual overrides. The 3 critical API-server bugs (import error, MediaPipe, squat neural) were fixed in the previous session.
+
+**Fixes applied (6):**
+
+1. **`run_pipeline.py:54-55` (HIGH):** `EXEVISION_MODEL_PATH` / `FACE_MODEL_PATH` pointed to `_MODELS / "pose_landmarker_heavy.task"` — no `runtime_pose_and_face/` subdirectory. Breaks `--include-neural` batch CLI mode.
+
+2. **`run_pipeline.py:110-115` (HIGH):** `_model()` fallback `generic_map` returned `_MODELS / "bilstm_finetuned.pt"` (flat). Now returns `_MODELS / "runtime_neural_squat/bilstm_finetuned.pt"` etc.
+
+3. **`extract_selected_features.py:50-51` (HIGH):** Fallback after `os.environ.get("EXEVISION_MODEL_PATH", ...)` used flat `os.path.join('models', 'pose_landmarker_heavy.task')`. API safe (env var set), direct CLI runs break without fix.
+
+4. **`classify_views.py:479` (HIGH):** `--neural-model` default was `"models/view_classifier_ohp.pt"` — file lives at `models/training_view_classifier/view_classifier_ohp.pt`. API unaffected (no `--neural` flag), silently falls back to heuristic if ever added.
+
+5. **`annotation_overhead_press.py:45-46` (MEDIUM):** `_POSE_MODEL` / `_FACE_MODEL` used `_REPO / "models" / "pose_landmarker_heavy.task"` (flat). Desktop annotation UI won't load pose model.
+
+6. **`finetune_models.py:981-986` + `evaluate_model.py:63-65` (MEDIUM):** All squat training CLI defaults pointed to flat `models/*.pt`. Pretrained models at `models/pretrain_squat/`, finetuned models at `models/runtime_neural_squat/`. Updated all defaults.
+
 ## 2026-05-14 — Dead Code Audit
 
 **Focus:** Systematic scan of the repo for 100% unreferenced code. Verified each finding via cross-references to provably have zero importers or consumers.
@@ -43,6 +92,24 @@
 - `front`, `back` → `"straight"`
 - `side` → `"side"` (pass-through)
 - `None`/falsy → `"unknown"` (or `None` in pipeline.py)
+
+
+## 2026-05-14 — OHP Personalised Feedback: 3-Tier Severity Cues
+
+**Focus:** Implement exercise-specific, severity-graded OHP feedback via new `metric_cues` config section. Replace flat `error_cues_phase3` with 3-tier per-metric cues (mild/moderate/severe). Fix data-forwarding bugs that blocked OHP feedback entirely.
+
+**What was done:**
+1. **`overhead_press.json`**: Removed `issue_groups` (referenced non-existent metrics `shoulder_elevation`/`elbow_extension`) and `error_cues_phase3` (flat single-cue block). Removed unused `field_mapping.metrics_to_feedback`. Added new `metric_cues` section — 8 independent metrics, each with:
+   - `direction`: "below" (lower=worse) or "above" (higher=worse) — handles binary metrics (`lockout` 0-1, `knee_error` 0-1 inverted)
+   - `issue_at`/`mild_at`/`moderate_at`: per-metric threshold boundaries
+   - `tiers`: {mild, moderate, severe} — specific, personalised cue text per severity level
+2. **`engine.py`**: Removed `PHASE3_CUE_THRESHOLDS` constant (keys mismatched model output: `lockout_prob`→`lockout`, `knee_error_prob`→`knee_error`). Added `_emit_metric_cues()` — reads `metric_cues` config, returns severity-graded FeedbackItems. No exercise branches — pure config-driven. Falls through to existing `_group_issue_cues` for squat. Added `knee_error` to `FeedbackItemBuilder` spatial_metrics category set.
+3. **`pipeline.py`**: Fixed `_resolve_exercise_config()` — `seated_overhead_press` aliases to `overhead_press` config. Fixed `merged_reps["sub_scores"]` — now includes all OHP neural keys (`lockout`, `elbow_flare`, `grip_ratio`, `rom_top`, `rom_bottom`, `knee_error`) alongside squat keys. Rewrote `feedback_input` construction — forwards OHP neural keys at top level so `_emit_metric_cues` can access them via `rep_data.get(metric_key)`. Preserved squat backward compat with AQA `metric_scores` fallback (`knee_valgus`, `forward_lean`, `hip_depth`, `knee_tracking`). Removed unused `_get_field_mapping()` function.
+4. **`tests/test_feedback_engine.py`** (new): 18 unit tests — `_emit_metric_cues` tier grading, direction "above" (knee_error), per-metric severity, boundary conditions, integration with `generate_feedback`.
+
+**Design:** 3-tier severity per metric (not per-rep), direction-aware thresholds, zero exercise branches. Squat unchanged — `metric_cues` absent → `_emit_metric_cues` returns `[]` → existing paths handle squat identically.
+
+**Test results:** 18/18 passed.
 
 
 

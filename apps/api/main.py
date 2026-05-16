@@ -280,17 +280,18 @@ def submit_inference(req: InferRequest, background_tasks: BackgroundTasks) -> di
     Accept a video URL and enqueue a pipeline run.
     Returns immediately with a job_id; poll GET /jobs/{job_id} for results.
     """
-    from pipeline import EXERCISES_CONFIG_DIR
-    
+    from pipeline import EXERCISES_CONFIG_DIR, _resolve_exercise_config
+
     job_id = req.job_id or str(uuid.uuid4())
-    
-    # Validate exercise config exists
-    exercise_config = EXERCISES_CONFIG_DIR / f"{req.exercise}.json"
-    if not exercise_config.exists():
+
+    # Validate exercise config exists (aliases like seated_overhead_press → overhead_press resolved here)
+    try:
+        _resolve_exercise_config(req.exercise)
+    except FileNotFoundError:
         available = sorted(p.stem for p in EXERCISES_CONFIG_DIR.glob("*.json"))
         raise HTTPException(
-            status_code=400, 
-            detail=f"Unsupported exercise: '{req.exercise}'. Available: {available}"
+            status_code=400,
+            detail=f"Unsupported exercise: '{req.exercise}'. Available: {available}",
         )
     
     try:

@@ -48,8 +48,8 @@ _API_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = _API_DIR.parents[1]
 STAGES_DIR = WORKSPACE_ROOT / "core" / "exevision" / "stages"
 RUNS_ROOT = WORKSPACE_ROOT / "pipeline_ui_runs"
-SHARED_MODEL_PATH = WORKSPACE_ROOT / "models" / "pose_landmarker_heavy.task"
-SHARED_FACE_MODEL_PATH = WORKSPACE_ROOT / "models" / "blaze_face_short_range.tflite"
+SHARED_MODEL_PATH = WORKSPACE_ROOT / "models" / "runtime_pose_and_face" / "pose_landmarker_heavy.task"
+SHARED_FACE_MODEL_PATH = WORKSPACE_ROOT / "models" / "runtime_pose_and_face" / "blaze_face_short_range.tflite"
 
 
 def _get_model_path(model_name: str, exercise: str) -> Path:
@@ -65,44 +65,54 @@ def _get_model_path(model_name: str, exercise: str) -> Path:
     if specific.exists():
         return specific
     if model_name in ["bilstm", "stgcn", "fusion"]:
+        squat_ckpt = WORKSPACE_ROOT / "models" / "runtime_neural_squat" / f"{model_name}_finetuned.pt"
+        if squat_ckpt.exists():
+            if exercise not in ("squat",):
+                logger.warning(
+                    "[pipeline] No %s checkpoint for exercise='%s'; falling back to squat weights. "
+                    "Neural fusion will likely fail and degrade to heuristic-only.",
+                    model_name, exercise,
+                )
+            return squat_ckpt
+        fusion_layer = WORKSPACE_ROOT / "models" / "runtime_neural_squat" / "fusion_layer.pt"
+        if model_name == "fusion" and fusion_layer.exists():
+            if exercise not in ("squat",):
+                logger.warning(
+                    "[pipeline] No fusion checkpoint for exercise='%s'; falling back to squat fusion_layer.pt. "
+                    "Neural fusion will likely fail and degrade to heuristic-only.",
+                    exercise,
+                )
+            return fusion_layer
+        if exercise not in ("squat",):
+            logger.warning(
+                "[pipeline] No %s checkpoint for exercise='%s' at expected paths; "
+                "falling back to flat models/ dir. Neural fusion will likely fail.",
+                model_name, exercise,
+            )
         return WORKSPACE_ROOT / "models" / f"{model_name}_finetuned.pt"
     return WORKSPACE_ROOT / "models" / f"{model_name}.pt"
+BILSTM_CKPT = _get_model_path("bilstm", "squat")
+STGCN_CKPT = _get_model_path("stgcn", "squat")
+FUSION_CKPT = _get_model_path("fusion", "squat")
+
 FEEDBACK_EXERCISE_CONFIG = WORKSPACE_ROOT / "core" / "exevision" / "config" / "exercises" / "squat.json"
 FEEDBACK_TEMPLATES_CONFIG = WORKSPACE_ROOT / "core" / "exevision" / "config" / "templates" / "feedback_templates.json"
 EXERCISES_CONFIG_DIR = WORKSPACE_ROOT / "core" / "exevision" / "config" / "exercises"
 
 
 def _resolve_exercise_config(exercise: str) -> Path:
-    """Resolve the exercise config JSON path, raising if not found."""
-    path = EXERCISES_CONFIG_DIR / f"{exercise}.json"
+    """Resolve the exercise config JSON path, raising if not found.
+
+    Maps exercise aliases (e.g. seated_overhead_press) to their base config.
+    """
+    _EXERCISE_CONFIG_ALIASES: dict[str, str] = {
+        "seated_overhead_press": "overhead_press",
+    }
+    config_name = _EXERCISE_CONFIG_ALIASES.get(exercise, exercise)
+    path = EXERCISES_CONFIG_DIR / f"{config_name}.json"
     if not path.exists():
         raise FileNotFoundError(f"Exercise config not found: {path}")
     return path
-
-
-def _get_field_mapping(exercise: str) -> dict[str, str]:
-    """Load field mapping from exercise config, with defaults for backward compatibility."""
-    import json
-    
-    # Default mapping for squat (for backward compatibility)
-    default_mapping = {
-        "squat_depth": "hip_depth",
-        "forward_lean_deg": "forward_lean",
-        "knee_valgus_ratio": "knee_valgus",
-        "knee_tracking_ratio": "knee_tracking",
-    }
-    
-    try:
-        config_path = _resolve_exercise_config(exercise)
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-        field_mapping = config.get("field_mapping", {}).get("metrics_to_feedback", {})
-        if field_mapping:
-            return field_mapping
-    except Exception as e:
-        logger.debug(f"Could not load field_mapping from {exercise} config: {e}")
-    
-    # Return default only for squat, empty dict otherwise
-    return default_mapping if exercise == "squat" else {}
 
 
 # ── Stage definitions ──────────────────────────────────────────────────────────
@@ -477,12 +487,12 @@ def _tier_for_score(score: float) -> str:
     if score >= 85.0:
         return "excellent"
     if score >= 75.0:
-        return "strong"
+        return "good"
     if score >= 60.0:
-        return "okay"
+        return "fair"
     if score >= 40.0:
-        return "needs_work"
-    return "focus_here"
+        return "poor"
+    return "critical"
 
 
 def coerce_old_feedback_format(old_feedback: dict[str, Any]) -> dict[str, Any]:
@@ -656,7 +666,21 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
 
     aqa_file = _find_json(aqa_base, f"{video_id}_aqa_simple.json")
     neural_file = _find_json(neural_base, f"{video_id}_neural.json")
-    seg_file = _find_json(seg_base, f"{video_id}_segmented.json")
+
+    # Prefer the segmented JSON from the same quality tier as the neural file.
+    # _find_json sorts alphabetically and "excellent" (0 reps) precedes "raw_unfiltered"
+    # (1+ reps), so naively grabbing the first match returns an empty-rep file.
+    seg_file = None
+    if neural_file is not None:
+        quality_tier = neural_file.parent.name  # e.g. "raw_unfiltered"
+        candidate = seg_base / quality_tier / f"{video_id}_segmented.json"
+        seg_file = candidate if candidate.exists() else _find_json(seg_base, f"{video_id}_segmented.json")
+    else:
+        seg_file = _find_json(seg_base, f"{video_id}_segmented.json")
+
+    print(f"[DIAGNOSTIC] neural_file={neural_file}, neural_file.parent.name={neural_file.parent.name if neural_file else 'N/A'}", flush=True)
+    print(f"[DIAGNOSTIC] candidate={candidate if neural_file else 'N/A'}, exists={candidate.exists() if neural_file else 'N/A'}", flush=True)
+    print(f"[DIAGNOSTIC] seg_file={seg_file}, exists={seg_file.exists() if seg_file else 'NONE'}", flush=True)
 
     if aqa_file is None:
         raise FileNotFoundError(
@@ -713,12 +737,25 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
             ct = nr.get("control")
             if sm is not None and ct is not None:
                 bilstm_score = round((sm + ct) / 2.0, 2)
-            dp = nr.get("depth")
-            fl = nr.get("forward_lean")
-            kt = nr.get("knee_tracking")
-            spatial_vals = [v for v in (dp, fl, kt) if v is not None]
-            if spatial_vals:
-                stgcn_score = round(sum(spatial_vals) / len(spatial_vals), 2)
+            # Prefer the model's own pre-computed aggregate (exercise-agnostic,
+            # correct weighting, immune to scale mismatches between heads).
+            agg = nr.get("aggregated_score")
+            if agg is not None:
+                stgcn_score = round(float(agg), 2)
+            else:
+                # Fallback: average 0-100 spatial sub-scores manually.
+                dp = nr.get("depth")
+                fl = nr.get("forward_lean")
+                kt = nr.get("knee_tracking")
+                spatial_vals = [v for v in (dp, fl, kt) if v is not None]
+                if not spatial_vals:
+                    ef = nr.get("elbow_flare")
+                    gr = nr.get("grip_ratio")
+                    rt = nr.get("rom_top")
+                    rb = nr.get("rom_bottom")
+                    spatial_vals = [v for v in (ef, gr, rt, rb) if v is not None]
+                if spatial_vals:
+                    stgcn_score = round(sum(spatial_vals) / len(spatial_vals), 2)
 
         # Phase timeline from Stage 5 segmentation (optional)
         seg_rep = seg_by_id.get(rid)
@@ -765,6 +802,12 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
                 "depth": nr.get("depth"),
                 "forward_lean": nr.get("forward_lean"),
                 "knee_tracking": nr.get("knee_tracking"),
+                "lockout": nr.get("lockout"),
+                "elbow_flare": nr.get("elbow_flare"),
+                "grip_ratio": nr.get("grip_ratio"),
+                "rom_top": nr.get("rom_top"),
+                "rom_bottom": nr.get("rom_bottom"),
+                "knee_error": nr.get("knee_error"),
             } if nr else None,
             "safety_clamps": nr.get("safety_clamps_applied", []),
             "phase_timeline": phase_timeline,
@@ -803,42 +846,53 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
             )
             print(f"[DIAGNOSTIC] FeedbackEngine initialized successfully", flush=True)
             feedback_input: list[dict[str, Any]] = []
-            field_mapping = _get_field_mapping(exercise)  # Get exercise-specific field mapping
             
             for rep in merged_reps:
-                metric_scores = rep.get("metric_scores") or {}
                 sub_scores = rep.get("sub_scores") or {}
-                metrics = rep.get("metrics") or {}
 
-                # Helper function to map field names via the field_mapping
-                def map_metric_name(raw_name: str) -> str | None:
-                    """Apply field_mapping to translate raw metric name to feedback name."""
-                    mapped = field_mapping.get(raw_name)
-                    return mapped if mapped else raw_name
-                
-                # Build normalized_sub_scores using the field_mapping
-                normalized_sub_scores = {
-                    "forward_lean": sub_scores.get("forward_lean") if sub_scores.get("forward_lean") is not None else metric_scores.get(map_metric_name("forward_lean_deg")),
-                    "hip_depth": sub_scores.get("depth") if sub_scores.get("depth") is not None else metric_scores.get(map_metric_name("squat_depth")),
-                    "knee_tracking": sub_scores.get("knee_tracking") if sub_scores.get("knee_tracking") is not None else metric_scores.get(map_metric_name("knee_tracking_ratio")),
-                    "knee_valgus": metric_scores.get(map_metric_name("knee_valgus_ratio")),
+                # Normalize sub_scores: squat keys for backward compat + OHP keys
+                normalized_sub_scores: dict[str, float | None] = {
+                    "forward_lean": sub_scores.get("forward_lean"),
+                    "hip_depth": sub_scores.get("depth"),
+                    "knee_tracking": sub_scores.get("knee_tracking"),
+                    "knee_valgus": None,
                     "smoothness": sub_scores.get("smoothness"),
                     "control": sub_scores.get("control"),
+                    "lockout": sub_scores.get("lockout"),
+                    "elbow_flare": sub_scores.get("elbow_flare"),
+                    "grip_ratio": sub_scores.get("grip_ratio"),
+                    "rom_top": sub_scores.get("rom_top"),
+                    "rom_bottom": sub_scores.get("rom_bottom"),
+                    "knee_error": sub_scores.get("knee_error"),
                 }
 
-                feedback_input.append(
-                    {
-                        "rep_id": rep.get("rep_id"),
-                        "neural_score": rep.get("neural_score") if rep.get("neural_score") is not None else rep.get("heuristic_score"),
-                        "metrics": {
-                            "forward_lean": metrics.get("forward_lean_deg") if metrics.get("forward_lean_deg") is not None else metrics.get("forward_lean"),
-                            "hip_depth": metrics.get("squat_depth") if metrics.get("squat_depth") is not None else metrics.get("hip_depth"),
-                            "knee_valgus": metrics.get("knee_valgus_ratio") if metrics.get("knee_valgus_ratio") is not None else metrics.get("knee_valgus"),
-                            "knee_tracking": metrics.get("knee_tracking"),
-                        },
-                        "sub_scores": normalized_sub_scores,
-                    }
-                )
+                # Fallback: squat metrics only present in AQA metric_scores
+                metric_scores = rep.get("metric_scores") or {}
+                if normalized_sub_scores.get("forward_lean") is None:
+                    normalized_sub_scores["forward_lean"] = metric_scores.get("forward_lean_deg")
+                if normalized_sub_scores.get("hip_depth") is None:
+                    normalized_sub_scores["hip_depth"] = metric_scores.get("squat_depth")
+                if normalized_sub_scores.get("knee_tracking") is None:
+                    normalized_sub_scores["knee_tracking"] = metric_scores.get("knee_tracking_ratio")
+                if normalized_sub_scores.get("knee_valgus") is None:
+                    normalized_sub_scores["knee_valgus"] = metric_scores.get("knee_valgus")
+
+                n_score = rep.get("neural_score") if rep.get("neural_score") is not None else rep.get("heuristic_score")
+
+                # Forward OHP neural keys at top level so _emit_metric_cues can find them
+                feedback_input.append({
+                    "rep_id": rep.get("rep_id"),
+                    "neural_score": n_score,
+                    "lockout": sub_scores.get("lockout"),
+                    "elbow_flare": sub_scores.get("elbow_flare"),
+                    "grip_ratio": sub_scores.get("grip_ratio"),
+                    "rom_top": sub_scores.get("rom_top"),
+                    "rom_bottom": sub_scores.get("rom_bottom"),
+                    "smoothness": sub_scores.get("smoothness"),
+                    "control": sub_scores.get("control"),
+                    "knee_error": sub_scores.get("knee_error"),
+                    "sub_scores": normalized_sub_scores,
+                })
 
             print(f"[DIAGNOSTIC] Built feedback_input for {len(feedback_input)} reps. Calling generate_feedback...", flush=True)
             feedback_result = feedback_engine.generate_feedback(feedback_input, video_id=video_id)
@@ -908,6 +962,16 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
             print(f"[DIAGNOSTIC] Skipping feedback: templates_config not found at {FEEDBACK_TEMPLATES_CONFIG}", flush=True)
         if not merged_reps:
             print(f"[DIAGNOSTIC] Skipping feedback: no merged_reps to process (count={merged_reps_count})", flush=True)
+
+    # Convert lockout and knee_error sub_scores from 0-1 error probability to 0-100 display score.
+    # Both use _error_head (sigmoid 0-1, higher=worse), but webapp expects 0-100 (higher=better).
+    for _rep in merged_reps:
+        _sub = _rep.get("sub_scores")
+        if _sub is not None:
+            for _key in ("lockout", "knee_error"):
+                _val = _sub.get(_key)
+                if _val is not None:
+                    _sub[_key] = round((1 - _val) * 100, 1)
 
     base_url = os.environ.get("API_PUBLIC_URL", "http://localhost:8000").rstrip("/")
     job_id = workspace_root.parent.name

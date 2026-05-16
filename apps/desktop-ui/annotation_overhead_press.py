@@ -42,8 +42,8 @@ _DEFAULT_HOME = Path(os.environ.get(
 ))
 
 _EXTRACT_SCRIPT = _REPO / "core" / "exevision" / "stages" / "extract_selected_features.py"
-_POSE_MODEL     = _REPO / "models" / "pose_landmarker_heavy.task"
-_FACE_MODEL     = _REPO / "models" / "blaze_face_short_range.tflite"
+_POSE_MODEL     = _REPO / "models" / "runtime_pose_and_face" / "pose_landmarker_heavy.task"
+_FACE_MODEL     = _REPO / "models" / "runtime_pose_and_face" / "blaze_face_short_range.tflite"
 
 
 def _load_ohp_config() -> dict:

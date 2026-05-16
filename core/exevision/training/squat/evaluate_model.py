@@ -60,9 +60,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--index-json", type=str, default="dataset/annotations/index.json")
     parser.add_argument("--splits-json", type=str, default="dataset/splits.json")
 
-    parser.add_argument("--bilstm-ckpt", type=str, default="models/bilstm_finetuned.pt")
-    parser.add_argument("--stgcn-ckpt", type=str, default="models/stgcn_finetuned.pt")
-    parser.add_argument("--fusion-ckpt", type=str, default="models/fusion_layer.pt")
+    parser.add_argument("--bilstm-ckpt", type=str, default="models/runtime_neural_squat/bilstm_finetuned.pt")
+    parser.add_argument("--stgcn-ckpt", type=str, default="models/runtime_neural_squat/stgcn_finetuned.pt")
+    parser.add_argument("--fusion-ckpt", type=str, default="models/runtime_neural_squat/fusion_layer.pt")
 
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--cpu", action="store_true")

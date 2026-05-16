@@ -476,7 +476,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--neural-model",
-        default="models/view_classifier_ohp.pt",
+        default="models/training_view_classifier/view_classifier_ohp.pt",
         help="Path to view_classifier_ohp.pt",
     )
     parser.add_argument(

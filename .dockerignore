@@ -9,6 +9,12 @@ models/bilstm_pretrained.pt
 models/stgcn_pretrained.pt
 models/stgcn_pretrained_encoder.pt
 
+# Environment files (may contain secrets)
+.env
+**/.env
+*.env.local
+**/*.env.local
+
 # Python cache
 __pycache__/
 **/__pycache__/

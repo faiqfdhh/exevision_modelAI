@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-_Last updated: 2026-05-14 — See [CHANGELOG.md](CHANGELOG.md) for full session history._
+_Last updated: 2026-05-14 (GCR fix) — See [CHANGELOG.md](CHANGELOG.md) for full session history._
 
 ---
 
@@ -50,7 +50,7 @@ curl -X POST http://localhost:8000/infer -H "Authorization: Bearer your-secret" 
 ```bash
 # PowerShell: apostrophe in "Faiq's FYP" breaks inline quoting — use $py/$script variables
 # All stages expect CWD = workspace root; accept --exercise (default: squat)
-export EXEVISION_MODEL_PATH=models/pose_landmarker_heavy.task
+export EXEVISION_MODEL_PATH=models/runtime_pose_and_face/pose_landmarker_heavy.task
 cd pipeline_ui_runs/{run_id}/workspace/
 python .../extract_selected_features.py filtered --video-id <id> --exercise overhead_press
 python .../classify_views.py --video-id <id> --exercise overhead_press  [--neural]
@@ -137,10 +137,10 @@ Stages run as **subprocesses** in `pipeline_ui_runs/{run_id}/workspace/`. Logs a
 
 ## Multi-Exercise Support
 
-- **Config-driven:** `core/exevision/config/exercises/{exercise}.json` — thresholds, issue groups, field mappings
+- **Config-driven:** `core/exevision/config/exercises/{exercise}.json` — thresholds, `metric_cues` (3-tier per-metric issue cues for OHP), `issue_groups` (squat), annotation schemas
 - **Workspace isolation:** all outputs under `workspace_root/{exercise}/`
 - **Models** (all OHP models in `models/runtime_neural_ohp/`):
-  - Squat: `models/bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt`
+  - Squat: `models/runtime_neural_squat/bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt`
   - **OHP finetuned (current, squat methodology):** `bilstm_ohp_finetuned.pt`, `stgcn_ohp_finetuned.pt`, `fusion_ohp_finetuned.pt` — single model, 8 heads, quality_mae=8.77
   - OHP Phase 3 ensemble (legacy): `bilstm/stgcn/fusion_ohp_phase3_seed{42,7,19,3,99}.pt` — superseded by finetuned
   - OHP Phase 2 (fallback): `bilstm/stgcn/fusion_ohp_phase2.pt` — quality + knee_error only
@@ -222,9 +222,9 @@ Key params: `DOWNWARD_VELOCITY_THRESHOLD=0.0015`, `UPWARD_VELOCITY_THRESHOLD=-0.
 | `core/exevision/training/ohp/data_phase3.py` | Dataset loader; default feat/seg dirs under `ohp_phase3_annotations/` |
 | `core/exevision/analysis/stamp_phase3_splits.py` | CLI tool — stamps `fitnessaqa_split=train/val/test`, stratified by quality bucket |
 | `core/exevision/analysis/populate_heuristic_scores.py` | CLI tool — back-fills `heuristic_score` from AQA JSONs into annotation files |
-| `core/exevision/feedback/engine.py` | Coaching text; tone: 80-100=soft, 70-79=strict, <70=very_strict |
+| `core/exevision/feedback/engine.py` | Coaching text; tone: 80-100=soft, 70-79=strict, <70=very_strict. `_emit_metric_cues()` drives OHP feedback via `metric_cues` config (3-tier severity: mild/moderate/severe, per-metric, direction-aware). Falls through to `_group_issue_cues` for squat.
 | `core/exevision/config/exercises/{ex}.json` | Per-exercise thresholds + Phase 3 annotation schema |
-| `models/` | Squat: `bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt` |
+| `models/runtime_neural_squat/` | Squat: `bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt` |
 | `models/runtime_neural_ohp/` | OHP finetuned + Phase 2 + Phase 3 seeds + Phase 3 CV folds |
 | `training_dataset/ohp_phase3_annotations/` | 165 annotations + `extracted_features/` + `segmented_reps/` (consolidated) |
 | `Dockerfile` / `requirements-runtime.txt` | Container; asserts config JSONs at build time |
@@ -246,6 +246,7 @@ Key params: `DOWNWARD_VELOCITY_THRESHOLD=0.0015`, `UPWARD_VELOCITY_THRESHOLD=-0.
 9. **Squat dataset distribution** — test set (26 reps) has no 0–20 coverage; poor-form generalization unvalidated.
 10. **No lockfile** — `requirements-runtime.txt` unpinned; reproducibility risk.
 11. **Dead code audit** — Several modules confirmed unused: `core/exevision/config/paths.py` + `settings.py` (never imported), `neural/ohp/inference.py` (zero importers), `rules/squat_analysis/` (unreferenced), `legacy_src_reference/` (unreferenced), `training/ohp/{finetune.py,evaluate.py,data.py,finetune_phase3.py,evaluate_phase3.py,tta.py}` (superseded), `training/squat/` + `training/overhead_press/` + `training/seated_overhead_press/` (standalone, never imported). See CHANGELOG 2026-05-14 for full details.
+12. **GCR deployment model paths** — Fixed in 2026-05-14 session. `_get_model_path()` now checks `models/runtime_neural_squat/`, `models/runtime_neural_ohp/`, `models/runtime_pose_and_face/` instead of flat `models/`. `BILSTM_CKPT`/`STGCN_CKPT`/`FUSION_CKPT` restored in `pipeline.py`. Dockerfile ENV vars updated.
 
 ---
 
@@ -259,3 +260,10 @@ Knowledge graph at `graphify-out/`.
 - Before architecture/cross-module questions, read `graphify-out/GRAPH_REPORT.md`
 - Use `graphify query/path/explain` for "how does X relate to Y" (traverses EXTRACTED + INFERRED edges)
 - After modifying code files, run `graphify update .` (AST-only, no API cost)
+
+## agentmemory
+
+- Session data is persisted to agentmemory MCP.
+- Query agentmemory at start of each task: `agentmemory_memory_recall("<topic>")` for relevant context from past sessions.
+- Save key decisions, bugs, patterns, and file modifications after each task via `agentmemory_memory_save()`.
+- Check `agentmemory_memory_sessions()` to see if there's an active session from this repo.
