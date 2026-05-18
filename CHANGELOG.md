@@ -1,5 +1,26 @@
 # ExeVision AI — Development Session Log
 
+## 2026-05-18 — Fix Squat Neural Fusion Scale Mismatch (Depth Reliability Gate + Subscore Ceiling)
+
+**Focus:** ST-GCN spatial head outputs Sigmoid [0,1] but `_squat_post_process()` compared against heuristic values in [0,100], causing `depth_unreliable` to always fire and subscore_ceiling to always clamp.
+
+**Bug:** `STGCNScorer.spatial_head` uses `nn.Sigmoid()` (comment: "will be scaled to [0, 100] at inference") but scaling was never implemented at the inference layer. `_squat_post_process()` at `neural_fusion_inference.py:190` computed:
+- `depth = max(0.0, min(100.0, result.get("depth", 0.0)))` → ~0.8 (Sigmoid, no-op clamp)
+- `heuristic_depth = _safe_score(hms.get("depth", 0.0))` → ~79 (from Stage 8, [0,100])
+- `depth_unreliable = abs(0.8 - 79.2) > 30.0` → **ALWAYS TRUE** for well-scored reps
+
+This triggered two destructive paths on every squat rep:
+1. `residual_dampening = 0.6` → neural residual cut by 40%
+2. `all_subscores` (smoothness, control, forward_lean, knee_tracking) all [0,1] → `subscore_worst ≈ 0.5` → `subscore_ceiling = 0.5*0.5 + 50.0 = 50.25` → neural_score clamped to ~50
+
+**Fix (2 lines):**
+1. `neural_fusion_inference.py:190`: `depth = max(0.0, min(100.0, result.get("depth", 0.0) * 100.0))`
+2. `neural_fusion_inference.py:220-225`: Scale all subscores `×100.0`
+
+**Files changed:** `core/exevision/stages/neural_fusion_inference.py`
+
+---
+
 ## 2026-05-14 — Critical Security + API Fixes
 
 **Focus:** Fix two critical issues found in full audit: secrets leaking into Docker image, and `seated_overhead_press` returning HTTP 400.

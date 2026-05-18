@@ -187,7 +187,7 @@ def _squat_post_process(
 
     residual_val = result.get("residual", 0.0)
     heuristic_raw = float(heuristic_vec[0]) * 100.0
-    depth = max(0.0, min(100.0, result.get("depth", 0.0)))
+    depth = max(0.0, min(100.0, result.get("depth", 0.0) * 100.0))
 
     hms = rep_data.get("heuristic_metric_scores") or {}
     heuristic_depth = _safe_score(hms.get("depth", 0.0))
@@ -218,10 +218,10 @@ def _squat_post_process(
             clamp_reasons.append("insufficient_squat_depth_severity>=3")
 
     all_subscores = [
-        result.get("forward_lean", 0.0),
-        result.get("knee_tracking", 0.0),
-        result.get("smoothness", 0.0),
-        result.get("control", 0.0),
+        result.get("forward_lean", 0.0) * 100.0,
+        result.get("knee_tracking", 0.0) * 100.0,
+        result.get("smoothness", 0.0) * 100.0,
+        result.get("control", 0.0) * 100.0,
     ]
     if not depth_unreliable:
         all_subscores.append(depth)

@@ -16,7 +16,12 @@ venv/
 __pycache__/
 .pytest_cache/
 .mypy_cache/
-
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+C:\Users\faiqf\Documents\Faiq's FYP\exevision\exevision_cloudMode\exevision_modelAI\apps\api\__pycache__\__init__.cpython-310.pyc
 # Runtime outputs, models and large artifacts
 pipeline_ui_runs/
 models/

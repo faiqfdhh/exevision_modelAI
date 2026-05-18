@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-_Last updated: 2026-05-14 (GCR fix) — See [CHANGELOG.md](CHANGELOG.md) for full session history._
+_Last updated: 2026-05-18 (squat neural fusion scale mismatch fix) — See [CHANGELOG.md](CHANGELOG.md) for full session history._
 
 ---
 
@@ -39,7 +39,7 @@ python apps/desktop-ui/app.py
 ```bash
 pip install -r apps/api/requirements.txt
 # PowerShell:
-$env:INFERENCE_API_SECRET="your-secret"; .\.venv\Scripts\python.exe -m uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
+$env:INFERENCE_API_SECRET="dev-secret"; .\.venv\Scripts\python.exe -m uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
 # Test:
 curl -X POST http://localhost:8000/infer -H "Authorization: Bearer your-secret" \
      -d '{"video_url":"<url>","job_id":"<uuid>","exercise":"overhead_press"}'
@@ -247,6 +247,7 @@ Key params: `DOWNWARD_VELOCITY_THRESHOLD=0.0015`, `UPWARD_VELOCITY_THRESHOLD=-0.
 10. **No lockfile** — `requirements-runtime.txt` unpinned; reproducibility risk.
 11. **Dead code audit** — Several modules confirmed unused: `core/exevision/config/paths.py` + `settings.py` (never imported), `neural/ohp/inference.py` (zero importers), `rules/squat_analysis/` (unreferenced), `legacy_src_reference/` (unreferenced), `training/ohp/{finetune.py,evaluate.py,data.py,finetune_phase3.py,evaluate_phase3.py,tta.py}` (superseded), `training/squat/` + `training/overhead_press/` + `training/seated_overhead_press/` (standalone, never imported). See CHANGELOG 2026-05-14 for full details.
 12. **GCR deployment model paths** — Fixed in 2026-05-14 session. `_get_model_path()` now checks `models/runtime_neural_squat/`, `models/runtime_neural_ohp/`, `models/runtime_pose_and_face/` instead of flat `models/`. `BILSTM_CKPT`/`STGCN_CKPT`/`FUSION_CKPT` restored in `pipeline.py`. Dockerfile ENV vars updated.
+13. **Squat ST-GCN depth scale mismatch** — Fixed in 2026-05-18 session. `STGCNScorer.spatial_head` outputs Sigmoid [0,1] but `_squat_post_process()` compared against heuristic_depth [0,100]. `depth_unreliable` always fired → residual_dampening=0.6 + subscore_ceiling on every rep. Fixed: scale depth ×100 and all subscores ×100 at `neural_fusion_inference.py:190,220-225`.
 
 ---
 

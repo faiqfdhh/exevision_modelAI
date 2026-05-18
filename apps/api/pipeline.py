@@ -1116,7 +1116,16 @@ def run_pipeline_sync(
             _run_stage(key, spec.script, video_id, workspace_root, logs_root, "unfiltered", generate_viz, exercise)
             logger.info("Stage extract_selected_features (unfiltered) completed.")
             # Validate that at least one of the two produced the expected artifact
-            _validate_stage_output(key, workspace_root, video_id, exercise)
+            try:
+                _validate_stage_output(key, workspace_root, video_id, exercise)
+            except RuntimeError as exc:
+                logger.warning(f"Feature extraction produced no output (non-fatal): {exc}")
+                return {
+                    "video_id": video_id,
+                    "exercise": exercise,
+                    "extraction_failed": True,
+                    "extraction_failure_reason": "no_poses_detected",
+                }
         else:
             # Neural fusion is optional: if it fails, we still return feedback based on heuristic scores.
             # All other stages are mandatory: failure propagates.

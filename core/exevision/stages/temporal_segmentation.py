@@ -2280,6 +2280,25 @@ def run_segmentation(quality_filter=None, create_visualization=True, exercise="s
                     print(f"   ⚠ Visualization failed for {video_id}", flush=True)
             else:
                 print(f"   ℹ Visualization disabled for this run", flush=True)
+            
+            # Print per-rep phase timing
+            repetitions = result.get("repetitions", [])
+            if repetitions:
+                print(f"\n   ⏱️  Phase Timing (seconds):")
+                phase_totals = {}
+                for rep in repetitions:
+                    rep_id = rep.get("rep_id", "?")
+                    phases = rep.get("phases", [])
+                    phase_strs = []
+                    for p in phases:
+                        ptype = p.get("phase_type", "unknown")
+                        psec = p.get("duration_seconds", 0)
+                        phase_strs.append(f"{ptype}={psec:.2f}s")
+                        phase_totals[ptype] = phase_totals.get(ptype, 0) + psec
+                    print(f"      Rep {rep_id}: {' | '.join(phase_strs)}")
+                if len(repetitions) > 1:
+                    total_strs = [f"{k}={v:.2f}s" for k, v in sorted(phase_totals.items())]
+                    print(f"      Total: {' | '.join(total_strs)}")
         
         elif result and "error" in result:
             if "view" in str(result.get("error", "")).lower():

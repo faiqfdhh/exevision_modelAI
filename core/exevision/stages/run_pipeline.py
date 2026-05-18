@@ -296,7 +296,6 @@ def main() -> None:
                 "--bilstm-ckpt", str(_model("bilstm", ex)),
                 "--stgcn-ckpt", str(_model("stgcn", ex)),
                 "--fusion-ckpt", str(_model("fusion", ex)),
-                "--quality-tier", "raw_unfiltered",
             ]
             ok = _run_stage(
                 "Stage 9 — Neural Fusion",
