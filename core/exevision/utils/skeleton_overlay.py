@@ -53,10 +53,7 @@ def draw_skeleton(
         xb, yb = keypoints_xy[b]
         ca = confs[a] if a < len(confs) else 1.0
         cb = confs[b] if b < len(confs) else 1.0
-        if ca < conf_threshold or cb < conf_threshold:
-            color = low_conf_color
-        else:
-            color = line_color
+        color = low_conf_color if (ca < conf_threshold or cb < conf_threshold) else line_color
         pt_a = (int(xa * w), int(ya * h))
         pt_b = (int(xb * w), int(yb * h))
         cv2.line(out, pt_a, pt_b, color, line_thickness)

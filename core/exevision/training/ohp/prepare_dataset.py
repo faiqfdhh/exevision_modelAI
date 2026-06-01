@@ -46,8 +46,7 @@ def _load_json(path: Path) -> Optional[dict]:
 
 
 def _load_label_windows(path: Path) -> Dict[str, List[List[float]]]:
-    data = _load_json(path) or {}
-    return {k: v for k, v in data.items()}
+    return dict(_load_json(path) or {})
 
 
 def _load_splits(splits_dir: Path) -> Dict[str, str]:

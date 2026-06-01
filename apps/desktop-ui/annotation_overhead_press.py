@@ -739,9 +739,6 @@ class OHPPhase3AnnotatorWindow:
 
         return scale, spinbox
 
-    def _add_slider(self, parent: ttk.Frame, label: str, var: tk.DoubleVar) -> tuple:
-        return self._add_score_row(parent, label, var)
-
     # ── Frame display ──────────────────────────────────────────────────────────
 
     def set_display_labels(

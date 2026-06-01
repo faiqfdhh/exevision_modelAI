@@ -58,8 +58,6 @@ class FeedbackResult:
 
 
 
-
-
 class QualityChecker:
     """Detect mismatch between overall score and sub-metric breakdown."""
 
@@ -122,23 +120,20 @@ class FeedbackItemBuilder:
     ) -> list[FeedbackItem]:
         """Attach scores to feedback items based on metrics."""
         scored_items: list[FeedbackItem] = []
-        
+
         for item in item_dicts:
             metric_key = item.get("metric_name", "unknown")
-            score = FeedbackItemBuilder.score_for_metric(
-                metric_key, metrics_dict.get(metric_key, None)
-            )
-            category = FeedbackItemBuilder.get_category_for_metric(metric_key)
-            
             scored_item: FeedbackItem = {
                 "text": item["text"],
-                "score": score,
-                "category": category,
+                "score": FeedbackItemBuilder.score_for_metric(
+                    metric_key, metrics_dict.get(metric_key)
+                ),
+                "category": FeedbackItemBuilder.get_category_for_metric(metric_key),
                 "type": item.get("type", "issue"),
                 "metric_key": metric_key,
             }
             scored_items.append(scored_item)
-        
+
         return scored_items
 
     @staticmethod
@@ -199,31 +194,24 @@ class FeedbackEngine:
                 threshold=threshold,
             )
 
-            # ── Build items with metric tracking, score them, and sort ──────
             all_item_dicts: list[dict[str, Any]] = []
 
-            # Collect win items
             _, win_items = self._build_win_texts(video_id, rep_id, wins, sub_scores, comparison)
             all_item_dicts.extend(win_items)
 
-            # Collect stable items (metrics ≥ threshold, not wins, not issues)
             _, stable_items = self._build_stable_texts(video_id, rep_id, sub_scores, wins, issues, threshold)
             all_item_dicts.extend(stable_items)
 
-            # Collect issue items — exclude metrics with metric_cues (handled by _emit_metric_cues)
+            # Exclude metrics with metric_cues — handled by _emit_metric_cues
             issue_tone_mode = self._resolve_issue_tone_mode(score, mismatch_type)
             metric_cues_config = self.exercise_config.get("metric_cues", {})
             filtered_issue_scores = {k: v for k, v in issue_scores.items() if k not in metric_cues_config}
             _, issue_items = self._group_issue_cues(filtered_issue_scores, tone_mode=issue_tone_mode)
             all_item_dicts.extend(issue_items)
 
-            metric_cue_items = self._emit_metric_cues(rep_data)
-            all_item_dicts.extend(metric_cue_items)
+            all_item_dicts.extend(self._emit_metric_cues(rep_data))
 
-            # Assign scores to all items based on their metric_name
             scored_items = self._item_builder.assign_item_scores(sub_scores, all_item_dicts)
-
-            # Sort by severity (ascending score)
             sorted_items = self._item_builder.sort_items_by_severity(scored_items)
 
             rep_feedbacks.append(
@@ -233,8 +221,8 @@ class FeedbackEngine:
                     tier=tier,
                     text=rep_text,
                     items=sorted_items,
-                    wins=wins,  # Backward compatibility
-                    issues=issues,  # Backward compatibility
+                    wins=wins,
+                    issues=issues,
                 )
             )
 
@@ -344,7 +332,7 @@ class FeedbackEngine:
         return "unknown"
 
     def _get_bracket_opener(self, tier: str) -> str:
-        for _, bracket_info in self.exercise_config.get("score_brackets", {}).items():
+        for bracket_info in self.exercise_config.get("score_brackets", {}).values():
             if bracket_info.get("tier") == tier:
                 return str(bracket_info.get("opener", ""))
         return ""
@@ -507,7 +495,7 @@ class FeedbackEngine:
         entries: list[tuple[str, float, str]] = []  # (cue, severity, metric_name)
         consumed: set[str] = set()
 
-        for _, group_info in issue_groups.items():
+        for group_info in issue_groups.values():
             metrics = group_info.get("metrics", [])
             low_metrics = [metric for metric in metrics if metric in issue_scores]
             if not low_metrics:
@@ -521,22 +509,19 @@ class FeedbackEngine:
             else:
                 cue_tier = "focus_here" if severity < 60 else "needs_work"
 
+            primary_metric = low_metrics[0]
             if len(low_metrics) > 1:
                 combined = group_info.get("combined_cue", "")
                 if isinstance(combined, dict):
                     cue = str(combined.get(cue_tier, combined.get("needs_work", ""))).strip()
                 else:
                     cue = str(combined).strip()
-                # For combined cues, use the lowest-scored metric as representative
-                primary_metric = low_metrics[0]
             else:
-                metric = low_metrics[0]
-                single = group_info.get("single_cues", {}).get(metric, "")
+                single = group_info.get("single_cues", {}).get(primary_metric, "")
                 if isinstance(single, dict):
                     cue = str(single.get(cue_tier, single.get("needs_work", ""))).strip()
                 else:
                     cue = str(single).strip()
-                primary_metric = metric
 
             if cue:
                 entries.append((cue, severity, primary_metric))
@@ -690,7 +675,7 @@ class FeedbackEngine:
             return "overall consistency"
 
         issue_groups = self.exercise_config.get("issue_groups", {})
-        for _, group_info in issue_groups.items():
+        for group_info in issue_groups.values():
             if metric_key in group_info.get("metrics", []):
                 cue = group_info.get("single_cues", {}).get(metric_key, "")
                 if isinstance(cue, dict):

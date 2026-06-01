@@ -135,11 +135,7 @@ class STGCNScorer(nn.Module):
         encoder_keys = {
             k: v
             for k, v in pretrained.items()
-            if k.startswith("block1")
-            or k.startswith("block2")
-            or k.startswith("block3")
-            or k.startswith("block4")
-            or k.startswith("block5")
+            if k.startswith(("block1", "block2", "block3", "block4", "block5"))
         }
         missing, unexpected = self.load_state_dict(encoder_keys, strict=False)
         return len(missing), len(unexpected)

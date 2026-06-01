@@ -467,7 +467,6 @@ def reps_from_phases(phases: List[str], min_rep_frames: int = 6) -> List[Rep]:
     WAIT_ECC, IN_ECC, IN_ISO, IN_CONC = 0, 1, 2, 3
     state = WAIT_ECC
     start = None
-    saw_conc = False
 
     def finalize(end_idx: int):
         nonlocal start
@@ -487,7 +486,6 @@ def reps_from_phases(phases: List[str], min_rep_frames: int = 6) -> List[Rep]:
             if p == "eccentric":
                 state = IN_ECC
                 start = i
-                saw_conc = False
             else:
                 continue
 
@@ -499,7 +497,6 @@ def reps_from_phases(phases: List[str], min_rep_frames: int = 6) -> List[Rep]:
                 continue
             if p == "concentric":
                 state = IN_CONC
-                saw_conc = True
                 continue
             if p == "idle":
                 # aborted
@@ -512,7 +509,6 @@ def reps_from_phases(phases: List[str], min_rep_frames: int = 6) -> List[Rep]:
                 continue
             if p == "concentric":
                 state = IN_CONC
-                saw_conc = True
                 continue
             if p == "eccentric":
                 # bounce back
@@ -534,7 +530,6 @@ def reps_from_phases(phases: List[str], min_rep_frames: int = 6) -> List[Rep]:
                 finalize(i - 1)
                 state = IN_ECC
                 start = i
-                saw_conc = False
                 continue
             # unknown: ignore
 

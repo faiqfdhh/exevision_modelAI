@@ -415,11 +415,10 @@ def evaluate_fusion_vs_heuristic(
                 print(f"  {i + 1}/{len(dataset)}")
 
             batch = dataset[i]
-            bd = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
-            bilstm_input = bd["bilstm_input"].unsqueeze(0).to(device)
-            stgcn_input = bd["stgcn_input"].unsqueeze(0).to(device)
-            heuristic_vec = bd["heuristic_vec"].unsqueeze(0).to(device)
+            bilstm_input = batch["bilstm_input"].unsqueeze(0).to(device)
+            stgcn_input = batch["stgcn_input"].unsqueeze(0).to(device)
+            heuristic_vec = batch["heuristic_vec"].unsqueeze(0).to(device)
             view_vec = heuristic_vec[:, 11:16]
 
             b_out = bilstm(bilstm_input)
@@ -427,9 +426,9 @@ def evaluate_fusion_vs_heuristic(
             fscore, _ = fusion(heuristic_vec, s_out["embedding"], b_out["embedding"])
 
             fusion_scores.append(float(fscore.item()))
-            heuristic_scores.append(bd["heuristic_score"])
-            human_scores.append(bd["human_score"])
-            views.append(bd["view"])
+            heuristic_scores.append(batch["heuristic_score"])
+            human_scores.append(batch["human_score"])
+            views.append(batch["view"])
 
     print(f"Inference complete. Processed {len(fusion_scores)} reps")
 

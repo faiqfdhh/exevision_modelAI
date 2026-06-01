@@ -13,7 +13,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -670,7 +669,7 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
     # Prefer the segmented JSON from the same quality tier as the neural file.
     # _find_json sorts alphabetically and "excellent" (0 reps) precedes "raw_unfiltered"
     # (1+ reps), so naively grabbing the first match returns an empty-rep file.
-    seg_file = None
+    candidate: Path | None = None
     if neural_file is not None:
         quality_tier = neural_file.parent.name  # e.g. "raw_unfiltered"
         candidate = seg_base / quality_tier / f"{video_id}_segmented.json"
@@ -1000,7 +999,6 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
         logger.error(f"Error finding raw video: {e}")
 
     try:
-        
         if viz_dir.exists():
             # Prefer raw_unfiltered annotated video; fall back to any match
             _unfiltered_viz = viz_dir / "raw_unfiltered" / f"{video_id}_annotated.mp4"

@@ -14,7 +14,7 @@ for _p in [str(_NEURAL_ROOT), str(_TRAIN_ROOT)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from nn_utils import NUM_OHP_BILSTM_CHANNELS, NUM_OHP_ACTIVE_JOINTS
+from nn_utils import NUM_OHP_BILSTM_CHANNELS
 from pretrain_bilstm import TemporalAttention   # encoder building block — not modified
 from pretrain_stgcn import STGCNBlock           # encoder building block — not modified
 

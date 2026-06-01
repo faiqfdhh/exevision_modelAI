@@ -648,9 +648,6 @@ class PipelineRunnerUI:
         self._set_overall_progress(0)
         self._set_stage_progress(0)
         self._log(f"▶ Starting run: {run_name}")
-        self._set_overall_progress(0)
-        self._set_stage_progress(0)
-        self._log(f"▶ Starting run: {run_name}")
         self._set_preview_outputs([])
         self._clear_score_display("Run in progress. Scoring results will appear here when available.")
         
@@ -784,7 +781,6 @@ class PipelineRunnerUI:
         self._log(f"Using shared face model: {SHARED_FACE_MODEL_PATH}")
 
         # Ensure local copy of analyze_results.py exists inside workspace (squat only)
-        exercise = self.exercise_var.get()
         if exercise == "squat":
             analyze_src = RUNTIME_ROOT / "squat" / "aqa_analysis_simple" / "analyze_results.py"
             analyze_dst = workspace_root / exercise / "aqa_analysis_simple" / "analyze_results.py"
@@ -900,7 +896,6 @@ class PipelineRunnerUI:
                 stage_args.extend(["--quality-tier", "raw_unfiltered"])
 
         # Add exercise parameter to all stage invocations
-        exercise = self.exercise_var.get()
         cmd = [sys.executable, str(script_to_run), "--exercise", exercise, *stage_args]
         log_file = logs_root / f"{stage.key}.log"
 
@@ -1661,8 +1656,7 @@ class PipelineRunnerUI:
                         self.current_reps = data.get("info", {}).get("total_reps", 0)
                         self.current_view = data.get("info", {}).get("view", "Unknown").replace("_", " ").title()
                         self.current_frame_phases = data.get("frame_phases", [])
-                        print(f"DEBUG: Loaded {len(self.current_frame_phases)} phases for video.")
-                        
+
                         self.view_type_var.set(f"View: {self.current_view} | Reps: {self.current_reps}")
                 else:
                     self.view_type_var.set("Reps: ?")
@@ -1774,18 +1768,10 @@ class PipelineRunnerUI:
             self.original_image_label.configure(image="", text="Original video not found for this overlay.")
 
         # Update real-time phase display if available
-        if self.current_frame_phases:
-            if 0 <= frame_idx < len(self.current_frame_phases):
-                phase = self.current_frame_phases[frame_idx]
-                text = f"View: {self.current_view} | Reps: {self.current_reps} | Phase: {phase.upper()}"
-                self.view_type_var.set(text)
-                # print(f"DEBUG: Frame {frame_idx}, Phase {phase}, Text: {text}") 
-            else:
-                # print(f"DEBUG: Frame {frame_idx} out of range (0-{len(self.current_frame_phases)})")
-                pass
-        else:
-             # print("DEBUG: No current_frame_phases found")
-             pass
+        if self.current_frame_phases and 0 <= frame_idx < len(self.current_frame_phases):
+            phase = self.current_frame_phases[frame_idx]
+            text = f"View: {self.current_view} | Reps: {self.current_reps} | Phase: {phase.upper()}"
+            self.view_type_var.set(text)
 
     def _set_overall_progress(self, value: float) -> None:
         self.overall_progress_var.set(float(value))
@@ -2389,9 +2375,8 @@ class AnnotationToolUI:
         if not config_path.exists():
             return []
         try:
-            import json as _json
             with open(config_path, encoding="utf-8") as f:
-                cfg = _json.load(f)
+                cfg = json.load(f)
             return list(cfg.get("annotation_flags", {}).items())
         except Exception:
             return []

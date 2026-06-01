@@ -5,8 +5,7 @@ import math
 import shutil
 import sys
 from pathlib import Path
-import numpy as np
-from collections import defaultdict, Counter
+from collections import Counter
 from tqdm import tqdm
 
 # --- Configuration ---

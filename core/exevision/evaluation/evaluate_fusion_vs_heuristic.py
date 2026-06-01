@@ -37,8 +37,6 @@ from nn_models import (
     build_heuristic_vector,
 )
 from nn_utils import (
-    FIXED_SEQ_LEN,
-    NUM_BILSTM_CHANNELS,
     _extract_rep_matrix,
     _extract_stgcn_rep,
     _load_json,
@@ -315,10 +313,9 @@ def evaluate_ohp(models: dict, device: torch.device) -> Tuple[List[float], List[
 
 def compute_metrics(name: str, human: List[float], heuristic: List[float],
                     fusion: List[float]) -> dict:
-    n = len(human)
-    metrics = {
+    return {
         "name": name,
-        "n_reps": n,
+        "n_reps": len(human),
         "heuristic_mae": mae(heuristic, human),
         "heuristic_pearson": pearson(heuristic, human),
         "heuristic_rmse": rmse(heuristic, human),
@@ -329,7 +326,6 @@ def compute_metrics(name: str, human: List[float], heuristic: List[float],
         "pearson_improvement": pearson(fusion, human) - pearson(heuristic, human),
         "rmse_improvement": rmse(heuristic, human) - rmse(fusion, human),
     }
-    return metrics
 
 
 def print_report(all_metrics: List[dict]) -> None:

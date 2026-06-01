@@ -40,7 +40,6 @@ import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Security, status
@@ -214,23 +213,20 @@ def _fire_callback(callback_url: str, payload: dict[str, Any]) -> None:
 def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, callback_url: str | None, generate_viz: bool, exercise: str = "squat") -> None:
     """Downloads the video and runs the full pipeline. Runs in a background thread."""
     import asyncio
-    import httpx
 
     _update_job(job_id, status="running", started_at=datetime.now(timezone.utc).isoformat())
 
     try:
-        # Download video to a temp directory
         with tempfile.TemporaryDirectory(prefix=f"exevision_{job_id}_") as tmp:
             tmp_path = Path(tmp)
 
-            # Download (run async download in a new event loop for the thread)
+            # Run async download in a new event loop for the thread
             loop = asyncio.new_event_loop()
             try:
                 video_path = loop.run_until_complete(download_video(video_url, tmp_path))
             finally:
                 loop.close()
 
-            # Run pipeline stages synchronously
             result = run_pipeline_sync(
                 job_id=job_id,
                 video_path=video_path,
@@ -240,8 +236,7 @@ def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, ca
                 exercise=exercise,
             )
 
-        completed_at = datetime.now(timezone.utc).isoformat()
-        _update_job(job_id, status="done", result=result, completed_at=completed_at)
+        _update_job(job_id, status="done", result=result, completed_at=datetime.now(timezone.utc).isoformat())
 
         # Fire-and-forget callback to Next.js / Supabase if requested
         if callback_url:
@@ -255,12 +250,11 @@ def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, ca
             _fire_callback(callback_url, callback_payload)
 
     except Exception as exc:
-        completed_at = datetime.now(timezone.utc).isoformat()
         _update_job(
             job_id,
             status="failed",
             error=str(exc),
-            completed_at=completed_at,
+            completed_at=datetime.now(timezone.utc).isoformat(),
         )
         if callback_url:
             callback_payload = {
@@ -293,7 +287,7 @@ def submit_inference(req: InferRequest, background_tasks: BackgroundTasks) -> di
             status_code=400,
             detail=f"Unsupported exercise: '{req.exercise}'. Available: {available}",
         )
-    
+
     try:
         stages = _normalize_stage_selection(req.stages)
     except ValueError as exc:
