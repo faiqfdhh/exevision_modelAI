@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-_Last updated: 2026-05-14 (GCR fix) — See [CHANGELOG.md](CHANGELOG.md) for full session history._
+_Last updated: 2026-06-08 (OHP 5-seed ensemble → production) — See [CHANGELOG.md](CHANGELOG.md) for full session history._
 
 ---
 
@@ -39,7 +39,6 @@ python apps/desktop-ui/app.py
 ```bash
 pip install -r apps/api/requirements.txt
 # PowerShell:
-$env:INFERENCE_API_SECRET="dev-secret"; $env:DEEPSEEK_API_KEY="sk-88b9973774af42cdafea345d8a046579";
 .\.venv\Scripts\python.exe -m uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
 # Test:
 curl -X POST http://localhost:8000/infer -H "Authorization: Bearer your-secret" \
@@ -97,11 +96,17 @@ $py = ".\.venv\Scripts\python.exe"
     --output         results\ohp_eval.json
 ```
 
-**Current eval results (Session 9h, 23-rep held-out test):**
-- ✅ quality_mae=8.77 (threshold <12) — beats heuristic baseline (17.79) by 2×
-- ✅ smoothness_mae=6.20, control_mae=5.23, elbow_flare_mae=12.06, grip_ratio_mae=8.68, rom_top_mae=11.87, rom_bottom_mae=9.60
-- ❌ lockout_auc=0.742 (threshold >0.75) — misses by 0.008 on 23-rep test set (1 rep = threshold)
-- `quality_pearson=0.546` vs heuristic `-0.111`; `residual_std=15.82` (model adapts beyond heuristic)
+**Current eval results — 5-SEED ENSEMBLE + GBM QUALITY META-LEARNER (Session 2026-06-08, 23-rep held-out test):**
+- ✅ **ALL 8 gates pass.** Ensemble of 5 seeds {42,7,19,3,99}; seed7 fusion dropped from quality avg only.
+- ✅ lockout_auc=0.780 (threshold >0.75) — **single model failed at 0.742; ensemble cleared it**
+- ✅ **quality_mae=7.30, quality_pearson=0.717** — GBM meta-learner (`quality_gbm.pkl`, alpha=0 i.e. pure GBM) replaces neural quality_score; was 9.01/0.550 with neural ensemble alone. 40-60 bucket MAE 27.07→16.32. See CHANGELOG "LightGBM meta-learner (Phase C)".
+- ✅ elbow_flare_mae=11.10, grip_ratio_mae=7.15, rom_top_mae=9.15, rom_bottom_mae=7.99 (unaffected by GBM — it only touches `quality`)
+- ✅ smoothness_mae=6.50, control_mae=5.36
+- Run ensemble eval: `evaluate_ohp_ensemble.py --model-dir models/runtime_neural_ohp --exclude-fusion _seed7`
+- Train seeds: `finetune_ohp.py … --seed <s> --suffix _seed<s>` (per seed); produces `{model}_ohp_finetuned_seed<s>.pt`
+- Train/eval GBM: `train_quality_gbm.py --annotation-dir training_dataset/ohp_phase3_annotations --model-dir models/runtime_neural_ohp --output-dir results --save`
+
+**Single-model baseline (Session 9h, superseded by ensemble):** quality_mae=8.77, lockout_auc=0.742 ❌ (missed gate).
 
 **⚠️ heuristic_score must be populated** in annotation JSONs before training. 108/166 reps had `heuristic_score=0` (AQA not run). Use `populate_heuristic_scores.py` after running Stage 5+8 on source videos.
 
@@ -142,11 +147,12 @@ Stages run as **subprocesses** in `pipeline_ui_runs/{run_id}/workspace/`. Logs a
 - **Workspace isolation:** all outputs under `workspace_root/{exercise}/`
 - **Models** (all OHP models in `models/runtime_neural_ohp/`):
   - Squat: `models/runtime_neural_squat/bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt`
-  - **OHP finetuned (current, squat methodology):** `bilstm_ohp_finetuned.pt`, `stgcn_ohp_finetuned.pt`, `fusion_ohp_finetuned.pt` — single model, 8 heads, quality_mae=8.77
-  - OHP Phase 3 ensemble (legacy): `bilstm/stgcn/fusion_ohp_phase3_seed{42,7,19,3,99}.pt` — superseded by finetuned
-  - OHP Phase 2 (fallback): `bilstm/stgcn/fusion_ohp_phase2.pt` — quality + knee_error only
+  - **OHP 5-seed ensemble (CURRENT, production):** `{bilstm,stgcn,fusion}_ohp_finetuned_seed{42,7,19,3,99}.pt` — 15 files, 8 heads. Stage 9 auto-loads these when present (handler `"ensemble": True`); seed7 fusion excluded from quality avg (`"fusion_exclude_seeds": ["_seed7"]`). All 8 gates pass; lockout_auc=0.780.
+  - **OHP quality GBM meta-learner (CURRENT, production):** `quality_gbm.pkl` + `quality_gbm_meta.json` (handler `"quality_gbm_name"`). LightGBM trained on 17 tabular features (heuristic anchor + ensemble's own predicted heads + per-metric heuristic scores + view one-hot); blends with neural quality via stored `alpha` (currently 0 = pure GBM). Replaces `neural_score` outright when present (raw kept as `neural_score_pre_gbm`); absent file → pure neural. quality_mae 9.01→7.30, pearson 0.550→0.717. Touches ONLY `quality` — all other heads byte-identical. See `train_quality_gbm.py` + CHANGELOG "LightGBM meta-learner (Phase C)".
+  - **OHP finetuned (single, fallback):** `bilstm_ohp_finetuned.pt`, `stgcn_ohp_finetuned.pt`, `fusion_ohp_finetuned.pt` — used when no `_seed*.pt` files exist. quality_mae=8.77 but lockout_auc=0.742 ❌.
+  - OHP Phase 2 (pretrain warm-start for finetune): `bilstm/stgcn/fusion_ohp_phase2.pt` — quality + knee_error only
   - OHP Seated: heuristic-only; leg landmarks zeroed (indices 25–32)
-- **Inference routing** (Stage 9): exercise handler from `registry.py` uses handler-defined default checkpoint paths. OHP defaults to `models/runtime_neural_ohp/{model}_ohp_finetuned.pt`. No manual routing needed — handler pattern handles it.
+- **Inference routing** (Stage 9): exercise handler from `registry.py`. OHP handler sets `"ensemble": True` → `_load_members()` in `neural_fusion_inference.py` globs `{base}_seed*.pt` triples from `ckpt_dir`, averages all heads per rep (single model = ensemble of 1). `"fusion_exclude_seeds"` drops named seeds from quality/residual avg only. Graceful fallback to single `_finetuned.pt` if no seed files. After ensemble averaging, if handler `"quality_gbm_name"` resolves to an existing file, `_infer_rep` builds a 17-feature vector and overwrites `neural_score` with the alpha-blended GBM prediction (gated/fallback-safe, same pattern). No CLI/pipeline.py changes needed — drop files in to activate.
 - **To add exercise:** create `config/exercises/{name}.json`, optionally add model checkpoints
 
 ---
@@ -218,6 +224,8 @@ Key params: `DOWNWARD_VELOCITY_THRESHOLD=0.0015`, `UPWARD_VELOCITY_THRESHOLD=-0.
 | `core/exevision/neural/registry.py` | Exercise → model class + inference handler registry (add entry + model file = new exercise) |
 | `core/exevision/training/ohp/finetune_ohp.py` | **Current**: 4-phase squat-methodology trainer (BiLSTM→ST-GCN→Fusion→Joint) |
 | `core/exevision/training/ohp/evaluate_ohp.py` | **Current**: comprehensive eval — quality Pearson, residual diagnostics, per-bucket MAE |
+| `core/exevision/training/ohp/evaluate_ohp_ensemble.py` | **Current**: ensemble eval — averages N seed checkpoints, `--exclude-fusion` |
+| `core/exevision/training/ohp/train_quality_gbm.py` | **Current**: trains/evals LightGBM quality meta-learner blended with frozen ensemble (Phase C, deployed) — `--save` writes `quality_gbm.pkl` |
 | `core/exevision/training/ohp/finetune_phase3.py` | Legacy 5-seed ensemble trainer (kept for reference) |
 | `core/exevision/training/ohp/evaluate_phase3.py` | Legacy 8-metric eval; `--all-data` flag |
 | `core/exevision/training/ohp/data_phase3.py` | Dataset loader; default feat/seg dirs under `ohp_phase3_annotations/` |

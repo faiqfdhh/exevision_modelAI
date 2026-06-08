@@ -85,8 +85,29 @@ def _handler_ohp() -> ExerciseHandler:
         # average only (its fusion converged poorly — best val at epoch 1).
         # Test (23 reps): lockout_auc 0.742→0.780 (gate cleared), quality_pearson
         # 0.546→0.550, all spatial MAEs improved; quality_mae 8.77→9.01 (noise).
+        #
+        # ── v2 fusion experiment (Session 2026-06-08, quality_mae focus) ──
+        # TRIED & REJECTED: retrained fusion only (head_dim=7 head-scalar input +
+        # bucket-weighted MSE, 3x on quality<60) → quality_mae 9.01→14.60,
+        # quality_pearson 0.550→0.006 (ranking collapsed). Bucket weighting on
+        # ~12 low-score training reps caused overfitting/distortion, not a fix.
+        # fusion_ohp_v2_seed*.pt checkpoints kept on disk for analysis but NOT
+        # wired in — handler stays on v1 fusion_ohp_finetuned*.pt (locked-in,
+        # all 8 gates pass). See CHANGELOG.md for full diagnosis + next ideas
+        # (GBM meta-learner / lighter bucket weight / more low-score data).
         "ensemble": True,
         "fusion_exclude_seeds": ["_seed7"],
+        # Phase C (Session 2026-06-08): LightGBM quality meta-learner trained on
+        # heuristic anchor + per-metric heuristic scores + view one-hot + the
+        # ensemble's OWN predicted heads (excluding quality). Trees ignore the bad
+        # heuristic anchor (heuristic_pearson=-0.11) and fix the 40-60 bucket blind
+        # spot directly from data instead of loss-shaping. WINS vs locked-in
+        # ensemble: quality_mae 9.01→7.30, quality_pearson 0.550→0.717, 40-60 bucket
+        # MAE 27.07→16.32 (alpha sweep on val picked alpha=0 — pure GBM). Replaces
+        # neural quality_score outright when present; absent file → pure neural
+        # (same fallback pattern as "ensemble"). See train_quality_gbm.py.
+        "quality_gbm_name": "quality_gbm.pkl",
+        "quality_gbm_meta_name": "quality_gbm_meta.json",
     }
 
 

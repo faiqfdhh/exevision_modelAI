@@ -155,7 +155,8 @@ class HeuristicGuidedFusion(nn.Module):
     decomposition is overparameterised. A single bounded residual is more stable.
     """
 
-    def __init__(self, heuristic_dim: int = 15, neural_dim: int = 256, fusion_dim: int = 64):
+    def __init__(self, heuristic_dim: int = 15, neural_dim: int = 256, fusion_dim: int = 64,
+                 head_dim: int = 0):
         super().__init__()
         self.stgcn_compress = nn.Linear(neural_dim, fusion_dim)
         self.bilstm_compress = nn.Linear(neural_dim, fusion_dim)
@@ -174,11 +175,25 @@ class HeuristicGuidedFusion(nn.Module):
             nn.Sigmoid(),
         )
 
+        # Optional head-scalar branch: lets the fusion see the neural heads'
+        # own quality-relevant outputs (lockout, ROM, smoothness, ...) instead
+        # of being blind to them. head_dim=0 (default) → identical to the
+        # original architecture; existing squat checkpoints load unchanged.
+        self.head_dim = head_dim
+        if head_dim > 0:
+            self.head_proj = nn.Sequential(
+                nn.Linear(head_dim, fusion_dim),
+                nn.ReLU(inplace=True),
+            )
+            residual_in = fusion_dim * 4
+        else:
+            residual_in = fusion_dim * 3
+
         # Residual head: tanh bounds output to [-1, 1]; scaled by 40 outside → ±40 pts max.
         # Dropout reduced from 0.3 to 0.1: aggressive dropout destabilises learning
         # on small datasets (batch=16, n_train≈121).
         self.residual_head = nn.Sequential(
-            nn.Linear(fusion_dim * 3, 64),
+            nn.Linear(residual_in, 64),
             nn.ReLU(inplace=True),
             nn.Dropout(0.1),
             nn.Linear(64, 1),
@@ -190,6 +205,7 @@ class HeuristicGuidedFusion(nn.Module):
         heuristic_vec: torch.Tensor,
         stgcn_embedding: torch.Tensor,
         bilstm_embedding: torch.Tensor,
+        head_vec: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -205,7 +221,15 @@ class HeuristicGuidedFusion(nn.Module):
 
         gated_spatial = sg * stgcn_comp
         gated_temporal = tg * bilstm_comp
-        fused = torch.cat([h_proj, gated_spatial, gated_temporal], dim=-1)
+        fused_parts = [h_proj, gated_spatial, gated_temporal]
+
+        if self.head_dim > 0:
+            if head_vec is None:
+                head_vec = torch.zeros(heuristic_vec.shape[0], self.head_dim,
+                                        device=heuristic_vec.device, dtype=heuristic_vec.dtype)
+            fused_parts.append(self.head_proj(head_vec))
+
+        fused = torch.cat(fused_parts, dim=-1)
 
         # tanh output is in [-1, 1]; ×40 gives ±40 point correction range
         residual = self.residual_head(fused) * 40.0

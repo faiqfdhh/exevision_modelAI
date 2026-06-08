@@ -154,6 +154,7 @@ def _infer_rep(
         view_vec = heur_t[:, start:end]
 
         exclude = set(handler.get("fusion_exclude_seeds", []) or [])
+        head_vec_fn = handler.get("head_vec_fn")
         quality_all: List[float] = []
         quality_keep: List[float] = []
         residual_all: List[float] = []
@@ -164,7 +165,8 @@ def _infer_rep(
             for m in members:
                 b_out = m["bilstm"](bilstm_t)
                 s_out = m["stgcn"](stgcn_t, view_vec)
-                pred, residual = m["fusion"](heur_t, s_out["embedding"], b_out["embedding"])
+                hv = head_vec_fn(b_out, s_out) if head_vec_fn else None
+                pred, residual = m["fusion"](heur_t, s_out["embedding"], b_out["embedding"], hv)
 
                 p_val, r_val = float(pred.item()), float(residual.item())
                 quality_all.append(p_val)
@@ -192,6 +194,26 @@ def _infer_rep(
         for name, vals in head_acc.items():
             is_prob = any(p in name for p in ("prob", "error"))
             result[name] = round(sum(vals) / len(vals), 4 if is_prob else 2)
+
+        quality_gbm = handler.get("_quality_gbm")
+        if quality_gbm is not None:
+            gbm_meta = handler["_quality_gbm_meta"]
+            feat = np.array([[
+                float(heuristic_vec[0]) * 100.0,
+                result.get("smoothness", 0.0), result.get("control", 0.0),
+                result.get("lockout", 0.0), result.get("elbow_flare", 0.0),
+                result.get("grip_ratio", 0.0), result.get("rom_top", 0.0), result.get("rom_bottom", 0.0),
+                float(heuristic_vec[1]) * 100.0, float(heuristic_vec[2]) * 100.0,
+                float(heuristic_vec[3]) * 100.0, float(heuristic_vec[4]) * 100.0,
+                float(heuristic_vec[11]), float(heuristic_vec[12]), float(heuristic_vec[13]),
+                float(heuristic_vec[14]), float(heuristic_vec[15]),
+            ]], dtype=np.float64)
+            gbm_pred = float(quality_gbm.predict(feat)[0])
+            alpha = float(gbm_meta.get("alpha", 0.0))
+            blended = alpha * result["neural_score"] + (1 - alpha) * gbm_pred
+            result["neural_score_pre_gbm"] = result["neural_score"]
+            result["quality_gbm_pred"] = round(gbm_pred, 2)
+            result["neural_score"] = round(blended, 2)
 
         if handler.get("grip_ratio_side_exclude", False) and view in ("side", "unknown"):
             result["grip_ratio"] = None
@@ -588,6 +610,17 @@ def main() -> int:
     # Attach squat-specific post-processing
     if exercise == "squat":
         handler["post_process"] = _squat_post_process
+
+    # Phase C quality GBM meta-learner (gated, fallback-safe — absent file = pure neural)
+    gbm_name = handler.get("quality_gbm_name")
+    if gbm_name:
+        gbm_path = ckpt_dir / gbm_name
+        meta_path = ckpt_dir / handler.get("quality_gbm_meta_name", "")
+        if gbm_path.exists() and meta_path.exists():
+            import joblib
+            handler["_quality_gbm"] = joblib.load(gbm_path)
+            handler["_quality_gbm_meta"] = json.loads(meta_path.read_text(encoding="utf-8"))
+            logger.info(f"Quality GBM loaded: {gbm_name} (alpha={handler['_quality_gbm_meta'].get('alpha')})")
 
     workspace_root = Path(args.workspace_root).resolve()
     device = get_device(force_cpu=args.cpu)

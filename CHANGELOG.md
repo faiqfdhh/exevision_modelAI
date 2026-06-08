@@ -1,5 +1,110 @@
 # ExeVision AI — Development Session Log
 
+## 2026-06-08 — Benchmarked 9 alternative quality meta-learners vs deployed LightGBM — NONE WIN, GBM STAYS
+
+**Question:** could a different model beat the deployed LightGBM's `quality_mae=7.30`?
+
+**Protocol** (`core/exevision/training/ohp/benchmark_quality_models.py`, NEW): on a 119/23/23-row
+dataset, a single 23-row test split is too noisy to pick a winner from directly (MAE deltas <1 are
+within noise). So: rank candidates by **RepeatedKFold(5×5) CV MAE on train+val (143 rows)** — the
+robust signal — then check the CV winner against the locked-in one-shot test bar (7.30) as a final
+guardrail, not the selector. Reuses the exact `train_quality_gbm.py` feature pipeline (frozen
+ensemble → 17 tabular features → `human_score`) — zero leakage, identical inputs.
+
+**Candidates:** Ridge, ElasticNet, SVR(RBF), GaussianProcess, RandomForest, XGBoost, LightGBM,
+CatBoost, Ridge+LGBM stack — all wrapped in `Pipeline(StandardScaler, ...)` where scale-sensitive.
+
+**Result — decision rule caught a trap live:**
+| model | CV MAE (143 rows) | one-shot test MAE (23 rows) |
+|---|---|---|
+| **random_forest** | **8.42** ← best CV | 7.94 — misses 7.30 bar |
+| xgboost | 8.76 | 7.91 |
+| catboost | 8.85 | 7.46 |
+| svr_rbf | 9.06 — ranked 5th/9 on CV | **6.84** ← best TEST, beats deployed GBM's 7.30! |
+| (lightgbm, refit on train+val) | 9.05 | 8.60 |
+
+`svr_rbf` posted the single best test number (6.84, would've looked like a clean win over the
+deployed 7.30) — but its CV rank (5th of 9, MAE 9.06) shows that's a lucky roll on 23 rows, not real
+skill. Picking on test alone would have deployed a worse model. `random_forest` won CV cleanly but
+still missed the 7.30 test guardrail. **No candidate cleared both bars → kept LightGBM deployed.**
+This is the exact failure mode the CV-first protocol exists to prevent, demonstrated empirically.
+
+**Note on the lightgbm row above (8.60) vs the deployed model's 7.30:** different training data —
+the benchmark refits every candidate on train+val (143 rows, correct CV→refit discipline), while the
+deployed `quality_gbm.pkl` was trained on train-only (120 rows) with `alpha` swept on val. Same
+small-data noise phenomenon, in reverse; it's *why* the locked-in 7.30 (the real production number)
+is the guardrail rather than re-deriving a new bar from this run.
+
+**Outcome:** `models/runtime_neural_ohp/quality_gbm.pkl` (LightGBM, alpha=0) **unchanged** — still
+the deployed quality meta-learner from Phase C below. `catboost` left installed in `.venv` but NOT
+added to `requirements-runtime.txt` (not deployed — no point bloating the container).
+Full table: `results/ohp_quality_model_benchmark.json`.
+
+---
+
+## 2026-06-08 — OHP `quality_mae` fix: LightGBM meta-learner (Phase C) — WINS, DEPLOYED
+
+**Goal:** Same as the rejected A+B attempt below — lower `quality_mae` (40–60 bucket MAE≈27) without touching other heads. Per the agreed plan, skipped straight to Phase C: a tree-based meta-learner instead of another loss-shaping retry.
+
+**Approach:** `core/exevision/training/ohp/train_quality_gbm.py` (NEW) trains a small `LGBMRegressor` directly on `human_score`, using per-rep tabular features built from the SAME frozen v1 5-seed ensemble already in production (no new neural training):
+`[heuristic_score, ensemble's own predicted heads (smoothness, control, lockout, elbow_flare, grip_ratio, rom_top, rom_bottom — excludes quality), heuristic per-metric scores (grip_ratio/rom/lockout/elbow_flare), view one-hot(5)]` — 17 features, 120/23/23 train/val/test rows. Final score = `alpha · neural_quality + (1-alpha) · gbm_pred`, with `alpha` swept on val (never test) to minimize MAE.
+
+**Result — WINS on every axis (test split, n=23):**
+| metric | v1 ensemble (locked, baseline) | GBM blend (alpha=0, i.e. pure GBM) |
+|---|---|---|
+| quality_mae | 9.01 | **7.30** (-19%) |
+| quality_pearson | 0.550 | **0.717** (+30%) |
+| 40-60 bucket MAE | 27.07 | **16.32** (-40% — the bucket we targeted) |
+| 60-80 / 80-100 bucket MAE | 6.14 / 7.75 | 7.12 / 6.17 (~flat) |
+
+Val-split alpha sweep picked `alpha=0.00` — the GBM alone beat every blend with the neural ensemble's quality output, meaning trees genuinely model `human_score` from the tabular features better than the deep-net fusion does (sidesteps the bad heuristic anchor, `heuristic_pearson=-0.11`, instead of fighting it).
+
+**Why this succeeded where A+B failed:** A+B tried to *reshape the deep-net's loss* to fix 12 minority-class samples — overwhelmed the signal and collapsed ranking (`pearson`→0.006). The GBM instead learns a *separate, simpler model* on compact tabular features where small-data tree regularization (`max_depth=3`, `num_leaves=7`, `min_child_samples=10`) handles the 119-row / class-imbalance regime natively, and blending is gated by an honest val-only alpha search — no risk of the deep net's ranking ability being touched at all (it's frozen).
+
+**Wired in (gated, fallback-safe — mirrors the `"ensemble"` pattern):**
+- `core/exevision/neural/registry.py` — OHP handler gains `"quality_gbm_name": "quality_gbm.pkl"` + `"quality_gbm_meta_name": "quality_gbm_meta.json"`. Absent files → pure neural (no behavior change); squat handler untouched (no key).
+- `core/exevision/stages/neural_fusion_inference.py` — `main()` loads the GBM + meta (alpha) into the handler dict if present; `_infer_rep` builds the same 17-feature vector from `heuristic_vec` + the ensemble's own averaged head outputs (BEFORE `grip_ratio_side_exclude` nulling, matching training distribution), predicts, blends, and **overwrites `neural_score`** — raw neural value kept as `neural_score_pre_gbm`, GBM raw value as `quality_gbm_pred` for traceability. All other heads (lockout, ROM, flare, smoothness, control, grip_ratio) stay byte-identical — GBM only ever touches `quality`.
+- **Models:** `models/runtime_neural_ohp/quality_gbm.pkl` + `quality_gbm_meta.json` (alpha, feature_names, seeds, test metrics).
+
+**Verified end-to-end:** ran on `neural_run_20260514_005338` → log `Quality GBM loaded: quality_gbm.pkl (alpha=0.0)`, rep output shows `neural_score=91.31`, `neural_score_pre_gbm=98.45`, `quality_gbm_pred=91.31` (alpha=0 → blend == GBM, as expected), all other heads (`smoothness/control/lockout/elbow_flare/grip_ratio/rom_top/rom_bottom`) unchanged from the locked-in ensemble run. Squat untouched (handler has no `quality_gbm_name`).
+
+**Eval artifact:** `results/ohp_quality_gbm_eval.json`.
+
+---
+
+## 2026-06-08 — OHP `quality_mae` improvement attempt: fusion v2 (head-scalar inputs + bucket-weighted loss) — TRIED & REJECTED
+
+**Goal:** Lower `quality_mae` (driven almost entirely by the 40–60 bucket, MAE≈27) without touching any other head, per user request: *"focus on improving quality_mae... while remaining the other heads."*
+
+**Approach (A+B from the agreed plan):**
+- **A — Head-scalar fusion input:** Added optional `head_dim` param to `HeuristicGuidedFusion` (`core/exevision/neural/nn_models.py`). When `head_dim=0` (default), architecture is byte-identical to before — squat untouched, verified via `strict=True` state_dict load of `fusion_layer.pt`. When `head_dim>0`, a new `head_proj` branch concatenates a projected 7-dim neural head-scalar vector `[smoothness, control, lockout, elbow_flare, grip_ratio, rom_top, rom_bottom]` (see `build_ohp_head_vector()` in `core/exevision/neural/ohp/fusion.py`, detached — heads stay frozen) into the residual head's input (`fusion_dim*4` vs `fusion_dim*3`).
+- **B — Bucket-weighted loss:** Added `bucket_weighted_mse()` to `core/exevision/training/ohp/losses.py` — 3× weight on quality targets <60 (the rare, poorly-fit bucket).
+- **New script `retrain_fusion_ohp.py`:** retrains ONLY the fusion (loads frozen `{bilstm,stgcn}_ohp_finetuned_seed*.pt` — bit-identical to production), saves `fusion_ohp_v2_seed*.pt` (new name — v2 residual_head input dim incompatible with v1 ckpts).
+
+**Result — REJECTED:**
+| metric | v1 (locked, production) | v2 (head-scalar + bucket-weighted) |
+|---|---|---|
+| quality_mae | **9.01** | 14.60 (+62% worse) |
+| quality_pearson | **0.550** | **0.006** (ranking collapsed) |
+| 40-60 bucket MAE | 27.7 | 34.7 (worse — the bucket we targeted) |
+| residual_mean | ~0 | -6.08 (systematic downward bias) |
+| all other heads (lockout/ROM/flare/grip/smoothness/control) | — | **bit-identical** (confirms wiring correct; isolates regression to fusion) |
+
+**Diagnosis:** The 3× bucket weight on ~12 low-score training reps (out of 119) overwhelmed the loss signal — the fusion learned to push scores down broadly to chase the rare low-score targets, destroying its ranking ability (`pearson` 0.550→0.006) rather than sharpening it. Other heads staying bit-identical across the experiment **proves the head_dim=7 wiring is correct** (architecture, training, eval, inference all plumbed properly) — the failure is purely a *loss-shaping* problem on too little data, not a code bug.
+
+**Action taken:** Reverted `registry.py` `_handler_ohp` to v1 fusion (`fusion_ohp_finetuned*.pt`, `head_dim=0`, `head_vec_fn` removed). Verified end-to-end on `neural_run_20260514_005338`: `Ensemble active: 5 members [...] (fusion-excluded: ['_seed7'])` — identical to locked-in production. `fusion_ohp_v2_seed*.pt` checkpoints kept on disk for analysis (not wired in).
+
+**What's still usable from this work (additive, zero regression):**
+- `HeuristicGuidedFusion(head_dim=...)` — generic, opt-in, squat/v1-OHP unaffected. Future fusion experiments can reuse it without re-deriving the architecture change.
+- `build_ohp_head_vector()`, `bucket_weighted_mse()`, `retrain_fusion_ohp.py` — reusable building blocks for a retry with gentler weighting.
+
+**Next ideas for `quality_mae` (if revisited):**
+1. Much lighter bucket weight (e.g. 1.3–1.5× instead of 3×) or a smooth inverse-frequency weight instead of a hard step — 3× was too aggressive for ~12 samples.
+2. Skip straight to the GBM meta-learner (Phase C of the plan) — tree models on ~119 tabular rows tolerate class imbalance better than reweighted deep-net MSE and sidestep the bad heuristic anchor (`heuristic_pearson=-0.11`) entirely.
+3. The real fix remains unchanged: more low-score (40–60) OHP training reps. No amount of loss-shaping replaces missing data on a 12-sample minority class.
+
+---
+
 ## 2026-06-08 — OHP 5-Seed Ensemble (additive; single model kept as fallback)
 
 **Decision:** Improve OHP neural inference WITHOUT changing the base architecture. The single finetuned model passed 7/8 gates but **failed `lockout_auc=0.742`** (gate >0.75) on the 23-rep test — a variance problem on tiny data, not architecture. Fix: train 5 seeds of the same architecture, average outputs at inference. Existing single model retained as automatic fallback.

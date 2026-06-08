@@ -11,6 +11,26 @@ def masked_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return F.mse_loss(pred[mask], target[mask])
 
 
+def bucket_weighted_mse(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    low_threshold: float = 0.6,
+    low_weight: float = 3.0,
+) -> torch.Tensor:
+    """MSE that up-weights low-score samples (target < low_threshold, both in [0,1]).
+
+    Combats bad-rep blindness: the 40-60 quality bucket is rare in training data,
+    so plain MSE barely penalises misses there. low_threshold=0.6 / low_weight=3.0
+    means reps scored <60 contribute 3x to the loss.
+    """
+    mask = ~torch.isnan(target)
+    if not mask.any():
+        return torch.tensor(0.0, device=pred.device, requires_grad=True)
+    p, t = pred[mask], target[mask]
+    w = torch.where(t < low_threshold, torch.full_like(t, low_weight), torch.ones_like(t))
+    return (w * (p - t) ** 2).mean()
+
+
 def weighted_bce(
     pred: torch.Tensor,
     target: torch.Tensor,

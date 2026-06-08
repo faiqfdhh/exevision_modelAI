@@ -1,9 +1,11 @@
 """OHP ensemble evaluation — averages N seed checkpoints at the prediction level.
 
 Mirrors evaluate_ohp.py exactly (same metric functions, same acceptance gates) but
-loads every {bilstm,stgcn,fusion}_ohp_finetuned_seed*.pt triple, runs each per rep,
-and averages the scalar outputs BEFORE computing metrics. Averaging the lockout
-probability is what reorders borderline reps and lifts lockout_auc.
+loads every {bilstm,stgcn}_ohp_finetuned_seed*.pt + fusion_ohp_v2_seed*.pt triple,
+runs each per rep, and averages the scalar outputs BEFORE computing metrics.
+Averaging the lockout probability is what reorders borderline reps and lifts
+lockout_auc. Fusion is v2 (head_dim=7, consumes neural head scalars — see
+retrain_fusion_ohp.py); bilstm/stgcn are the SAME frozen v1 encoders as production.
 
 CLI:
   python evaluate_ohp_ensemble.py \\
@@ -34,14 +36,19 @@ for _p in [str(_NEURAL), str(_OHP_NEURAL), str(_TRAIN_OHP_PRETRAIN), str(_TRAIN_
 
 from nn_utils import build_adjacency_matrix_ohp
 from models import OHPBiLSTMScorer, OHPSTGCNScorer
-from fusion import build_ohp_fusion
+from fusion import build_ohp_fusion, build_ohp_head_vector, OHP_HEAD_DIM
 from data_phase3 import OHPPhase3Dataset
 # Reuse the single-model eval's metric functions verbatim — identical comparison.
 from evaluate_ohp import _nanmae, _pearson, _auc, _bucket, ACCEPTANCE
 
 
 def _discover_seeds(model_dir: Path) -> list[str]:
-    """Return seed suffixes (e.g. ['_seed42', '_seed7']) with a complete triple."""
+    """Return seed suffixes (e.g. ['_seed42', '_seed7']) with a complete v2 triple.
+
+    v2 fusion (fusion_ohp_v2{sfx}.pt, head_dim=7) pairs with the SAME frozen
+    {bilstm,stgcn}_ohp_finetuned{sfx}.pt encoders used by the locked-in v1 ensemble
+    — only the fusion layer was retrained (see retrain_fusion_ohp.py).
+    """
     seeds = []
     for b in sorted(model_dir.glob("bilstm_ohp_finetuned_seed*.pt")):
         m = re.search(r"(_seed\w+)\.pt$", b.name)
@@ -49,7 +56,7 @@ def _discover_seeds(model_dir: Path) -> list[str]:
             continue
         sfx = m.group(1)
         if (model_dir / f"stgcn_ohp_finetuned{sfx}.pt").exists() and \
-           (model_dir / f"fusion_ohp_finetuned{sfx}.pt").exists():
+           (model_dir / f"fusion_ohp_v2{sfx}.pt").exists():
             seeds.append(sfx)
     return seeds
 
@@ -57,10 +64,10 @@ def _discover_seeds(model_dir: Path) -> list[str]:
 def _load_member(model_dir: Path, sfx: str, A: torch.Tensor, device: torch.device):
     bilstm = OHPBiLSTMScorer().to(device)
     stgcn  = OHPSTGCNScorer(A).to(device)
-    fusion = build_ohp_fusion().to(device)
+    fusion = build_ohp_fusion(head_dim=OHP_HEAD_DIM).to(device)
     bilstm.load_state_dict(torch.load(model_dir / f"bilstm_ohp_finetuned{sfx}.pt", map_location="cpu"))
     stgcn.load_state_dict(torch.load(model_dir / f"stgcn_ohp_finetuned{sfx}.pt", map_location="cpu"))
-    fusion.load_state_dict(torch.load(model_dir / f"fusion_ohp_finetuned{sfx}.pt", map_location="cpu"))
+    fusion.load_state_dict(torch.load(model_dir / f"fusion_ohp_v2{sfx}.pt", map_location="cpu"))
     bilstm.eval(); stgcn.eval(); fusion.eval()
     return bilstm, stgcn, fusion
 
@@ -118,7 +125,8 @@ def evaluate_ensemble(
             for sfx, bilstm, stgcn, fusion in members:
                 b_out = bilstm(bd["bilstm_input"])
                 s_out = stgcn(bd["stgcn_input"], bd["view_vec"])
-                fscore, _ = fusion(bd["heuristic_vec"], s_out["embedding"], b_out["embedding"])
+                head_vec = build_ohp_head_vector(b_out, s_out)
+                fscore, _ = fusion(bd["heuristic_vec"], s_out["embedding"], b_out["embedding"], head_vec)
                 if sfx not in exclude_fusion:        # quality = fusion only; honor exclusion
                     preds["quality"].append(float(fscore.item()))
                 preds["smoothness"].append(float(b_out["smoothness"].item()))
