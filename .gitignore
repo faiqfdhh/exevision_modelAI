@@ -71,3 +71,13 @@ desktop.ini
 
 # Keep requirements file tracked
 !requirements-runtime.txt
+
+.agents/
+.claude/
+.github/
+.opencode/
+.remember/
+docs/
+graphify-out/
+catboost_info/
+batch_runs/
