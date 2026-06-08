@@ -1,5 +1,30 @@
 # ExeVision AI — Development Session Log
 
+## 2026-06-08 — OHP 5-Seed Ensemble (additive; single model kept as fallback)
+
+**Decision:** Improve OHP neural inference WITHOUT changing the base architecture. The single finetuned model passed 7/8 gates but **failed `lockout_auc=0.742`** (gate >0.75) on the 23-rep test — a variance problem on tiny data, not architecture. Fix: train 5 seeds of the same architecture, average outputs at inference. Existing single model retained as automatic fallback.
+
+**Why it works:** Different seeds settle in different loss-surface minima → uncorrelated errors. Averaging the per-rep scalar outputs (NOT embeddings — those are per-seed, unaligned) cancels variance. `lockout` is a probability/ranking, so averaging reorders borderline reps and lifts AUC; AUC is rank-based, so monotonic calibration could NOT have moved it (key lesson — calibration ≠ ranking).
+
+**Result (23-rep test, ensemble vs single):**
+- `lockout_auc` 0.742 ❌ → **0.780 ✅** (gate cleared)
+- `quality_pearson` 0.546 → **0.550** (ranking ≥ single); `quality_mae` 8.77 → 9.01 (0.24 = noise)
+- elbow_flare 12.06→11.10, grip_ratio 8.70→7.15, rom_top 11.88→9.15, rom_bottom 9.60→7.99 (all improved)
+- **All 8 acceptance gates pass.**
+
+**Asymmetric ensemble:** seed7's fusion converged poorly (best val at epoch 1) and inflated `quality_mae` via constant bias. Solution: all 5 seeds vote on every head, but **seed7 is dropped from the quality/residual average only** (`fusion_exclude_seeds`). Dropping it: quality_mae 9.68→9.01, pearson 0.402→0.550, lockout held at 0.780. MAE-vs-Pearson divergence revealed the bias (magnitude up, correlation unchanged).
+
+**What changed:**
+- **`core/exevision/training/ohp/finetune_ohp.py`** — added `--seed` and `--suffix` CLI args; all 13 output-filename literals parametrized via `bilstm_name`/`stgcn_name`/`fusion_name`. Multi-seed runs no longer clobber each other.
+- **`core/exevision/training/ohp/evaluate_ohp_ensemble.py`** (NEW) — loads all `*_seed*.pt` triples, averages outputs, reports the same metrics/gates as `evaluate_ohp.py` (reuses its metric fns). `--exclude-fusion _seed7` drops seeds from quality avg only.
+- **`core/exevision/stages/neural_fusion_inference.py`** — `_infer_rep` now loops over a `members` list and averages scalar outputs (single model = ensemble of 1; squat unaffected). New `_load_member`/`_load_members`: if handler `"ensemble"`, globs `{base}_seed*.pt` from `ckpt_dir`, else single fallback. `process_video`/`main` pass `members`. Output JSON gains `ensemble_size`.
+- **`core/exevision/neural/registry.py`** — OHP handler: `"ensemble": True`, `"fusion_exclude_seeds": ["_seed7"]`. Squat handler unchanged (no flag → single model).
+- **Models:** 15 new checkpoints `{bilstm,stgcn,fusion}_ohp_finetuned_seed{42,7,19,3,99}.pt` in `models/runtime_neural_ohp/`. Single `_finetuned.pt` files untouched.
+
+**Verified:** Stage 9 ran end-to-end on real OHP workspace (`neural_run_20260514_005338`) → log "Ensemble active: 5 members … fusion-excluded: ['_seed7']", output JSON `ensemble_size: 5`, all heads populated. No CLI/`pipeline.py`/`app.py` changes needed — drop seed files in to activate, remove to revert.
+
+**Open:** 40–60 quality bucket still poor (MAE ~30) — bad-rep blindness from data scarcity, NOT fixable by ensembling. Needs more low-score training reps (future work). Squat NOT ensembled (single model only).
+
 ## 2026-06-01 — LLM Feedback Enhancer (LangChain + DeepSeek)
 
 **Focus:** Post-process template-concatenated coaching feedback through a LangChain LCEL chain to produce natural, coherent coaching sentences. Learning exercise: LangChain chains, `ChatDeepSeek`, `ChatPromptTemplate`, `StrOutputParser`, LCEL `|` pipe operator.

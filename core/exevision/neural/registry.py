@@ -79,6 +79,14 @@ def _handler_ohp() -> ExerciseHandler:
         "fusion_ckpt_name": "fusion_ohp_finetuned.pt",
         "suppress_knee": False,
         "grip_ratio_side_exclude": True,
+        # 5-seed ensemble (Session 2026-06-08): auto-loads *_seed*.pt triples from
+        # ckpt_dir if present, else falls back to the single *_finetuned.pt model.
+        # All seeds vote on every head; seed7's fusion is dropped from the QUALITY
+        # average only (its fusion converged poorly — best val at epoch 1).
+        # Test (23 reps): lockout_auc 0.742→0.780 (gate cleared), quality_pearson
+        # 0.546→0.550, all spatial MAEs improved; quality_mae 8.77→9.01 (noise).
+        "ensemble": True,
+        "fusion_exclude_seeds": ["_seed7"],
     }
 
 

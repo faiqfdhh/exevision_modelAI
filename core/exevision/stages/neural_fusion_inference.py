@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -119,11 +120,19 @@ def _infer_rep(
     feature_data: dict,
     seg_data: dict,
     view: str,
-    models: Dict[str, torch.nn.Module],
+    members: List[Dict[str, Any]],
     device: torch.device,
     handler: dict,
 ) -> Optional[Dict[str, Any]]:
-    """Generic per-rep neural inference. Returns dict with neural_score + model outputs."""
+    """Generic per-rep neural inference over an ensemble of members.
+
+    Each member is {"bilstm", "stgcn", "fusion", "tag"}. A single-model run is
+    just an ensemble of one. Scalar outputs are averaged across members AFTER
+    each full forward pass (never average embeddings — they are per-seed and
+    not aligned). Members whose tag is in handler["fusion_exclude_seeds"] are
+    dropped from the QUALITY/residual average only; they still vote on every
+    other head (lockout, ROM, flare, ...).
+    """
     try:
         exercise = handler["exercise"]
         bilstm_seq = _extract_rep_matrix(seg_data, rep_data, exercise=exercise)
@@ -144,22 +153,45 @@ def _infer_rep(
         start, end = handler["view_vec_slice"]
         view_vec = heur_t[:, start:end]
 
+        exclude = set(handler.get("fusion_exclude_seeds", []) or [])
+        quality_all: List[float] = []
+        quality_keep: List[float] = []
+        residual_all: List[float] = []
+        residual_keep: List[float] = []
+        head_acc: Dict[str, List[float]] = {}
+
         with torch.no_grad():
-            b_out = models["bilstm"](bilstm_t)
-            s_out = models["stgcn"](stgcn_t, view_vec)
-            pred, residual = models["fusion"](heur_t, s_out["embedding"], b_out["embedding"])
+            for m in members:
+                b_out = m["bilstm"](bilstm_t)
+                s_out = m["stgcn"](stgcn_t, view_vec)
+                pred, residual = m["fusion"](heur_t, s_out["embedding"], b_out["embedding"])
+
+                p_val, r_val = float(pred.item()), float(residual.item())
+                quality_all.append(p_val)
+                residual_all.append(r_val)
+                if m.get("tag") not in exclude:
+                    quality_keep.append(p_val)
+                    residual_keep.append(r_val)
+
+                for name, val in {**b_out, **s_out}.items():
+                    if name == "embedding":
+                        continue
+                    head_acc.setdefault(name, []).append(float(val.item()))
+
+        # Fall back to all members if exclusion emptied the quality pool.
+        q_pool = quality_keep or quality_all
+        r_pool = residual_keep or residual_all
 
         result = {
-            "neural_score": round(float(pred.item()), 2),
-            "residual": round(float(residual.item()), 2),
+            "neural_score": round(sum(q_pool) / len(q_pool), 2),
+            "residual": round(sum(r_pool) / len(r_pool), 2),
             "neural_available": True,
+            "ensemble_size": len(members),
         }
 
-        for name, val in {**b_out, **s_out}.items():
-            if name == "embedding":
-                continue
+        for name, vals in head_acc.items():
             is_prob = any(p in name for p in ("prob", "error"))
-            result[name] = round(float(val.item()), 4 if is_prob else 2)
+            result[name] = round(sum(vals) / len(vals), 4 if is_prob else 2)
 
         if handler.get("grip_ratio_side_exclude", False) and view in ("side", "unknown"):
             result["grip_ratio"] = None
@@ -254,12 +286,9 @@ def aggregate_scores(heuristic: float, neural: float) -> float:
     return round(lower + (higher - lower) * 0.3, 1)
 
 
-def _load_models(handler: dict, device: torch.device, bilstm_ckpt: Path, stgcn_ckpt: Path, fusion_ckpt: Path) -> Dict[str, torch.nn.Module]:
-    """Load exercise-specific neural models from checkpoints."""
+def _load_member(handler: dict, device: torch.device, A: torch.Tensor, bilstm_ckpt: Path, stgcn_ckpt: Path, fusion_ckpt: Path, tag: str) -> Dict[str, Any]:
+    """Load one ensemble member (bilstm + stgcn + fusion) from checkpoints."""
     model_classes = get_model_classes(handler["exercise"])
-    adjacency = handler["adjacency_fn"]()
-    A = torch.tensor(adjacency, dtype=torch.float32).to(device)
-
     bilstm = model_classes["bilstm"]().to(device)
     stgcn = model_classes["stgcn"](A).to(device)
     fusion = handler["fusion_builder"]().to(device)
@@ -271,15 +300,55 @@ def _load_models(handler: dict, device: torch.device, bilstm_ckpt: Path, stgcn_c
     bilstm.eval()
     stgcn.eval()
     fusion.eval()
+    return {"bilstm": bilstm, "stgcn": stgcn, "fusion": fusion, "tag": tag}
 
-    return {"bilstm": bilstm, "stgcn": stgcn, "fusion": fusion}
+
+def _load_members(
+    handler: dict,
+    device: torch.device,
+    ckpt_dir: Path,
+    bilstm_ckpt: Path,
+    stgcn_ckpt: Path,
+    fusion_ckpt: Path,
+) -> List[Dict[str, Any]]:
+    """Load model members. If handler["ensemble"] and seed checkpoints exist in
+    ckpt_dir, returns one member per seed (e.g. *_seed42.pt, *_seed7.pt, ...).
+    Otherwise falls back to a single member from the explicit checkpoint paths.
+    """
+    A = torch.tensor(handler["adjacency_fn"](), dtype=torch.float32).to(device)
+
+    if handler.get("ensemble"):
+        # Derive seed glob from the base bilstm name: foo.pt -> foo_seed*.pt
+        base = handler["bilstm_ckpt_name"][:-3]  # strip ".pt"
+        stgcn_base = handler["stgcn_ckpt_name"][:-3]
+        fusion_base = handler["fusion_ckpt_name"][:-3]
+        members: List[Dict[str, Any]] = []
+        for bf in sorted(ckpt_dir.glob(f"{base}_seed*.pt")):
+            m = re.search(r"(_seed\w+)\.pt$", bf.name)
+            if not m:
+                continue
+            tag = m.group(1)
+            sf = ckpt_dir / f"{stgcn_base}{tag}.pt"
+            ff = ckpt_dir / f"{fusion_base}{tag}.pt"
+            if sf.exists() and ff.exists():
+                members.append(_load_member(handler, device, A, bf, sf, ff, tag))
+        if members:
+            excl = set(handler.get("fusion_exclude_seeds", []) or [])
+            logger.info(
+                "Ensemble active: %d members %s (fusion-excluded: %s)",
+                len(members), [m["tag"] for m in members], sorted(excl) or "none",
+            )
+            return members
+        logger.warning("Ensemble enabled but no seed checkpoints found in %s — using single model", ckpt_dir)
+
+    return [_load_member(handler, device, A, bilstm_ckpt, stgcn_ckpt, fusion_ckpt, "single")]
 
 
 def process_video(
     video_id: str,
     workspace_root: Path,
     quality_tier: str,
-    models: Dict[str, torch.nn.Module],
+    members: List[Dict[str, Any]],
     device: torch.device,
     handler: dict,
 ) -> Optional[Dict[str, Any]]:
@@ -351,7 +420,7 @@ def process_video(
         else:
             logger.debug(f"No AQA rep data for rep_id={rep.get('rep_id')} in {video_id}")
 
-        neural_output = _infer_rep(rep, feature_data, seg_data, view, models, device, handler)
+        neural_output = _infer_rep(rep, feature_data, seg_data, view, members, device, handler)
         if neural_output is None:
             logger.debug(f"Skipped rep {rep_idx + 1} in {video_id}")
             continue
@@ -554,8 +623,8 @@ def main() -> int:
         if not fusion_ckpt.exists():
             logger.error(f"Fusion checkpoint not found: {fusion_ckpt}")
             return 1
-        models = _load_models(handler, device, bilstm_ckpt, stgcn_ckpt, fusion_ckpt)
-        logger.info("Models loaded successfully")
+        members = _load_members(handler, device, ckpt_dir, bilstm_ckpt, stgcn_ckpt, fusion_ckpt)
+        logger.info("Models loaded successfully (%d member(s))", len(members))
     except Exception as e:
         logger.error(f"Failed to load models: {str(e)}")
         return 1
@@ -567,7 +636,7 @@ def main() -> int:
 
     for video_id, quality_tier in videos:
         try:
-            result = process_video(video_id, workspace_root, quality_tier, models, device, handler)
+            result = process_video(video_id, workspace_root, quality_tier, members, device, handler)
             if result is not None:
                 video_results[video_id] = result
                 successful += 1

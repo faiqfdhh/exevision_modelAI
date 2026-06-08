@@ -190,10 +190,18 @@ def train(
     pretrain_stgcn: Path,
     output_dir: Path,
     run_joint: bool = False,
+    seed: int = SEED,
+    suffix: str = "",
 ) -> None:
-    set_seed(SEED)
+    set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"Device: {device}  seed={seed}  suffix='{suffix}'")
+
+    # Output checkpoint names — suffix keeps multi-seed ensemble runs from
+    # overwriting each other (e.g. "_seed7" → bilstm_ohp_finetuned_seed7.pt).
+    bilstm_name = f"bilstm_ohp_finetuned{suffix}.pt"
+    stgcn_name  = f"stgcn_ohp_finetuned{suffix}.pt"
+    fusion_name = f"fusion_ohp_finetuned{suffix}.pt"
 
     all_paths = sorted((annotation_dir / "videos").glob("*.json"))
     train_paths = [p for p in all_paths if _get_split(p) == "train"]
@@ -248,13 +256,13 @@ def train(
         print(f"  ep {ep:2d}/{P1_EPOCHS} | train={tr:.4f} | val={val_str:>6}{flag}")
         if improved:
             best_p1_loss = metric
-            torch.save(bilstm.state_dict(), output_dir / "bilstm_ohp_finetuned.pt")
+            torch.save(bilstm.state_dict(), output_dir / bilstm_name)
         p1_val_hist.append(metric)
         if _early_stop(p1_val_hist, P1_PATIENCE):
             print(f"  Early stop at epoch {ep}.")
             break
 
-    bilstm.load_state_dict(torch.load(output_dir / "bilstm_ohp_finetuned.pt", map_location="cpu"))
+    bilstm.load_state_dict(torch.load(output_dir / bilstm_name, map_location="cpu"))
     print(f"Phase 1 done. Best val_loss={best_p1_loss:.4f}")
 
     # ── Phase 2: ST-GCN spatial heads ─────────────────────────────────────────
@@ -283,13 +291,13 @@ def train(
         print(f"  ep {ep:2d}/{P2_EPOCHS} | train={tr:.4f} | val={val_str:>6}{flag}")
         if improved:
             best_p2_loss = metric
-            torch.save(stgcn.state_dict(), output_dir / "stgcn_ohp_finetuned.pt")
+            torch.save(stgcn.state_dict(), output_dir / stgcn_name)
         p2_val_hist.append(metric)
         if _early_stop(p2_val_hist, P2_PATIENCE):
             print(f"  Early stop at epoch {ep}.")
             break
 
-    stgcn.load_state_dict(torch.load(output_dir / "stgcn_ohp_finetuned.pt", map_location="cpu"))
+    stgcn.load_state_dict(torch.load(output_dir / stgcn_name, map_location="cpu"))
     print(f"Phase 2 done. Best val_loss={best_p2_loss:.4f}")
 
     # ── Phase 3: Fusion (encoders frozen) ─────────────────────────────────────
@@ -340,13 +348,13 @@ def train(
         print(f"  SWA val_loss={swa_val:.4f}  best_single={best_p3_loss:.4f}")
         if val_loader and swa_val < best_p3_loss:
             print("  → SWA wins, saving SWA weights.")
-            torch.save(swa_state, output_dir / "fusion_ohp_finetuned.pt")
+            torch.save(swa_state, output_dir / fusion_name)
         else:
             print("  → Best single epoch wins.")
-            torch.save(best_fusion_state, output_dir / "fusion_ohp_finetuned.pt")
+            torch.save(best_fusion_state, output_dir / fusion_name)
             fusion.load_state_dict(best_fusion_state)
     else:
-        torch.save(best_fusion_state or fusion.state_dict(), output_dir / "fusion_ohp_finetuned.pt")
+        torch.save(best_fusion_state or fusion.state_dict(), output_dir / fusion_name)
 
     print(f"Phase 3 done. Best val_loss={best_p3_loss:.4f}")
 
@@ -376,9 +384,9 @@ def train(
             print(f"  ep {ep:2d}/{P4_EPOCHS} | train={tr:.4f} | val={val_str:>6}{flag}")
             if improved:
                 best_p4_loss = metric
-                torch.save(bilstm.state_dict(), output_dir / "bilstm_ohp_finetuned.pt")
-                torch.save(stgcn.state_dict(),  output_dir / "stgcn_ohp_finetuned.pt")
-                torch.save(fusion.state_dict(), output_dir / "fusion_ohp_finetuned.pt")
+                torch.save(bilstm.state_dict(), output_dir / bilstm_name)
+                torch.save(stgcn.state_dict(),  output_dir / stgcn_name)
+                torch.save(fusion.state_dict(), output_dir / fusion_name)
             p4_val_hist.append(metric)
             if _early_stop(p4_val_hist, P4_PATIENCE):
                 print(f"  Early stop at epoch {ep}.")
@@ -388,9 +396,9 @@ def train(
 
     print("\n" + "="*60)
     print("Training complete.")
-    print(f"  bilstm_ohp_finetuned.pt → {output_dir / 'bilstm_ohp_finetuned.pt'}")
-    print(f"  stgcn_ohp_finetuned.pt  → {output_dir / 'stgcn_ohp_finetuned.pt'}")
-    print(f"  fusion_ohp_finetuned.pt → {output_dir / 'fusion_ohp_finetuned.pt'}")
+    print(f"  {bilstm_name} → {output_dir / bilstm_name}")
+    print(f"  {stgcn_name}  → {output_dir / stgcn_name}")
+    print(f"  {fusion_name} → {output_dir / fusion_name}")
 
 
 def main() -> None:
@@ -405,9 +413,13 @@ def main() -> None:
                         help="Directory for output checkpoints")
     parser.add_argument("--joint", action="store_true",
                         help="Run optional Phase 4 joint fine-tune after fusion")
+    parser.add_argument("--seed", type=int, default=SEED,
+                        help="Random seed for this run (default: 42)")
+    parser.add_argument("--suffix", type=str, default="",
+                        help="Appended to output checkpoint names, e.g. _seed7")
     args = parser.parse_args()
     train(args.annotation_dir, args.pretrain_bilstm, args.pretrain_stgcn,
-          args.output_dir, run_joint=args.joint)
+          args.output_dir, run_joint=args.joint, seed=args.seed, suffix=args.suffix)
 
 
 if __name__ == "__main__":
