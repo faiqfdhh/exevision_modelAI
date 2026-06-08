@@ -1,5 +1,43 @@
 # ExeVision AI — Development Session Log
 
+## 2026-06-01 — LLM Feedback Enhancer (LangChain + DeepSeek)
+
+**Focus:** Post-process template-concatenated coaching feedback through a LangChain LCEL chain to produce natural, coherent coaching sentences. Learning exercise: LangChain chains, `ChatDeepSeek`, `ChatPromptTemplate`, `StrOutputParser`, LCEL `|` pipe operator.
+
+**What was built:**
+
+- **`core/exevision/feedback/llm_enhancer.py`** (NEW) — `LLMFeedbackEnhancer` class. Builds LangChain chain `ChatPromptTemplate | ChatDeepSeek | StrOutputParser` in `__init__`. `enhance_rep(rep, exercise)` extracts issue metric_keys, calls `chain.invoke({exercise, score, tier, issues, template_text})`, falls back to `rep.text` on any exception. `enhance_result(result)` returns new `FeedbackResult` via `dataclasses.replace()` — original not mutated. `_chain` injection parameter for testing (bypasses real LLM). Module-level cache (`_llm_feedback_enhancer_cache` in `pipeline.py`) avoids per-request chain rebuild.
+
+- **`tests/feedback/test_llm_enhancer.py`** (NEW) — 10 unit tests. All mock `_chain` injection (no real HTTP). Covers: output replacement, exception fallback, context shape, batch enhancement, item/session immutability, empty reps, partial failure isolation (one rep fails → others still enhanced), exercise routing.
+
+- **`apps/api/pipeline.py`** — +12 lines after `generate_feedback()` (line 897). Feature-flagged via `DEEPSEEK_API_KEY` env var. Lazy import of `LLMFeedbackEnhancer`. Non-fatal: `except Exception` logs warning and returns template output. Module-level `_llm_feedback_enhancer_cache` at line 26.
+
+- **`requirements-runtime.txt`** — Added `langchain-deepseek>=0.1.0`.
+
+**Architecture:**
+```
+FeedbackEngine.generate_feedback()  → FeedbackResult (template text)
+    ↓  (if DEEPSEEK_API_KEY set)
+LLMFeedbackEnhancer.enhance_result()
+    → per rep: ChatPromptTemplate | ChatDeepSeek | StrOutputParser
+    → HTTP POST to api.deepseek.com
+    → RepFeedback.text replaced with natural sentence
+    → RepFeedback.items unchanged (structured UI data)
+    ↓  (on any failure: return original template text)
+Final FeedbackResult → feedback_payload → API response
+```
+
+**LangChain concepts covered:** `ChatDeepSeek` (native provider package), `ChatPromptTemplate.from_messages()`, LCEL `|` pipe (lazy composition), `StrOutputParser`, provider abstraction (swap provider = zero chain changes), `temperature` parameter.
+
+**Known limitations:**
+- Serial LLM calls per rep (~1–3s each × rep count). Fix: `chain.batch()`.
+- Desktop UI does not use this enhancement (wired into API only).
+- RAG deferred to Phase 2 (requires coaching knowledge base documents).
+
+**Files changed:** `core/exevision/feedback/llm_enhancer.py` (new), `tests/feedback/test_llm_enhancer.py` (new), `apps/api/pipeline.py`, `requirements-runtime.txt`
+
+---
+
 ## 2026-05-18 — Fix Squat Neural Fusion Scale Mismatch (Depth Reliability Gate + Subscore Ceiling)
 
 **Focus:** ST-GCN spatial head outputs Sigmoid [0,1] but `_squat_post_process()` compared against heuristic values in [0,100], causing `depth_unreliable` to always fire and subscore_ceiling to always clamp.

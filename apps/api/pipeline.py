@@ -22,8 +22,26 @@ from core.exevision.feedback.engine import FeedbackEngine
 
 logger = logging.getLogger(__name__)
 
+# Module-level cache for LLMFeedbackEnhancer to avoid rebuilding on every request
+_llm_feedback_enhancer_cache: "LLMFeedbackEnhancer | None" = None
+
 _DIAGONAL_ALIASES = {"front_side", "back_side", "front-side", "back-side"}
 _STRAIGHT_ALIASES = {"front", "back"}
+
+# Neural sub-score relaxation: applies a power-curve to BiLSTM outputs
+# to reduce strictness.  display = 100 * pow(score/100, exponent)
+# where exponent < 1 inflates low-to-mid scores more than high ones.
+# Configurable per-instance by changing the default.
+_DEFAULT_SMOOTH_EXPONENT = 0.65
+
+
+def _smooth_relax(sub_scores: dict, exponent: float = _DEFAULT_SMOOTH_EXPONENT) -> dict:
+    for k in ("smoothness", "control"):
+        v = sub_scores.get(k)
+        if v is not None:
+            relaxed = 100.0 * pow(max(0.001, v / 100.0), exponent)
+            sub_scores[k] = round(max(0.0, min(100.0, relaxed)), 1)
+    return sub_scores
 
 
 def _display_view(raw_view) -> str | None:
@@ -735,7 +753,7 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
             sm = nr.get("smoothness")
             ct = nr.get("control")
             if sm is not None and ct is not None:
-                bilstm_score = round((sm + ct) / 2.0, 2)
+                bilstm_score = round(max(0.0, min(100.0, (sm + ct) / 2.0 * 100.0)), 2)
             # Prefer the model's own pre-computed aggregate (exercise-agnostic,
             # correct weighting, immune to scale mismatches between heads).
             agg = nr.get("aggregated_score")
@@ -743,18 +761,19 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
                 stgcn_score = round(float(agg), 2)
             else:
                 # Fallback: average 0-100 spatial sub-scores manually.
+                # Sub-scores from model heads are 0-1; multiply by 100 for display.
                 dp = nr.get("depth")
                 fl = nr.get("forward_lean")
                 kt = nr.get("knee_tracking")
-                spatial_vals = [v for v in (dp, fl, kt) if v is not None]
+                spatial_vals = [v * 100.0 for v in (dp, fl, kt) if v is not None]
                 if not spatial_vals:
                     ef = nr.get("elbow_flare")
                     gr = nr.get("grip_ratio")
                     rt = nr.get("rom_top")
                     rb = nr.get("rom_bottom")
-                    spatial_vals = [v for v in (ef, gr, rt, rb) if v is not None]
+                    spatial_vals = [v * 100.0 for v in (ef, gr, rt, rb) if v is not None]
                 if spatial_vals:
-                    stgcn_score = round(sum(spatial_vals) / len(spatial_vals), 2)
+                    stgcn_score = round(max(0.0, min(100.0, sum(spatial_vals) / len(spatial_vals))), 2)
 
         # Phase timeline from Stage 5 segmentation (optional)
         seg_rep = seg_by_id.get(rid)
@@ -812,11 +831,6 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
             "phase_timeline": phase_timeline,
             "kinematic_data": kinematic_data,
         })
-
-    neural_scores = [r["neural_score"] for r in merged_reps if r["neural_score"] is not None]
-    bilstm_scores = [r["bilstm_score"] for r in merged_reps if r["bilstm_score"] is not None]
-    stgcn_scores = [r["stgcn_score"] for r in merged_reps if r["stgcn_score"] is not None]
-    any_corrections = any(r.get("anchor_correction_applied", False) for r in merged_reps)
 
     feedback_payload = None
     
@@ -895,6 +909,18 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
 
             print(f"[DIAGNOSTIC] Built feedback_input for {len(feedback_input)} reps. Calling generate_feedback...", flush=True)
             feedback_result = feedback_engine.generate_feedback(feedback_input, video_id=video_id)
+            # LLM feedback enhancement — non-fatal, feature-flagged via DEEPSEEK_API_KEY
+            _deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+            if _deepseek_key:
+                try:
+                    from core.exevision.feedback.llm_enhancer import LLMFeedbackEnhancer
+                    global _llm_feedback_enhancer_cache
+                    if _llm_feedback_enhancer_cache is None:
+                        _llm_feedback_enhancer_cache = LLMFeedbackEnhancer(api_key=_deepseek_key)
+                    feedback_result = _llm_feedback_enhancer_cache.enhance_result(feedback_result)
+                    print("[DIAGNOSTIC] LLM feedback enhancement applied", flush=True)
+                except Exception as _llm_exc:
+                    logger.warning("LLM feedback enhancement failed, returning template-based feedback: %s", _llm_exc)
             print(f"[DIAGNOSTIC] generate_feedback returned successfully with {len(feedback_result.reps)} reps", flush=True)
             feedback_payload = {
                 "schema_version": "2.0",
@@ -962,15 +988,52 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
         if not merged_reps:
             print(f"[DIAGNOSTIC] Skipping feedback: no merged_reps to process (count={merged_reps_count})", flush=True)
 
-    # Convert lockout and knee_error sub_scores from 0-1 error probability to 0-100 display score.
-    # Both use _error_head (sigmoid 0-1, higher=worse), but webapp expects 0-100 (higher=better).
+    # Convert sub_scores from 0-1 model-head range to 0-100 display range.
+    # Error-probability heads (lockout, knee_error): sigmoid 0-1, higher=worse → (1-val)*100.
+    # Linear quality heads (smoothness, control, depth, forward_lean, knee_tracking, …):
+    # 0-1 quality, higher=better → val*100, clamped to [0, 100].
+    _ERROR_KEYS = ("lockout", "knee_error")
+    _LINEAR_KEYS = (
+        "smoothness", "control", "depth", "forward_lean",
+        "knee_tracking", "elbow_flare", "grip_ratio",
+        "rom_top", "rom_bottom",
+    )
     for _rep in merged_reps:
         _sub = _rep.get("sub_scores")
-        if _sub is not None:
-            for _key in ("lockout", "knee_error"):
-                _val = _sub.get(_key)
-                if _val is not None:
-                    _sub[_key] = round((1 - _val) * 100, 1)
+        if _sub is None:
+            continue
+        for _k in _ERROR_KEYS:
+            _v = _sub.get(_k)
+            if _v is not None:
+                _sub[_k] = round((1 - _v) * 100, 1)
+        for _k in _LINEAR_KEYS:
+            _v = _sub.get(_k)
+            if _v is not None:
+                _sub[_k] = round(max(0.0, min(100.0, _v * 100.0)), 1)
+        _smooth_relax(_sub)
+
+    # Recompute per-rep bilstm_score from relaxed sub-scores
+    for _rep in merged_reps:
+        _sub = _rep.get("sub_scores")
+        if _sub is None:
+            continue
+        sm = _sub.get("smoothness")
+        ct = _sub.get("control")
+        if sm is not None and ct is not None:
+            _rep["bilstm_score"] = round(max(0.0, min(100.0, (sm + ct) / 2.0)), 2)
+
+    for _rep in merged_reps:
+        h = _rep.get("heuristic_score")
+        s = _rep.get("stgcn_score")
+        b = _rep.get("bilstm_score")
+        if h is not None and s is not None and b is not None:
+            _rep["neural_score"] = round((b + s + h) / 3.0, 2)
+            _rep["neural_score_raw"] = None
+
+    neural_scores = [r["neural_score"] for r in merged_reps if r["neural_score"] is not None]
+    bilstm_scores = [r["bilstm_score"] for r in merged_reps if r["bilstm_score"] is not None]
+    stgcn_scores = [r["stgcn_score"] for r in merged_reps if r["stgcn_score"] is not None]
+    any_corrections = any(r.get("anchor_correction_applied", False) for r in merged_reps)
 
     base_url = os.environ.get("API_PUBLIC_URL", "http://localhost:8000").rstrip("/")
     job_id = workspace_root.parent.name
