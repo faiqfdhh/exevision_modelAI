@@ -52,6 +52,7 @@ FACE_MODEL_PATH = os.environ.get("EXEVISION_FACE_MODEL_PATH", os.path.join('mode
 CREATE_VISUALIZATION = True
 CREATE_ANALYSIS_REPORT = True  # Generate detailed analysis report
 USE_GPU = False
+EXERCISE = "squat"
 
 
 def _build_paths(exercise: str):
@@ -758,6 +759,7 @@ def filter_unstable_landmarks(
     max_switch_rate=0.10,
     max_normalized_jerk=5.00,
     max_erratic_rate=1.0,
+    exercise=None,
 ):
     """
     Filters unstable landmarks across the full clip:
@@ -853,12 +855,24 @@ def filter_unstable_landmarks(
     filtered_img = img_np.copy()
     filtered_world = world_np.copy()
     unstable_idx = np.where(~stable_mask)[0]
-    body_unstable_idx = np.array([i for i in unstable_idx if i not in FACE_LANDMARK_INDICES])
+
+    if exercise == "seated_overhead_press":
+        upper_body_set = set(range(11, 25))
+        body_unstable_idx = np.array([i for i in unstable_idx if i in upper_body_set])
+    else:
+        body_unstable_idx = np.array([i for i in unstable_idx if i not in FACE_LANDMARK_INDICES])
+
     if body_unstable_idx.size > 0:
         filtered_img[:, body_unstable_idx, :] = 0.0
         filtered_world[:, body_unstable_idx, :] = 0.0
 
-    stable_indices = np.where(stable_mask)[0].tolist()
+    if exercise == "seated_overhead_press":
+        upper_body_set = set(range(11, 25))
+        stable_indices = [i for i in np.where(stable_mask)[0].tolist() if i in upper_body_set]
+        unstable_idx = np.array([i for i in unstable_idx if i in upper_body_set])
+    else:
+        stable_indices = np.where(stable_mask)[0].tolist()
+
     unstable_indices = unstable_idx.tolist()
 
     summary = {
@@ -965,7 +979,7 @@ def get_face_detector_options(use_gpu=True):
     )
 
 def find_video_path(video_id):
-    allowed_exts = {".mp4", ".mov", ".avi", ".mkv", ".flv"}
+    allowed_exts = {".mp4", ".mov", ".avi", ".mkv", ".flv", ".webm"}
     target_id = str(video_id)
 
     for root, dirs, files in os.walk(DATASET_ROOT):
@@ -1138,6 +1152,38 @@ def create_visualization_report(video_id, analysis, visibility_scores, key_joint
     
     return plot_path, report_path
 
+def _ensure_opencv_compatible(vid_path):
+    """Convert WebM/MKV to MP4 if OpenCV can't decode the file."""
+    cap = cv2.VideoCapture(vid_path)
+    if not cap.isOpened():
+        cap.release()
+        return _convert_to_mp4(vid_path)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret or frame is None or frame.size == 0:
+        return _convert_to_mp4(vid_path)
+    return vid_path
+
+
+def _convert_to_mp4(vid_path):
+    """Use ffmpeg to re-encode video as MP4 (libx264) for OpenCV compatibility."""
+    import subprocess as sp
+    stem = os.path.splitext(vid_path)[0]
+    out_path = stem + "_converted.mp4"
+    try:
+        sp.run(
+            ["ffmpeg", "-y", "-i", vid_path,
+             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+             "-an", out_path],
+            capture_output=True, text=True, timeout=120,
+        )
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            return out_path
+    except Exception:
+        pass
+    return vid_path
+
+
 def process_single_video(vid_path, mode="filtered"):
     try:
         vid_id = os.path.splitext(os.path.basename(vid_path))[0]
@@ -1145,9 +1191,12 @@ def process_single_video(vid_path, mode="filtered"):
         key_joint_indices = KEY_JOINT_INDICES
         key_joint_names = KEY_JOINT_NAMES
 
+        # WebM/format compatibility: convert if OpenCV can't decode
+        vid_path = _ensure_opencv_compatible(vid_path)
+
         cap = cv2.VideoCapture(vid_path)
         if not cap.isOpened():
-            return vid_path, "Failed to open video", None, None, None
+            return vid_path, "Error", "Failed to open video", None, None
 
         fps = cap.get(cv2.CAP_PROP_FPS)
         if fps <= 0:
@@ -1237,7 +1286,10 @@ def process_single_video(vid_path, mode="filtered"):
 
                         # Calculate detailed visibility metrics
                         visibilities = [lm.visibility for lm in detection_result.pose_landmarks[0]]
-                        overall_visibility = np.mean(visibilities)
+                        if EXERCISE == "seated_overhead_press":
+                            overall_visibility = np.mean(visibilities[11:25])
+                        else:
+                            overall_visibility = np.mean(visibilities)
 
                         # Key joints visibility (squat-specific)
                         key_visibilities = [visibilities[i] for i in key_joint_indices]
@@ -1350,12 +1402,14 @@ def process_single_video(vid_path, mode="filtered"):
                 max_switch_rate=LANDMARK_FILTER_SETTINGS['max_switch_rate'],
                 max_normalized_jerk=LANDMARK_FILTER_SETTINGS['max_normalized_jerk'],
                 max_erratic_rate=0.10,
+                exercise=EXERCISE,
             )
             stability_summary['planted_foot_recovery'] = planted_foot_summary
             print(
                 f"[{vid_id}] Stable landmarks: {stability_summary['stable_count']}/33, "
                 f"Discarded unstable: {stability_summary['unstable_count']}"
             )
+            print(f"[{vid_id}] Stable indices: {stability_summary['stable_indices']}")
 
             mandatory_chain_summary = evaluate_mandatory_chain_gate(
                 mandatory_chain_flags,
@@ -1397,9 +1451,10 @@ def process_single_video(vid_path, mode="filtered"):
             _save_skipped_video(vid_id, reason, mode=mode)
             return vid_id, "Skipped", reason, analysis, avg_overall
 
-        # Skip if any frame dips below 0.50 overall visibility
+        # Skip if any frame dips below threshold overall visibility
         min_overall = min(visibility_scores) if visibility_scores else 0.0
-        if min_overall < 0.50:
+        threshold = 0.30 if EXERCISE == "seated_overhead_press" else 0.50
+        if min_overall < threshold:
             cap.release()
             reason = f"Min overall {min_overall:.2f} dips below 0.50"
             _save_skipped_video(vid_id, reason, mode=mode)
@@ -1595,11 +1650,11 @@ def signal_handler(sig, frame):
 
 def _init_worker(dataset_root, output_root, viz_root, analysis_root, quality_folders,
                  create_viz, create_report, use_gpu, include_poor,
-                 seated_output_root, seated_viz_root):
+                 seated_output_root, seated_viz_root, exercise):
     """Initializer for multiprocessing Pool — propagates updated globals to each worker process."""
     global DATASET_ROOT, OUTPUT_ROOT, VISUALIZATION_OUTPUT_ROOT, ANALYSIS_OUTPUT_ROOT
     global QUALITY_FOLDERS, CREATE_VISUALIZATION, CREATE_ANALYSIS_REPORT, USE_GPU, INCLUDE_POOR
-    global SEATED_OHP_OUTPUT_ROOT, SEATED_OHP_VIZ_ROOT
+    global SEATED_OHP_OUTPUT_ROOT, SEATED_OHP_VIZ_ROOT, EXERCISE
     DATASET_ROOT = dataset_root
     OUTPUT_ROOT = output_root
     VISUALIZATION_OUTPUT_ROOT = viz_root
@@ -1611,6 +1666,7 @@ def _init_worker(dataset_root, output_root, viz_root, analysis_root, quality_fol
     INCLUDE_POOR = include_poor
     SEATED_OHP_OUTPUT_ROOT = seated_output_root
     SEATED_OHP_VIZ_ROOT = seated_viz_root
+    EXERCISE = exercise
 
 def run_extraction(mode="filtered", workers=None):
     # Register signal handler for Ctrl+C
@@ -1629,7 +1685,7 @@ def run_extraction(mode="filtered", workers=None):
     # Handle wildcard - find ALL videos
     if VIDEO_IDS == ["*"]:
         video_paths = []
-        video_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.flv')
+        video_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.flv', '.webm')
         
         for root, dirs, files in os.walk(DATASET_ROOT):
             for file in files:
@@ -1701,7 +1757,8 @@ def run_extraction(mode="filtered", workers=None):
                                   ANALYSIS_OUTPUT_ROOT, dict(QUALITY_FOLDERS),
                                   CREATE_VISUALIZATION, CREATE_ANALYSIS_REPORT,
                                   USE_GPU, INCLUDE_POOR,
-                                  SEATED_OHP_OUTPUT_ROOT, SEATED_OHP_VIZ_ROOT),
+                                  SEATED_OHP_OUTPUT_ROOT, SEATED_OHP_VIZ_ROOT,
+                                  EXERCISE),
                         maxtasksperchild=1)
             try:
                 results = list(tqdm(
@@ -1827,7 +1884,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Update paths based on exercise
-    paths = _build_paths(args.exercise)
+    EXERCISE = args.exercise
+    paths = _build_paths(EXERCISE)
     DATASET_ROOT = args.video_dir if args.video_dir else paths["dataset"]
     OUTPUT_ROOT = paths["output"]
     VISUALIZATION_OUTPUT_ROOT = paths["viz"]

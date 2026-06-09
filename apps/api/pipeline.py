@@ -1165,18 +1165,39 @@ def run_pipeline_sync(
         if not spec.script.exists():
             raise FileNotFoundError(f"Stage script not found: {spec.script}")
 
-        # Special handling for dual extraction: run both filtered and unfiltered
+        # Special handling for dual extraction: respect mode parameter
         if key == "extract_selected_features":
-            # Run filtered first — may produce no output for Poor quality videos (not a fatal error)
-            try:
-                _run_stage(key, spec.script, video_id, workspace_root, logs_root, "filtered", generate_viz, exercise)
-                logger.info("Stage extract_selected_features (filtered) completed.")
-            except RuntimeError as e:
-                logger.warning(f"Filtered extraction failed (likely Poor quality): {e}")
-            # Run unfiltered unconditionally — always produces output
-            _run_stage(key, spec.script, video_id, workspace_root, logs_root, "unfiltered", generate_viz, exercise)
-            logger.info("Stage extract_selected_features (unfiltered) completed.")
-            # Validate that at least one of the two produced the expected artifact
+            if mode == "unfiltered":
+                try:
+                    _run_stage(key, spec.script, video_id, workspace_root, logs_root, "unfiltered", generate_viz, exercise)
+                    logger.info("Stage extract_selected_features (unfiltered) completed.")
+                except RuntimeError as e:
+                    logger.warning(f"Unfiltered extraction failed: {e}")
+                    return {
+                        "video_id": video_id,
+                        "exercise": exercise,
+                        "extraction_failed": True,
+                        "extraction_failure_reason": "unfiltered_failed",
+                    }
+            else:
+                # Default: run filtered first (non-fatal), then unfiltered as safety net
+                try:
+                    _run_stage(key, spec.script, video_id, workspace_root, logs_root, "filtered", generate_viz, exercise)
+                    logger.info("Stage extract_selected_features (filtered) completed.")
+                except RuntimeError as e:
+                    logger.warning(f"Filtered extraction failed (likely Poor quality): {e}")
+                try:
+                    _run_stage(key, spec.script, video_id, workspace_root, logs_root, "unfiltered", generate_viz, exercise)
+                    logger.info("Stage extract_selected_features (unfiltered) completed.")
+                except RuntimeError as e:
+                    logger.warning(f"Unfiltered extraction also failed: {e}")
+                    return {
+                        "video_id": video_id,
+                        "exercise": exercise,
+                        "extraction_failed": True,
+                        "extraction_failure_reason": "both_filtered_and_unfiltered_failed",
+                    }
+            # Validate that at least one run produced the expected artifact
             try:
                 _validate_stage_output(key, workspace_root, video_id, exercise)
             except RuntimeError as exc:

@@ -444,7 +444,7 @@ def find_video_file(video_id: str, quality: Optional[str] = None, exercise: str 
             return annotated_path
 
     # 2. Search in custom directory if provided
-    video_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.flv')
+    video_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.flv', '.webm')
     
     if video_dir and os.path.exists(video_dir):
         for root, dirs, files in os.walk(video_dir):
