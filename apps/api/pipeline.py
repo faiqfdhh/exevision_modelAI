@@ -787,30 +787,12 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
             ct = nr.get("control")
             if sm is not None and ct is not None:
                 bilstm_score = round(max(0.0, min(100.0, (sm + ct) / 2.0 * 100.0)), 2)
-            # Compute ST-GCN score from spatial sub-score average (mirrors the
-            # ensemble-averaged sub-scores shown in the UI).  For squat depth,
-            # blend the ST-GCN head with the heuristic metric to avoid over-
-            # reliance on any single pipeline (same min-biased approach as
-            # aggregate_scores in neural_fusion_inference.py).
-            dp_raw = nr.get("depth")
+            # Compute ST-GCN score from spatial sub-score average, excluding
+            # depth (unreliable — see _segment_realtime knee_angles discussion).
             fl = nr.get("forward_lean")
             kt = nr.get("knee_tracking")
 
-            depth_scaled: float | None = None
-            if dp_raw is not None:
-                heuristic_depth = r.get("score", {}).get("metric_scores", {}).get("depth")
-                if heuristic_depth is not None and heuristic_depth > 0:
-                    lower = min(heuristic_depth, dp_raw * 100.0)
-                    higher = max(heuristic_depth, dp_raw * 100.0)
-                    depth_scaled = round(lower + (higher - lower) * 0.3, 1)
-                else:
-                    depth_scaled = round(dp_raw * 100.0, 1)
-                # Record blended depth (0-1 scale) for sub_scores dict
-                depth_for_subscore = round(depth_scaled / 100.0, 4)
-
             spatial_vals = [v * 100.0 for v in (fl, kt) if v is not None]
-            if depth_scaled is not None:
-                spatial_vals.append(depth_scaled)
 
             if not spatial_vals:
                 ef = nr.get("elbow_flare")
@@ -863,7 +845,6 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
             "sub_scores": {
                 "smoothness": nr.get("smoothness"),
                 "control": nr.get("control"),
-                "depth": locals().get("depth_for_subscore", nr.get("depth")),
                 "forward_lean": nr.get("forward_lean"),
                 "knee_tracking": nr.get("knee_tracking"),
                 "lockout": nr.get("lockout"),
@@ -895,7 +876,7 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
     
     # Convert sub_scores from 0-1 model-head range to 0-100 display range.
     # Error-probability heads (lockout, knee_error): sigmoid 0-1, higher=worse → (1-val)*100.
-    # Linear quality heads (smoothness, control, depth, forward_lean, knee_tracking, …):
+    # Linear quality heads (smoothness, control, forward_lean, knee_tracking, …):
     # 0-1 quality, higher=better → val*100, clamped to [0, 100].
     _ERROR_KEYS = ("lockout", "knee_error")
     _LINEAR_KEYS = (
@@ -1139,6 +1120,8 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
             logger.info(f"viz_dir exists: {viz_dir}, files: {[p.name for p in sorted(viz_dir.iterdir())]}")
             if viz_matches:
                 viz_file = viz_matches[0]
+                # Compress annotated video before upload (~80% quality, smaller storage)
+                viz_file = _compress_video(viz_file)
                 # Upload to Supabase (required for both local and production)
                 viz_path = _upload_visualization_to_supabase(viz_file, job_id)
                 if viz_path:

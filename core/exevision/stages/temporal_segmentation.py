@@ -1677,7 +1677,7 @@ class TemporalSegmenter:
         self.analyzer.control_signal = detector.signal
         self.analyzer.window_velocities = detector.velocity
         self.analyzer.velocity_signal = detector.raw_velocity
-        self.analyzer.knee_angles = None
+        self.analyzer.compute_knee_angles()
         self.analyzer.landmark_confidence = detector.landmark_confidence
         self.analyzer.torso_length = 0.0
         self.analyzer.femur_length = 0.0
@@ -1723,7 +1723,7 @@ class TemporalSegmenter:
                 "normalized_hip_displacement": detector.displacement.tolist(),
                 "window_velocity": detector.velocity.tolist(),
                 "raw_velocity": detector.raw_velocity.tolist(),
-                "knee_angles": [0.0] * self.frame_count,
+                "knee_angles": self.analyzer.knee_angles.tolist() if self.analyzer.knee_angles is not None else [0.0] * self.frame_count,
                 "landmark_confidence": detector.landmark_confidence.tolist(),
                 "elbow_angles_avg": [0.0] * self.frame_count,
                 "wrist_lr_diff_y": [0.0] * self.frame_count,
