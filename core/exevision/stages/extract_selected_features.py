@@ -1452,10 +1452,41 @@ def process_single_video(vid_path, mode="filtered"):
             _save_skipped_video(vid_id, reason, mode=mode)
             return vid_id, "Skipped", reason, analysis, avg_overall
 
-        # Skip only if sustained poor visibility in the exercise portion
-        # (trim last 10 frames to allow walk-away; require 3+ consecutive bad frames)
-        threshold = 0.30 if EXERCISE == "seated_overhead_press" else 0.50
-        trimmed = visibility_scores[:-10] if len(visibility_scores) > 10 else visibility_scores
+        # Walk-away detection: if the longest bad-visibility run ends at the
+        # video tail it's the person walking away after exercise — trim it out.
+        threshold = 0.30
+        total_frames = len(visibility_scores)
+
+        full_max_consecutive = 0
+        full_current_run = 0
+        full_run_start = None
+        full_longest_start = None
+        full_longest_end = None
+        for i, v in enumerate(visibility_scores):
+            if v < threshold:
+                if full_current_run == 0:
+                    full_run_start = i
+                full_current_run += 1
+                if full_current_run > full_max_consecutive:
+                    full_max_consecutive = full_current_run
+                    full_longest_start = full_run_start
+                    full_longest_end = i
+            else:
+                full_current_run = 0
+
+        is_walk_away = (
+            full_max_consecutive >= 3
+            and full_longest_end is not None
+            and full_longest_end >= total_frames - 5
+            and full_longest_start is not None
+            and full_longest_start > total_frames * 0.3
+            and full_longest_start > 0
+        )
+
+        if is_walk_away:
+            trimmed = visibility_scores[:full_longest_start]
+        else:
+            trimmed = visibility_scores[:-70] if total_frames > 70 else visibility_scores
 
         max_consecutive = 0
         current_run = 0
