@@ -108,7 +108,7 @@ class FeedbackItemBuilder:
     @staticmethod
     def get_category_for_metric(metric_name: str) -> Literal["spatial", "temporal", "geometric"]:
         """Classify metric into category for frontend filtering."""
-        spatial_metrics = {"hip_depth", "depth", "knee_tracking", "elbow_flare", "grip_ratio", "rom_top", "rom_bottom", "lockout", "knee_error"}
+        spatial_metrics = {"depth", "knee_tracking", "elbow_flare", "grip_ratio", "rom_top", "rom_bottom", "lockout", "knee_error"}
         temporal_metrics = {"smoothness", "control"}
         
         if metric_name in spatial_metrics:

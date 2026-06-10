@@ -194,7 +194,7 @@ def _prepare_workspace(workspace_root: Path, video_path: Path, exercise: str = "
     shutil.copy2(video_path, dest)
 
 
-def _build_stage_cmd(key: str, script: Path, video_id: str, mode: str, generate_viz: bool = True, exercise: str = "squat", rep_boundaries_path: str | None = None) -> list[str]:
+def _build_stage_cmd(key: str, script: Path, video_id: str, mode: str, generate_viz: bool = True, exercise: str = "squat", rep_boundaries_path: str | None = None, legacy_fsm: bool = False) -> list[str]:
     """Build the subprocess command for a stage, mirroring app.py arg construction.
 
     API runs skip all visualization outputs (--no-report) by default.
@@ -213,6 +213,8 @@ def _build_stage_cmd(key: str, script: Path, video_id: str, mode: str, generate_
             cmd.extend(["--rep-boundaries", rep_boundaries_path])
         if not generate_viz:
             cmd.append("--no-viz")
+        if legacy_fsm:
+            cmd.append("--legacy-fsm")
         return cmd
     elif key == "classify_views":
         return base + ["--video-id", video_id] + exercise_args
@@ -242,9 +244,10 @@ def _run_stage(
     generate_viz: bool = True,
     exercise: str = "squat",
     rep_boundaries_path: str | None = None,
+    legacy_fsm: bool = False,
 ) -> str:
     """Run one pipeline stage; returns captured stdout+stderr."""
-    cmd = _build_stage_cmd(key, script, video_id, mode, generate_viz, exercise, rep_boundaries_path)
+    cmd = _build_stage_cmd(key, script, video_id, mode, generate_viz, exercise, rep_boundaries_path, legacy_fsm=legacy_fsm)
     env = os.environ.copy()
     env["EXEVISION_MODEL_PATH"] = str(SHARED_MODEL_PATH)
     env["EXEVISION_FACE_MODEL_PATH"] = str(SHARED_FACE_MODEL_PATH)
@@ -821,7 +824,6 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
             "sub_scores": {
                 "smoothness": nr.get("smoothness"),
                 "control": nr.get("control"),
-                "depth": nr.get("depth"),
                 "forward_lean": nr.get("forward_lean"),
                 "knee_tracking": nr.get("knee_tracking"),
                 "lockout": nr.get("lockout"),
@@ -857,7 +859,7 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
     # 0-1 quality, higher=better → val*100, clamped to [0, 100].
     _ERROR_KEYS = ("lockout", "knee_error")
     _LINEAR_KEYS = (
-        "smoothness", "control", "depth", "forward_lean",
+        "smoothness", "control", "forward_lean",
         "knee_tracking", "elbow_flare", "grip_ratio",
         "rom_top", "rom_bottom",
     )
@@ -874,6 +876,24 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
             if _v is not None:
                 _sub[_k] = round(max(0.0, min(100.0, _v * 100.0)), 1)
         _smooth_relax(_sub)
+
+    # Merge ST-GCN sub_scores with heuristic metric_scores (squat only).
+    # Heuristic gets 60% weight, ST-GCN gets 40%.
+    for _rep in merged_reps:
+        _sub = _rep.get("sub_scores")
+        _ms = _rep.get("metric_scores")
+        if _sub is None or _ms is None:
+            continue
+        # forward_lean: heuristic forward_lean vs ST-GCN forward_lean
+        h_fl = _ms.get("forward_lean")
+        n_fl = _sub.get("forward_lean")
+        if h_fl is not None and n_fl is not None:
+            _sub["forward_lean"] = round(h_fl * 0.6 + n_fl * 0.4, 1)
+        # knee_tracking: heuristic knee_valgus vs ST-GCN knee_tracking
+        h_kv = _ms.get("knee_valgus")
+        n_kt = _sub.get("knee_tracking")
+        if h_kv is not None and n_kt is not None:
+            _sub["knee_tracking"] = round(h_kv * 0.6 + n_kt * 0.4, 1)
 
     # Recompute per-rep bilstm_score from relaxed sub-scores
     for _rep in merged_reps:
@@ -912,7 +932,6 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
 
                 normalized_sub_scores: dict[str, float | None] = {
                     "forward_lean": sub_scores.get("forward_lean"),
-                    "hip_depth": sub_scores.get("depth"),
                     "knee_tracking": sub_scores.get("knee_tracking"),
                     "knee_valgus": None,
                     "smoothness": sub_scores.get("smoothness"),
@@ -928,8 +947,6 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
                 metric_scores = rep.get("metric_scores") or {}
                 if normalized_sub_scores.get("forward_lean") is None:
                     normalized_sub_scores["forward_lean"] = metric_scores.get("forward_lean_deg")
-                if normalized_sub_scores.get("hip_depth") is None:
-                    normalized_sub_scores["hip_depth"] = metric_scores.get("squat_depth")
                 if normalized_sub_scores.get("knee_tracking") is None:
                     normalized_sub_scores["knee_tracking"] = metric_scores.get("knee_tracking_ratio")
                 if normalized_sub_scores.get("knee_valgus") is None:

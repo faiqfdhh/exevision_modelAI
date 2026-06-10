@@ -27,16 +27,12 @@
   "severity_band": 5,
   "issue_groups": {
     "descent_quality": {
-      "metrics": ["forward_lean", "hip_depth"],
+      "metrics": ["forward_lean"],
       "label": "descent quality",
       "single_cues": {
         "forward_lean": {
           "needs_work": "Work on keeping your torso more upright.",
           "focus_here": "Your forward lean needs serious attention - stay upright throughout the movement."
-        },
-        "hip_depth": {
-          "needs_work": "Work on getting lower - aim for parallel or below.",
-          "focus_here": "Hip depth is insufficient - you need to go significantly deeper."
         }
       },
       "combined_cue": {
@@ -97,7 +93,6 @@
   },
   "field_mapping": {
     "metrics_to_feedback": {
-      "squat_depth": "hip_depth",
       "forward_lean_deg": "forward_lean",
       "knee_valgus_ratio": "knee_valgus",
       "knee_tracking_ratio": "knee_tracking"

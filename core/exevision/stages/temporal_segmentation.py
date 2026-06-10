@@ -1282,6 +1282,194 @@ class SquatStateMachine:
         return phase_names.get(phase_id, "unknown")
 
 
+class RealtimePhaseDetector:
+    """
+    Webcam-like hysteresis-based phase detector.
+    Mirrors the realtime PhaseDetector from heuristic/phase-detector.ts.
+    Uses simple windowed velocity, forward-fill NaN, hysteresis consensus.
+    No knee-angle gates, no Savitzky-Golay smoothing, no blended velocity.
+    """
+
+    PHASE_NAMES: Dict[int, str] = {
+        SquatPhase.IDLE.value: "idle",
+        SquatPhase.ECCENTRIC.value: "eccentric",
+        SquatPhase.ISOMETRIC.value: "isometric",
+        SquatPhase.CONCENTRIC.value: "concentric",
+        SquatPhase.UNKNOWN.value: "unknown",
+    }
+
+    def __init__(self, frames: list, fps: float = 30.0, exercise: str = "squat"):
+        self.frames = frames
+        self.fps = fps
+        self.exercise = exercise
+        self._is_ohp = exercise.lower() in ("overhead_press", "standing_overhead_press", "seated_overhead_press")
+
+        # Config (set before calibration & signal processing)
+        self.warmup = CALIBRATION_FRAMES
+        self.lockout_frames = PHASE_LOCKOUT_FRAMES
+        self.idle_disp_threshold = IDLE_RETURN_MARGIN
+        self.pos_thresh = DOWNWARD_VELOCITY_THRESHOLD
+        self.neg_thresh = UPWARD_VELOCITY_THRESHOLD
+        self.zero_thresh = VELOCITY_IDLE_THRESHOLD
+
+        if self._is_ohp:
+            self.hysteresis = 5
+        else:
+            self.hysteresis = HYSTERESIS_FRAMES
+
+        # Extract and forward-fill control signal
+        self.raw_signal = _get_control_signal(frames, exercise)
+        self.signal = self._forward_fill(self.raw_signal)
+
+        # Calibrate baseline from warmup frames
+        self._calibrate()
+
+        # Displacement from baseline
+        self.displacement = self.signal - self.baseline
+
+        # Windowed velocity (mean of pairwise diffs)
+        self.velocity = self._windowed_velocity(ANALYSIS_WINDOW_SIZE)
+        self.raw_velocity = self._raw_velocity()
+
+        # FSM state
+        self.transition_log: List[dict] = []
+        self.phase_labels: Optional[np.ndarray] = None
+
+        # Landmark confidence
+        self.landmark_confidence = self._compute_landmark_confidence()
+
+    def _compute_landmark_confidence(self) -> np.ndarray:
+        confs = []
+        for frame in self.frames:
+            if frame is None:
+                confs.append(0.0)
+                continue
+            if self._is_ohp:
+                if len(frame) > R_WRIST:
+                    l_conf = frame[L_WRIST][3] if len(frame) > L_WRIST else 0
+                    r_conf = frame[R_WRIST][3] if len(frame) > R_WRIST else 0
+                    confs.append((l_conf + r_conf) / 2)
+                else:
+                    confs.append(0.0)
+            else:
+                if len(frame) > R_HIP:
+                    l_conf = frame[L_HIP][3] if len(frame) > L_HIP else 0
+                    r_conf = frame[R_HIP][3] if len(frame) > R_HIP else 0
+                    confs.append((l_conf + r_conf) / 2)
+                else:
+                    confs.append(0.0)
+        return np.array(confs)
+
+    def _forward_fill(self, arr: np.ndarray) -> np.ndarray:
+        last = 0.5
+        result = np.copy(arr)
+        for i in range(len(result)):
+            if np.isnan(result[i]):
+                result[i] = last
+            else:
+                last = result[i]
+        return result
+
+    def _calibrate(self) -> None:
+        warmup = self.signal[:self.warmup]
+        valid = warmup[~np.isnan(warmup)]
+        if len(valid) < MIN_VALID_CALIBRATION_FRAMES:
+            valid = self.signal[~np.isnan(self.signal)]
+        if len(valid) == 0:
+            self.baseline = 0.0
+            return
+        if self._is_ohp:
+            self.baseline = float(np.percentile(valid, 75))
+        else:
+            self.baseline = float(np.percentile(valid, 25))
+
+    def _windowed_velocity(self, window: int = 15) -> np.ndarray:
+        disp = self.displacement
+        n = len(disp)
+        vel = np.zeros(n, dtype=np.float64)
+        for i in range(1, n):
+            start = max(0, i - window + 1)
+            diffs = [disp[j] - disp[j - 1] for j in range(start + 1, i + 1)]
+            vel[i] = sum(diffs) / len(diffs) if diffs else 0.0
+        return vel
+
+    def _raw_velocity(self) -> np.ndarray:
+        vel = np.zeros_like(self.displacement)
+        vel[1:] = np.diff(self.displacement)
+        return vel
+
+    def _velocity_to_phase(self, vel: float, disp: float) -> Optional[SquatPhase]:
+        if abs(vel) <= self.zero_thresh / 3.0:
+            if abs(disp) >= self.idle_disp_threshold:
+                return SquatPhase.ISOMETRIC
+            return SquatPhase.IDLE
+
+        if self._is_ohp:
+            if vel > self.pos_thresh:
+                return SquatPhase.CONCENTRIC
+            if vel < self.neg_thresh:
+                return SquatPhase.ECCENTRIC
+        else:
+            if vel > self.pos_thresh:
+                return SquatPhase.ECCENTRIC
+            if vel < self.neg_thresh:
+                return SquatPhase.CONCENTRIC
+
+        return None
+
+    def _is_valid_transition(self, from_phase: SquatPhase, to_phase: SquatPhase) -> bool:
+        valid = OHP_VALID_TRANSITIONS if self._is_ohp else VALID_TRANSITIONS
+        return to_phase in valid.get(from_phase, [from_phase])
+
+    def detect_phases(self) -> np.ndarray:
+        n = len(self.signal)
+        phase_ids = np.full(n, SquatPhase.IDLE.value, dtype=np.int32)
+
+        current = SquatPhase.IDLE
+        hyst_state = SquatPhase.IDLE
+        hyst_count = 0
+        lockout = 0
+
+        for i in range(n):
+            vel = self.velocity[i]
+            disp = self.displacement[i]
+
+            candidate = self._velocity_to_phase(vel, disp)
+            if candidate is None:
+                phase_ids[i] = current.value
+                if lockout > 0:
+                    lockout -= 1
+                continue
+
+            if candidate == hyst_state:
+                hyst_count += 1
+            else:
+                hyst_state = candidate
+                hyst_count = 1
+
+            if hyst_count >= self.hysteresis and lockout <= 0 and candidate != current and self._is_valid_transition(current, candidate):
+                self.transition_log.append({
+                    "frame": int(i),
+                    "from": self.get_phase_name(current.value),
+                    "to": self.get_phase_name(candidate.value),
+                    "reason": f"hysteresis ({self.hysteresis} frames)"
+                })
+                current = candidate
+                hyst_count = 0
+                lockout = self.lockout_frames
+
+            phase_ids[i] = current.value
+
+            if lockout > 0:
+                lockout -= 1
+
+        self.phase_labels = phase_ids
+        return phase_ids
+
+    def get_phase_name(self, phase_id: int) -> str:
+        return self.PHASE_NAMES.get(int(phase_id), "unknown")
+
+
 class TemporalSegmenter:
     """
     Advanced temporal segmentation with biomechanical rigor.
@@ -1296,7 +1484,7 @@ class TemporalSegmenter:
     5. Repetition detection and validation
     """
     
-    def __init__(self, keypoints_data: dict, video_id: str, exercise: str = "squat", rep_boundaries: Optional[List[Dict]] = None):
+    def __init__(self, keypoints_data: dict, video_id: str, exercise: str = "squat", rep_boundaries: Optional[List[Dict]] = None, realtime_mode: bool = True):
         self.video_id = video_id
         self.exercise = exercise
         self.keypoints = keypoints_data.get('keypoints_img', [])
@@ -1314,6 +1502,7 @@ class TemporalSegmenter:
         self.state_machine = None
         self.phase_labels = None
         self.rep_boundaries = rep_boundaries
+        self.realtime_mode = realtime_mode
 
     
     def _validate_view(self) -> bool:
@@ -1326,6 +1515,9 @@ class TemporalSegmenter:
     
     def segment(self) -> dict:
         """Main segmentation pipeline with comprehensive error handling"""
+        if self.realtime_mode:
+            return self._segment_realtime()
+
         try:
             # Step 0: View validation
             if not self.view_valid:
@@ -1461,7 +1653,116 @@ class TemporalSegmenter:
                 "error": str(e),
                 "traceback": traceback.format_exc()
             }
-    
+
+    def _segment_realtime(self) -> dict:
+        """Fast segmentation using webcam-like hysteresis FSM (realtime_mode)."""
+        if not self.view_valid:
+            return {
+                "video_id": self.video_id,
+                "error": f"Unreliable view: {self.view}",
+                "info": {
+                    "fps": float(self.fps),
+                    "frame_count": int(self.frame_count),
+                    "quality_rating": self.quality_rating,
+                    "view": self.view,
+                    "view_reliable": False
+                }
+            }
+
+        detector = RealtimePhaseDetector(self.keypoints, self.fps, self.exercise)
+        self.phase_labels = detector.detect_phases()
+        self.state_machine = detector
+
+        self.analyzer.normalized_hip_displacement = detector.displacement
+        self.analyzer.control_signal = detector.signal
+        self.analyzer.window_velocities = detector.velocity
+        self.analyzer.velocity_signal = detector.raw_velocity
+        self.analyzer.knee_angles = None
+        self.analyzer.landmark_confidence = detector.landmark_confidence
+        self.analyzer.torso_length = 0.0
+        self.analyzer.femur_length = 0.0
+        self.analyzer.tibia_length = 0.0
+        self.analyzer.standing_hip_height = 0.0
+        self.analyzer.body_scale = 1.0
+
+        reps = self._detect_repetitions_phase_only()
+
+        phase_names_list = [detector.get_phase_name(int(p)) for p in self.phase_labels]
+
+        result = {
+            "video_id": self.video_id,
+            "info": {
+                "fps": float(self.fps),
+                "frame_count": int(self.frame_count),
+                "quality_rating": self.quality_rating,
+                "view": self.view,
+                "view_reliable": self.view.lower() in RELIABLE_VIEWS,
+                "total_reps": len(reps),
+                "calibration": {
+                    "torso_length": 0.0,
+                    "femur_length": 0.0,
+                    "tibia_length": 0.0,
+                    "standing_hip_height": 0.0,
+                    "body_scale": 1.0,
+                    "calibration_success": True
+                },
+                "analysis_params": {
+                    "window_size": ANALYSIS_WINDOW_SIZE,
+                    "min_phase_duration": MIN_PHASE_DURATION_FRAMES,
+                    "hysteresis_frames": detector.hysteresis,
+                    "velocity_idle_threshold": VELOCITY_IDLE_THRESHOLD,
+                    "velocity_moving_threshold": VELOCITY_MOVING_THRESHOLD,
+                    "strict_phase_sequence": "hysteresis-based (webcam realtime FSM)",
+                    "illegal_transition_repairs": 0
+                }
+            },
+            "frame_phases": phase_names_list,
+            "repetitions": [r.to_dict() for r in reps],
+            "transition_log": detector.transition_log,
+            "signals": {
+                "normalized_hip_displacement": detector.displacement.tolist(),
+                "window_velocity": detector.velocity.tolist(),
+                "raw_velocity": detector.raw_velocity.tolist(),
+                "knee_angles": [0.0] * self.frame_count,
+                "landmark_confidence": detector.landmark_confidence.tolist(),
+                "elbow_angles_avg": [0.0] * self.frame_count,
+                "wrist_lr_diff_y": [0.0] * self.frame_count,
+                "shoulder_lr_diff_y": [0.0] * self.frame_count,
+                "wrist_acceleration": [0.0] * self.frame_count,
+            }
+        }
+
+        if _debug_enabled():
+            debug_log = {
+                "video_id": self.video_id,
+                "exercise": self.exercise,
+                "frame_count": self.frame_count,
+                "fps": float(self.fps),
+                "control_signal_range": (
+                    float(np.nanmin(detector.displacement)),
+                    float(np.nanmax(detector.displacement))
+                ),
+                "reps": []
+            }
+            for rep in reps:
+                debug_log["reps"].append({
+                    "rep_id": rep.rep_id,
+                    "start_frame": rep.start_frame,
+                    "end_frame": rep.end_frame,
+                    "duration_frames": rep.end_frame - rep.start_frame + 1,
+                    "control_signal_max": float(rep.squat_depth_normalized),
+                    "phase_sequence": [p.phase_type for p in rep.phases],
+                    "accepted": True,
+                    "reasons": [
+                        f"Phase sequence: {' -> '.join([p.phase_type for p in rep.phases])}",
+                        f"Max displacement: {rep.squat_depth_normalized:.4f}",
+                        f"Duration: {rep.end_frame - rep.start_frame + 1} frames"
+                    ]
+                })
+            result["debug_log"] = debug_log
+
+        return convert_to_serializable(result)
+
     def _reps_from_boundaries(self) -> List[Repetition]:
         """Convert browser-captured rep boundaries (seconds relative to recording start)
         to Repetition objects using FSM phase labels for per-rep phase breakdown.
@@ -2027,7 +2328,7 @@ class TemporalSegmenter:
         return phases
 
 
-def process_video(json_path: str, exercise: str = "squat", rep_boundaries_path: Optional[str] = None) -> Tuple[str, str, Optional[dict], Optional[str]]:
+def process_video(json_path: str, exercise: str = "squat", rep_boundaries_path: Optional[str] = None, realtime_mode: bool = True) -> Tuple[str, str, Optional[dict], Optional[str]]:
     """Process a single video's keypoints with exercise-specific segmentation. Returns (video_id, status, result, quality)"""
     video_id = os.path.splitext(os.path.basename(json_path))[0]
     
@@ -2045,7 +2346,7 @@ def process_video(json_path: str, exercise: str = "squat", rep_boundaries_path: 
         with open(json_path, 'r') as f:
             data = json.load(f)
         
-        segmenter = TemporalSegmenter(data, video_id, exercise=exercise, rep_boundaries=rep_boundaries)
+        segmenter = TemporalSegmenter(data, video_id, exercise=exercise, rep_boundaries=rep_boundaries, realtime_mode=realtime_mode)
         result = segmenter.segment()
         
         quality = result.get("info", {}).get("quality_rating", "unknown").lower()
@@ -2203,7 +2504,7 @@ def create_segmentation_visualization(video_id: str, seg_data: dict, quality: st
         return False
 
 
-def run_segmentation(quality_filter=None, create_visualization=True, exercise="squat", video_dir=None, rep_boundaries_path=None):
+def run_segmentation(quality_filter=None, create_visualization=True, exercise="squat", video_dir=None, rep_boundaries_path=None, realtime_mode=True):
     """
     Process all extracted features and segment into reps using biomechanical analysis.
     
@@ -2289,7 +2590,7 @@ def run_segmentation(quality_filter=None, create_visualization=True, exercise="s
         video_id = os.path.splitext(os.path.basename(json_path))[0]
         print(f"\n▶ [{idx}/{len(json_files)}] Segmenting {video_id}...", flush=True)
 
-        video_id, status, result, quality = process_video(json_path, exercise=exercise, rep_boundaries_path=rep_boundaries_path)
+        video_id, status, result, quality = process_video(json_path, exercise=exercise, rep_boundaries_path=rep_boundaries_path, realtime_mode=realtime_mode)
         source_quality = quality_mapping.get(json_path, quality)
         
         if status == "Success" and result and "error" not in result:
@@ -2427,6 +2728,7 @@ if __name__ == "__main__":
     parser.add_argument("--video-dir", help="Path to custom video directory (searches recursively)")
     parser.add_argument("--debug-phases", action="store_true", help="Enable phase detection debug output (outputs to {exercise}/debug_phases/)")
     parser.add_argument("--rep-boundaries", help="Path to JSON file with browser-captured rep boundaries (list of {start_s, end_s})")
+    parser.add_argument("--legacy-fsm", action="store_true", help="Use legacy FSM (knee-angle gates, SavGol smoothing) instead of default realtime webcam-like FSM")
     args = parser.parse_args()
     
     # Enable debug mode if requested
@@ -2456,4 +2758,4 @@ if __name__ == "__main__":
     if rep_boundaries_path:
         print(f"ℹ️  Browser-captured rep boundaries loaded from: {rep_boundaries_path}")
 
-    run_segmentation(quality_filter=args.quality, create_visualization=create_viz, exercise=args.exercise, video_dir=args.video_dir, rep_boundaries_path=rep_boundaries_path)
+    run_segmentation(quality_filter=args.quality, create_visualization=create_viz, exercise=args.exercise, video_dir=args.video_dir, rep_boundaries_path=rep_boundaries_path, realtime_mode=not args.legacy_fsm)
