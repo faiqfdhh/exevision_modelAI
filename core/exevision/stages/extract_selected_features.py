@@ -7,6 +7,7 @@ os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 os.environ['OPENCV_FFMPEG_LOGLEVEL'] = 'quiet'
 
 import json
+import statistics
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -1451,14 +1452,60 @@ def process_single_video(vid_path, mode="filtered"):
             _save_skipped_video(vid_id, reason, mode=mode)
             return vid_id, "Skipped", reason, analysis, avg_overall
 
-        # Skip if any frame dips below threshold overall visibility
-        min_overall = min(visibility_scores) if visibility_scores else 0.0
+        # Skip only if sustained poor visibility in the exercise portion
+        # (trim last 10 frames to allow walk-away; require 3+ consecutive bad frames)
         threshold = 0.30 if EXERCISE == "seated_overhead_press" else 0.50
-        if min_overall < threshold:
+        trimmed = visibility_scores[:-10] if len(visibility_scores) > 10 else visibility_scores
+
+        max_consecutive = 0
+        current_run = 0
+        run_start = None
+        longest_run_start = None
+        for i, v in enumerate(trimmed):
+            if v < threshold:
+                if current_run == 0:
+                    run_start = i
+                current_run += 1
+                if current_run > max_consecutive:
+                    max_consecutive = current_run
+                    longest_run_start = run_start
+            else:
+                current_run = 0
+
+        if max_consecutive >= 3:
+            # --- Diagnostic logging ---
+            bad_indices = [i for i, v in enumerate(visibility_scores) if v < threshold]
+            bad_details = []
+            for idx in bad_indices[:5]:
+                fm = frame_metrics[idx] if idx < len(frame_metrics) else {}
+                is_miss = visibility_scores[idx] == 0.0 and fm.get("worst_joint") == "None"
+                bad_details.append({
+                    "frame": idx,
+                    "overall": visibility_scores[idx],
+                    "type": "mediapipe_miss" if is_miss else "low_visibility",
+                })
+            total = len(visibility_scores)
+            below = len(bad_indices)
+            min_overall = min(trimmed) if trimmed else 0.0
+            print(
+                f"[{vid_id}] ❌ SUSTAINED POOR VISIBILITY: max_consecutive={max_consecutive} (>=3), "
+                f"threshold={threshold}, total_frames={total}, "
+                f"trimmed_tail={len(visibility_scores) - len(trimmed)}, "
+                f"frames_below_threshold={below} ({below/total:.1%}), "
+                f"mean={np.mean(visibility_scores):.3f}, p10={np.percentile(visibility_scores, 10):.3f}"
+            )
+            print(f"[{vid_id}] Longest bad run: start_frame={longest_run_start} ({max_consecutive} frames)")
+            print(f"[{vid_id}] Bad frames ({len(bad_indices)} total): first_5={bad_details}")
+            # --- End diagnostic logging ---
             cap.release()
-            reason = f"Min overall {min_overall:.2f} dips below 0.50"
+            reason = f"Sustained poor visibility: {max_consecutive} consecutive bad frames (threshold={threshold})"
             _save_skipped_video(vid_id, reason, mode=mode)
             return vid_id, "Skipped", reason, analysis, avg_overall
+        elif bad_count := sum(1 for v in trimmed if v < threshold):
+            print(
+                f"[{vid_id}] ⚠️  {bad_count} bad frame(s) below {threshold} "
+                f"(max {max_consecutive} consecutive, <3) — accepting"
+            )
 
         # Skip poor videos unless --include-poor is set; always skip truly undetectable ones
         if quality_rating == 'Poor':

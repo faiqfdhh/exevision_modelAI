@@ -26,14 +26,16 @@ _HUMAN_TEMPLATE = (
 )
 
 _SESSION_SYSTEM_PROMPT = (
-    "You are an expert exercise coach reviewing a complete workout session. "
-    "You will receive structured per-rep data: each rep's overall score, tier, "
-    "sub-metric scores, and detected issues/wins. Write a single cohesive "
-    "'Coach's Notes' summary (3-5 sentences) that:\n"
-    "1. Identifies concrete trends across reps (a metric improving or declining, "
-    "a recurring issue) and references actual metric names and values from the data.\n"
-    "2. Ends with 1-2 specific, actionable recommendations for the next session.\n"
-    "Do NOT invent data not present in the input. Be direct, specific, and encouraging."
+    "You are an expert exercise coach writing concise 'Coach's Notes'. "
+    "Rules:\n"
+    "1. Address the athlete directly as \"you\".\n"
+    "2. Describe metrics qualitatively (e.g. \"needs work\", \"well below par\", "
+    "\"on track\", \"lagging behind\") — do NOT use exact numbers or scores.\n"
+    "3. Keep it to 2-3 short sentences. No filler, no preamble.\n"
+    "4. End with one natural-sounding recommendation for next session — "
+    "write it as a coach would speak, not as a labeled \"cue\".\n"
+    "5. Do NOT invent data. Do NOT add information not in the input.\n"
+    "6. Be direct. No motivational fluff (\"Great start\", \"solid foundation\")."
 )
 
 _SESSION_HUMAN_TEMPLATE = (
@@ -73,7 +75,7 @@ class LLMFeedbackEnhancer:
         from langchain_core.prompts import ChatPromptTemplate
         from langchain_core.output_parsers import StrOutputParser
 
-        llm = ChatDeepSeek(model=model, temperature=0.7, api_key=api_key)
+        llm = ChatDeepSeek(model=model, temperature=0, api_key=api_key)
         prompt = ChatPromptTemplate.from_messages([
             ("system", _SYSTEM_PROMPT),
             ("human", _HUMAN_TEMPLATE),
@@ -94,13 +96,15 @@ class LLMFeedbackEnhancer:
             if item.get("type") == "issue" and item.get("metric_key")
         ]
         try:
-            return self.chain.invoke({
+            text = self.chain.invoke({
                 "exercise": exercise,
                 "score": int(rep.score),
                 "tier": rep.tier,
                 "issues": ", ".join(issues) if issues else "none",
                 "template_text": rep.text,
             })
+            print("[DIAGNOSTIC] LLM successfully enhanced feedback for rep %d" % rep.rep_id, flush=True)
+            return text
         except Exception as exc:
             logger.warning("LLM enhance_rep failed for rep %d: %s", rep.rep_id, exc)
             return rep.text
@@ -124,6 +128,7 @@ class LLMFeedbackEnhancer:
                 "trajectory": result.session.trajectory,
                 "session_digest": json.dumps(result.session.session_digest),
             })
+            print("[DIAGNOSTIC] LLM successfully enhanced session coach_text", flush=True)
             new_session = dataclasses.replace(result.session, coach_text=new_coach_text)
             return dataclasses.replace(result, session=new_session)
         except Exception as exc:

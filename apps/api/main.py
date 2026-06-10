@@ -24,7 +24,8 @@ Usage
 
 from __future__ import annotations
 from dotenv import load_dotenv
-load_dotenv()  # Load .env.local and .env
+load_dotenv()                    # .env (shared/base config)
+load_dotenv(".env.local", override=True)  # .env.local overrides .env
 import logging
 import sys
 from pathlib import Path

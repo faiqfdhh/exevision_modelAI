@@ -910,7 +910,7 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
             print(f"[DIAGNOSTIC] Built feedback_input for {len(feedback_input)} reps. Calling generate_feedback...", flush=True)
             feedback_result = feedback_engine.generate_feedback(feedback_input, video_id=video_id)
             # LLM feedback enhancement — non-fatal, feature-flagged via DEEPSEEK_API_KEY
-            _deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+            _deepseek_key = os.environ.get("DEEPSEEK_API_KEY")
             if _deepseek_key:
                 try:
                     from core.exevision.feedback.llm_enhancer import LLMFeedbackEnhancer
@@ -927,6 +927,8 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
                         print("[DIAGNOSTIC] LLM session enhancement applied", flush=True)
                 except Exception as _llm_session_exc:
                     logger.warning("LLM session enhancement failed, returning template-based coach_text: %s", _llm_session_exc)
+            else:
+                print("[DIAGNOSTIC] DEEPSEEK_API_KEY not set — using template-based feedback (no LLM enhancement)", flush=True)
             print(f"[DIAGNOSTIC] generate_feedback returned successfully with {len(feedback_result.reps)} reps", flush=True)
             feedback_payload = {
                 "schema_version": "2.0",

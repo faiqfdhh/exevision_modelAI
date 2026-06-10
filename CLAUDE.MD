@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-_Last updated: 2026-06-08 (OHP 5-seed ensemble → production) — See [CHANGELOG.md](CHANGELOG.md) for full session history._
+_Last updated: 2026-06-10 (Squat 5-seed ensemble + GBM meta-learner mirror) — See [CHANGELOG.md](CHANGELOG.md) for full session history._
 
 ---
 
@@ -120,6 +120,35 @@ $py = ".\.venv\Scripts\python.exe"
     --output-dir      models\runtime_neural_ohp\ --final
 ```
 
+### Squat Training (5-seed ensemble + GBM meta-learner — Session 2026-06-10)
+
+**Mirrors OHP's proven ensemble+GBM architecture.** Squat uses 424 labeled reps (2.5× OHP's 165) with 14-feature GBM vector (vs OHP's 17). Same seed set {42,7,19,3,99}. Safety clamps re-applied as monotone cap after GBM — GBM provides accuracy, clamps ensure egregious form violations still cap scores.
+
+```powershell
+$py = ".\.venv\Scripts\python.exe"
+$ann = "training_dataset\squat_annotations"
+# 1. Train 5 ensemble seeds (bilstm_finetuned_seed*.pt / stgcn_finetuned_seed*.pt / fusion_layer_seed*.pt)
+foreach ($s in 42,7,19,3,99) {
+  & $py core\exevision\training\squat\finetune_models.py `
+      --index-json $ann\index.json --splits-json training_dataset\splits.json `
+      --seed $s --suffix "_seed$s" --run-phase4
+}
+# 2. Ensemble eval (baseline quality_mae/pearson)
+& $py core\exevision\training\squat\evaluate_squat_ensemble.py `
+    --annotation-dir $ann --model-dir models\runtime_neural_squat `
+    --output results\squat_ensemble_eval.json
+# 3. Train + eval GBM, save only if it beats the ensemble
+& $py core\exevision\training\squat\train_quality_gbm_squat.py `
+    --annotation-dir $ann --model-dir models\runtime_neural_squat `
+    --output-dir results --save
+```
+
+**New scripts:**
+- `evaluate_squat_ensemble.py` — mirrors `evaluate_ohp_ensemble.py`; reports quality_mae/pearson/per-bucket MAE/bucket coverage on test split
+- `train_quality_gbm_squat.py` — mirrors `train_quality_gbm.py`; 14-feature LGBMRegressor, α-sweep on val, `--save` refuses unless GBM blend beats ensemble baseline
+
+**Score path:** GBM → safety clamps (knee_valgus≥2→60, forward_lean≥2→65, insufficient_depth≥3→50, subscore_ceiling). When GBM absent → original `heuristic+tanh(residual)×40+clamps` (byte-identical).
+
 ### Deploy (GCR)
 ```bash
 gcloud builds submit --tag "${GCR_REGION}-docker.pkg.dev/${GCP_PROJECT}/exevision-modelai/exevision-modelai:latest" .
@@ -146,13 +175,14 @@ Stages run as **subprocesses** in `pipeline_ui_runs/{run_id}/workspace/`. Logs a
 - **Config-driven:** `core/exevision/config/exercises/{exercise}.json` — thresholds, `metric_cues` (3-tier per-metric issue cues for OHP), `issue_groups` (squat), annotation schemas
 - **Workspace isolation:** all outputs under `workspace_root/{exercise}/`
 - **Models** (all OHP models in `models/runtime_neural_ohp/`):
-  - Squat: `models/runtime_neural_squat/bilstm_finetuned.pt`, `stgcn_finetuned.pt`, `fusion_layer.pt`
+  - **Squat 5-seed ensemble (Session 2026-06-10):** `{bilstm,stgcn,fusion_layer}_seed{42,7,19,3,99}.pt` — 15 files. Same architecture as OHP; handler sets `"ensemble": True`. When seed files absent → single model fallback (byte-identical to pre-ensemble behavior).
+  - **Squat quality GBM meta-learner (Session 2026-06-10):** `models/runtime_neural_squat/quality_gbm.pkl` + `quality_gbm_meta.json`. 14-feature vector (heuristic_score + 5 ensembled heads×100 + 3 heuristic sub-scores + view one-hot). Same α-sweep/refuse-save pattern as OHP. GBM output → safety clamps applied as monotone cap on top.
   - **OHP 5-seed ensemble (CURRENT, production):** `{bilstm,stgcn,fusion}_ohp_finetuned_seed{42,7,19,3,99}.pt` — 15 files, 8 heads. Stage 9 auto-loads these when present (handler `"ensemble": True`); seed7 fusion excluded from quality avg (`"fusion_exclude_seeds": ["_seed7"]`). All 8 gates pass; lockout_auc=0.780.
   - **OHP quality GBM meta-learner (CURRENT, production):** `quality_gbm.pkl` + `quality_gbm_meta.json` (handler `"quality_gbm_name"`). LightGBM trained on 17 tabular features (heuristic anchor + ensemble's own predicted heads + per-metric heuristic scores + view one-hot); blends with neural quality via stored `alpha` (currently 0 = pure GBM). Replaces `neural_score` outright when present (raw kept as `neural_score_pre_gbm`); absent file → pure neural. quality_mae 9.01→7.30, pearson 0.550→0.717. Touches ONLY `quality` — all other heads byte-identical. See `train_quality_gbm.py` + CHANGELOG "LightGBM meta-learner (Phase C)".
   - **OHP finetuned (single, fallback):** `bilstm_ohp_finetuned.pt`, `stgcn_ohp_finetuned.pt`, `fusion_ohp_finetuned.pt` — used when no `_seed*.pt` files exist. quality_mae=8.77 but lockout_auc=0.742 ❌.
   - OHP Phase 2 (pretrain warm-start for finetune): `bilstm/stgcn/fusion_ohp_phase2.pt` — quality + knee_error only
   - OHP Seated: heuristic-only; leg landmarks zeroed (indices 25–32)
-- **Inference routing** (Stage 9): exercise handler from `registry.py`. OHP handler sets `"ensemble": True` → `_load_members()` in `neural_fusion_inference.py` globs `{base}_seed*.pt` triples from `ckpt_dir`, averages all heads per rep (single model = ensemble of 1). `"fusion_exclude_seeds"` drops named seeds from quality/residual avg only. Graceful fallback to single `_finetuned.pt` if no seed files. After ensemble averaging, if handler `"quality_gbm_name"` resolves to an existing file, `_infer_rep` builds a 17-feature vector and overwrites `neural_score` with the alpha-blended GBM prediction (gated/fallback-safe, same pattern). No CLI/pipeline.py changes needed — drop files in to activate.
+- **Inference routing** (Stage 9): exercise handler from `registry.py`. Handler sets `"ensemble": True` → `_load_members()` in `neural_fusion_inference.py` globs `{base}_seed*.pt` triples from `ckpt_dir`, averages all heads per rep (single model = ensemble of 1). `"fusion_exclude_seeds"` drops named seeds from quality/residual avg only. Graceful fallback to single `_finetuned.pt` if no seed files. After ensemble averaging, if handler `"quality_gbm_name"` resolves to an existing file, `_infer_rep` calls `handler["gbm_feature_fn"](heuristic_vec, result)` to build the exercise-specific feature vector and overwrites `neural_score` with the alpha-blended GBM prediction. **Both OHP and squat handlers now carry a `gbm_feature_fn`** — OHP's produces the 17-feature vector (moved there from the old hard-coded block), squat's produces a 14-feature vector. No CLI/pipeline.py changes needed — drop files in to activate.
 - **To add exercise:** create `config/exercises/{name}.json`, optionally add model checkpoints
 
 ---
@@ -202,8 +232,9 @@ Key params: `DOWNWARD_VELOCITY_THRESHOLD=0.0015`, `UPWARD_VELOCITY_THRESHOLD=-0.
 - Output: `{exercise}/aqa_analysis_simple/{quality}/{video_id}/aqa_simple.json`
 
 **Stage 9 — Neural Fusion** (`neural_fusion_inference.py`)
-- `neural_score = clamp(heuristic + tanh(residual)×40, 0, 100)`
 - Exercise-agnostic handler pattern: `get_exercise_handler(exercise)` from `registry.py` returns adjacency, fusion, heuristic builders + default checkpoint paths
+- **Score computation:** no single formula — each exercise has its own `post_process` handler. OHP blending: `alpha * neural_ensemble_quality + (1-alpha) * gbm_pred`. Squat: when GBM present, starts from blended value then applies safety clamps (knee_valgus≥2 → cap 60, forward_lean≥2 → cap 65, insufficient_depth≥3 → cap 50, subscore_ceiling). When GBM absent, falls back to `heuristic + tanh(residual)×40 + clamps` (original behavior).
+- **GBM feature builder:** exercise-aware — handler field `"gbm_feature_fn"` returns a callable `(heuristic_vec, result) → np.array`. OHP produces 17 features, squat produces 14. See `registry.py:_ohp_gbm_features` and `_squat_gbm_features`.
 - To add an exercise: one entry in `_EXERCISE_HANDLER_FACTORIES` + model classes in `_REGISTRY_FACTORIES` in `registry.py`
 - `seated_overhead_press`: `suppress_knee=True` in handler, same OHP model
 - Stage 9 failure is non-fatal: pipeline continues with heuristic scores
@@ -256,6 +287,7 @@ Key params: `DOWNWARD_VELOCITY_THRESHOLD=0.0015`, `UPWARD_VELOCITY_THRESHOLD=-0.
 10. **No lockfile** — `requirements-runtime.txt` unpinned; reproducibility risk.
 11. **Dead code audit** — Several modules confirmed unused: `core/exevision/config/paths.py` + `settings.py` (never imported), `neural/ohp/inference.py` (zero importers), `rules/squat_analysis/` (unreferenced), `legacy_src_reference/` (unreferenced), `training/ohp/{finetune.py,evaluate.py,data.py,finetune_phase3.py,evaluate_phase3.py,tta.py}` (superseded), `training/squat/` + `training/overhead_press/` + `training/seated_overhead_press/` (standalone, never imported). See CHANGELOG 2026-05-14 for full details.
 12. **GCR deployment model paths** — Fixed in 2026-05-14 session. `_get_model_path()` now checks `models/runtime_neural_squat/`, `models/runtime_neural_ohp/`, `models/runtime_pose_and_face/` instead of flat `models/`. `BILSTM_CKPT`/`STGCN_CKPT`/`FUSION_CKPT` restored in `pipeline.py`. Dockerfile ENV vars updated.
+13. **Local repo missing LLM session coaching ("Coach's Notes")** — 2026-06-10: cloud added `LLMFeedbackEnhancer.enhance_session()` (data-grounded session-level DeepSeek summary, see CHANGELOG). `exevision_local` has no `langchain-deepseek`/LLM feedback infra at all — local sessions still use template-only `coach_text`. Intentional drift (cloud-only scope decision); local LLM feedback port is a separate future task, not yet scheduled.
 
 ---
 
