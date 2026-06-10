@@ -334,6 +334,7 @@ def _cleanup_workspace(workspace_root: Path, generate_viz: bool = True, exercise
         f"{exercise}/analysis_reports",
         f"{exercise}/extracted_features_clean",
         f"{exercise}/segmented_reps",
+        f"{exercise}/dataset_videos_all",
     ]
     # Only remove visualization directories if visualization was not requested
     if not generate_viz:
@@ -615,6 +616,31 @@ def _build_feedback_fallback(merged_reps: list[dict[str, Any]], exercise: str = 
     }
 
 
+def _compress_video(input_path: Path, crf: int = 28) -> Path:
+    """Re-encode video with H.264 at given CRF to reduce storage.
+
+    CRF 28 ≈ 80% visual quality with ~40-50% smaller file size.
+    Returns the compressed path; falls back to original on failure.
+    """
+    output_path = input_path.with_name(f"{input_path.stem}_compressed.mp4")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(input_path),
+                "-c:v", "libx264", "-crf", str(crf),
+                "-preset", "fast", "-an",
+                str(output_path),
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        if output_path.exists() and output_path.stat().st_size > 0:
+            return output_path
+    except Exception as exc:
+        logger.warning(f"Video compression failed ({input_path.name}): {exc}")
+    return input_path
+
+
 def _upload_visualization_to_supabase(
     viz_path: Path,
     job_id: str,
@@ -761,26 +787,39 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
             ct = nr.get("control")
             if sm is not None and ct is not None:
                 bilstm_score = round(max(0.0, min(100.0, (sm + ct) / 2.0 * 100.0)), 2)
-            # Prefer the model's own pre-computed aggregate (exercise-agnostic,
-            # correct weighting, immune to scale mismatches between heads).
-            agg = nr.get("aggregated_score")
-            if agg is not None:
-                stgcn_score = round(float(agg), 2)
-            else:
-                # Fallback: average 0-100 spatial sub-scores manually.
-                # Sub-scores from model heads are 0-1; multiply by 100 for display.
-                dp = nr.get("depth")
-                fl = nr.get("forward_lean")
-                kt = nr.get("knee_tracking")
-                spatial_vals = [v * 100.0 for v in (dp, fl, kt) if v is not None]
-                if not spatial_vals:
-                    ef = nr.get("elbow_flare")
-                    gr = nr.get("grip_ratio")
-                    rt = nr.get("rom_top")
-                    rb = nr.get("rom_bottom")
-                    spatial_vals = [v * 100.0 for v in (ef, gr, rt, rb) if v is not None]
-                if spatial_vals:
-                    stgcn_score = round(max(0.0, min(100.0, sum(spatial_vals) / len(spatial_vals))), 2)
+            # Compute ST-GCN score from spatial sub-score average (mirrors the
+            # ensemble-averaged sub-scores shown in the UI).  For squat depth,
+            # blend the ST-GCN head with the heuristic metric to avoid over-
+            # reliance on any single pipeline (same min-biased approach as
+            # aggregate_scores in neural_fusion_inference.py).
+            dp_raw = nr.get("depth")
+            fl = nr.get("forward_lean")
+            kt = nr.get("knee_tracking")
+
+            depth_scaled: float | None = None
+            if dp_raw is not None:
+                heuristic_depth = r.get("score", {}).get("metric_scores", {}).get("depth")
+                if heuristic_depth is not None and heuristic_depth > 0:
+                    lower = min(heuristic_depth, dp_raw * 100.0)
+                    higher = max(heuristic_depth, dp_raw * 100.0)
+                    depth_scaled = round(lower + (higher - lower) * 0.3, 1)
+                else:
+                    depth_scaled = round(dp_raw * 100.0, 1)
+                # Record blended depth (0-1 scale) for sub_scores dict
+                depth_for_subscore = round(depth_scaled / 100.0, 4)
+
+            spatial_vals = [v * 100.0 for v in (fl, kt) if v is not None]
+            if depth_scaled is not None:
+                spatial_vals.append(depth_scaled)
+
+            if not spatial_vals:
+                ef = nr.get("elbow_flare")
+                gr = nr.get("grip_ratio")
+                rt = nr.get("rom_top")
+                rb = nr.get("rom_bottom")
+                spatial_vals = [v * 100.0 for v in (ef, gr, rt, rb) if v is not None]
+            if spatial_vals:
+                stgcn_score = round(max(0.0, min(100.0, sum(spatial_vals) / len(spatial_vals))), 2)
 
         # Phase timeline from Stage 5 segmentation (optional)
         seg_rep = seg_by_id.get(rid)
@@ -824,6 +863,7 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
             "sub_scores": {
                 "smoothness": nr.get("smoothness"),
                 "control": nr.get("control"),
+                "depth": locals().get("depth_for_subscore", nr.get("depth")),
                 "forward_lean": nr.get("forward_lean"),
                 "knee_tracking": nr.get("knee_tracking"),
                 "lockout": nr.get("lockout"),
@@ -1265,8 +1305,8 @@ def run_pipeline_sync(
         # After extraction completes, remove the input video copy — it is no longer
         # needed (stage 2.5 has already produced the feature JSON) and accounts for
         # ~15% of workspace disk usage.
-        # if key == "extract_selected_features":
-        #     _delete_input_video(workspace_root, video_path.name, exercise)
+        if key == "extract_selected_features":
+            _delete_input_video(workspace_root, video_path.name, exercise)
 
     result = collect_results(workspace_root, video_id, exercise)
 
