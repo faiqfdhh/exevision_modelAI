@@ -1296,7 +1296,7 @@ class TemporalSegmenter:
     5. Repetition detection and validation
     """
     
-    def __init__(self, keypoints_data: dict, video_id: str, exercise: str = "squat"):
+    def __init__(self, keypoints_data: dict, video_id: str, exercise: str = "squat", rep_boundaries: Optional[List[Dict]] = None):
         self.video_id = video_id
         self.exercise = exercise
         self.keypoints = keypoints_data.get('keypoints_img', [])
@@ -1313,6 +1313,7 @@ class TemporalSegmenter:
         self.analyzer = BiomechanicalAnalyzer(self.keypoints, self.view, self.fps, exercise=exercise)
         self.state_machine = None
         self.phase_labels = None
+        self.rep_boundaries = rep_boundaries
 
     
     def _validate_view(self) -> bool:
@@ -1360,11 +1361,16 @@ class TemporalSegmenter:
             self.phase_labels = phase_ids
             
             # Step 5: Detect and validate repetitions
-            reps = self._detect_repetitions()
+            # When browser-captured rep boundaries are available, use them instead of
+            # re-running FSM-based rep grouping (Task 6: real-time boundaries bridge).
+            if self.rep_boundaries:
+                reps = self._reps_from_boundaries()
+            else:
+                reps = self._detect_repetitions()
 
-            # ⭐ FALLBACK: if strict detection finds nothing, count by phase cycles only
-            if ENABLE_PHASE_ONLY_REP_FALLBACK and len(reps) == 0:
-                reps = self._detect_repetitions_phase_only()
+                # ⭐ FALLBACK: if strict detection finds nothing, count by phase cycles only
+                if ENABLE_PHASE_ONLY_REP_FALLBACK and len(reps) == 0:
+                    reps = self._detect_repetitions_phase_only()
 
             # Convert phase labels to names
             phase_names_list = [self.state_machine.get_phase_name(int(p)) for p in self.phase_labels]
@@ -1456,6 +1462,53 @@ class TemporalSegmenter:
                 "traceback": traceback.format_exc()
             }
     
+    def _reps_from_boundaries(self) -> List[Repetition]:
+        """Convert browser-captured rep boundaries (seconds relative to recording start)
+        to Repetition objects using FSM phase labels for per-rep phase breakdown.
+
+        Called when self.rep_boundaries is set (Task 6: real-time boundaries bridge).
+        """
+        fps = self.fps
+        reps = []
+        for i, b in enumerate(self.rep_boundaries):
+            start_s = float(b["start_sec"])
+            end_s = float(b["end_sec"])
+            start_frame = max(0, min(self.frame_count - 1, round(start_s * fps)))
+            end_frame = max(0, min(self.frame_count - 1, round(end_s * fps)))
+            if end_frame <= start_frame:
+                continue
+            
+            # Bottom frame: argmax of normalized hip displacement within rep boundary
+            if self.analyzer.normalized_hip_displacement is not None:
+                bottom_slice = self.analyzer.normalized_hip_displacement[start_frame:end_frame + 1]
+                bottom_offset = int(np.argmax(bottom_slice))
+                bottom_frame = start_frame + bottom_offset
+                squat_depth_normalized = float(bottom_slice[bottom_offset])
+            else:
+                bottom_frame = (start_frame + end_frame) // 2
+                squat_depth_normalized = 0.0
+
+            # Knee angle at bottom frame
+            if self.analyzer.knee_angles is not None and bottom_frame < len(self.analyzer.knee_angles):
+                bottom_knee_angle = float(self.analyzer.knee_angles[bottom_frame])
+            else:
+                bottom_knee_angle = 0.0
+
+            # Extract FSM-detected phases within this rep's boundary
+            phases = self._extract_rep_phases(start_frame, end_frame, bottom_frame)
+
+            reps.append(Repetition(
+                rep_id=i + 1,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                phases=phases,
+                squat_depth_normalized=squat_depth_normalized,
+                squat_depth_angle=max(0.0, float(self.analyzer.knee_angles[start_frame]) - bottom_knee_angle) if self.analyzer.knee_angles is not None and start_frame < len(self.analyzer.knee_angles) else 0.0,
+                bottom_frame=bottom_frame,
+                bottom_knee_angle=bottom_knee_angle,
+            ))
+        return reps
+
     def _detect_repetitions(self) -> List[Repetition]:
         """Route to exercise-specific rep detection."""
         if self.exercise.lower() in ("overhead_press", "standing_overhead_press", "seated_overhead_press"):
@@ -1974,15 +2027,25 @@ class TemporalSegmenter:
         return phases
 
 
-def process_video(json_path: str, exercise: str = "squat") -> Tuple[str, str, Optional[dict], Optional[str]]:
+def process_video(json_path: str, exercise: str = "squat", rep_boundaries_path: Optional[str] = None) -> Tuple[str, str, Optional[dict], Optional[str]]:
     """Process a single video's keypoints with exercise-specific segmentation. Returns (video_id, status, result, quality)"""
     video_id = os.path.splitext(os.path.basename(json_path))[0]
+    
+    # Load browser-captured rep boundaries if provided (Task 6: real-time boundaries bridge)
+    rep_boundaries = None
+    if rep_boundaries_path:
+        try:
+            with open(rep_boundaries_path, 'r') as f:
+                rep_boundaries = json.load(f).get("rep_boundaries")
+            print(f"  ℹ Loaded {len(rep_boundaries) if rep_boundaries else 0} browser-captured rep boundaries from {rep_boundaries_path}")
+        except Exception as e:
+            print(f"  ⚠ Failed to load rep_boundaries from {rep_boundaries_path}: {e}")
     
     try:
         with open(json_path, 'r') as f:
             data = json.load(f)
         
-        segmenter = TemporalSegmenter(data, video_id, exercise=exercise)
+        segmenter = TemporalSegmenter(data, video_id, exercise=exercise, rep_boundaries=rep_boundaries)
         result = segmenter.segment()
         
         quality = result.get("info", {}).get("quality_rating", "unknown").lower()
@@ -2140,7 +2203,7 @@ def create_segmentation_visualization(video_id: str, seg_data: dict, quality: st
         return False
 
 
-def run_segmentation(quality_filter=None, create_visualization=True, exercise="squat", video_dir=None):
+def run_segmentation(quality_filter=None, create_visualization=True, exercise="squat", video_dir=None, rep_boundaries_path=None):
     """
     Process all extracted features and segment into reps using biomechanical analysis.
     
@@ -2226,7 +2289,7 @@ def run_segmentation(quality_filter=None, create_visualization=True, exercise="s
         video_id = os.path.splitext(os.path.basename(json_path))[0]
         print(f"\n▶ [{idx}/{len(json_files)}] Segmenting {video_id}...", flush=True)
 
-        video_id, status, result, quality = process_video(json_path, exercise=exercise)
+        video_id, status, result, quality = process_video(json_path, exercise=exercise, rep_boundaries_path=rep_boundaries_path)
         source_quality = quality_mapping.get(json_path, quality)
         
         if status == "Success" and result and "error" not in result:
@@ -2363,6 +2426,7 @@ if __name__ == "__main__":
     parser.add_argument("--exercise", default="squat", help="Exercise type (default: squat)")
     parser.add_argument("--video-dir", help="Path to custom video directory (searches recursively)")
     parser.add_argument("--debug-phases", action="store_true", help="Enable phase detection debug output (outputs to {exercise}/debug_phases/)")
+    parser.add_argument("--rep-boundaries", help="Path to JSON file with browser-captured rep boundaries (list of {start_s, end_s})")
     args = parser.parse_args()
     
     # Enable debug mode if requested
@@ -2388,4 +2452,8 @@ if __name__ == "__main__":
         VIDEO_IDS_TO_PROCESS[:] = [args.video_id]
         print(f"ℹ️  Video filter enabled: {args.video_id}")
 
-    run_segmentation(quality_filter=args.quality, create_visualization=create_viz, exercise=args.exercise, video_dir=args.video_dir)
+    rep_boundaries_path = args.rep_boundaries
+    if rep_boundaries_path:
+        print(f"ℹ️  Browser-captured rep boundaries loaded from: {rep_boundaries_path}")
+
+    run_segmentation(quality_filter=args.quality, create_visualization=create_viz, exercise=args.exercise, video_dir=args.video_dir, rep_boundaries_path=rep_boundaries_path)

@@ -165,6 +165,7 @@ class InferRequest(BaseModel):
     mode: Literal["filtered", "unfiltered"] = "filtered"
     generate_viz: bool = True               # Generate visuals (annotated video outputs from MediaPipe)
     callback_url: str | None = None         # Optional: POST result here when done
+    rep_boundaries: list[dict] | None = None  # Per-rep boundaries (start_sec, end_sec) from browser real-time detection
 
 
 class JobStatus(BaseModel):
@@ -211,7 +212,7 @@ def _fire_callback(callback_url: str, payload: dict[str, Any]) -> None:
 
 
 # ── Background task ────────────────────────────────────────────────────────────
-def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, callback_url: str | None, generate_viz: bool, exercise: str = "squat") -> None:
+def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, callback_url: str | None, generate_viz: bool, exercise: str = "squat", rep_boundaries: list[dict] | None = None) -> None:
     """Downloads the video and runs the full pipeline. Runs in a background thread."""
     import asyncio
 
@@ -235,6 +236,7 @@ def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, ca
                 mode=mode,
                 generate_viz=generate_viz,
                 exercise=exercise,
+                rep_boundaries=rep_boundaries,
             )
 
         _update_job(job_id, status="done", result=result, completed_at=datetime.now(timezone.utc).isoformat())
@@ -315,6 +317,7 @@ def submit_inference(req: InferRequest, background_tasks: BackgroundTasks) -> di
         callback_url=req.callback_url,
         generate_viz=req.generate_viz,
         exercise=req.exercise,
+        rep_boundaries=req.rep_boundaries,
     )
     return {"job_id": job_id, "status": "queued"}
 

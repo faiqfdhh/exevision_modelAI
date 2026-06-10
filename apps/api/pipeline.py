@@ -8,6 +8,7 @@ Does NOT modify any scoring, segmentation, or feature-extraction logic.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -193,7 +194,7 @@ def _prepare_workspace(workspace_root: Path, video_path: Path, exercise: str = "
     shutil.copy2(video_path, dest)
 
 
-def _build_stage_cmd(key: str, script: Path, video_id: str, mode: str, generate_viz: bool = True, exercise: str = "squat") -> list[str]:
+def _build_stage_cmd(key: str, script: Path, video_id: str, mode: str, generate_viz: bool = True, exercise: str = "squat", rep_boundaries_path: str | None = None) -> list[str]:
     """Build the subprocess command for a stage, mirroring app.py arg construction.
 
     API runs skip all visualization outputs (--no-report) by default.
@@ -208,6 +209,8 @@ def _build_stage_cmd(key: str, script: Path, video_id: str, mode: str, generate_
         return cmd
     elif key == "temporal_segmentation":
         cmd = base + ["--video-id", video_id] + exercise_args
+        if rep_boundaries_path:
+            cmd.extend(["--rep-boundaries", rep_boundaries_path])
         if not generate_viz:
             cmd.append("--no-viz")
         return cmd
@@ -238,9 +241,10 @@ def _run_stage(
     mode: str,
     generate_viz: bool = True,
     exercise: str = "squat",
+    rep_boundaries_path: str | None = None,
 ) -> str:
     """Run one pipeline stage; returns captured stdout+stderr."""
-    cmd = _build_stage_cmd(key, script, video_id, mode, generate_viz, exercise)
+    cmd = _build_stage_cmd(key, script, video_id, mode, generate_viz, exercise, rep_boundaries_path)
     env = os.environ.copy()
     env["EXEVISION_MODEL_PATH"] = str(SHARED_MODEL_PATH)
     env["EXEVISION_FACE_MODEL_PATH"] = str(SHARED_FACE_MODEL_PATH)
@@ -847,6 +851,49 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
         merged_reps_count,
     )
     
+    # Convert sub_scores from 0-1 model-head range to 0-100 display range.
+    # Error-probability heads (lockout, knee_error): sigmoid 0-1, higher=worse → (1-val)*100.
+    # Linear quality heads (smoothness, control, depth, forward_lean, knee_tracking, …):
+    # 0-1 quality, higher=better → val*100, clamped to [0, 100].
+    _ERROR_KEYS = ("lockout", "knee_error")
+    _LINEAR_KEYS = (
+        "smoothness", "control", "depth", "forward_lean",
+        "knee_tracking", "elbow_flare", "grip_ratio",
+        "rom_top", "rom_bottom",
+    )
+    for _rep in merged_reps:
+        _sub = _rep.get("sub_scores")
+        if _sub is None:
+            continue
+        for _k in _ERROR_KEYS:
+            _v = _sub.get(_k)
+            if _v is not None:
+                _sub[_k] = round((1 - _v) * 100, 1)
+        for _k in _LINEAR_KEYS:
+            _v = _sub.get(_k)
+            if _v is not None:
+                _sub[_k] = round(max(0.0, min(100.0, _v * 100.0)), 1)
+        _smooth_relax(_sub)
+
+    # Recompute per-rep bilstm_score from relaxed sub-scores
+    for _rep in merged_reps:
+        _sub = _rep.get("sub_scores")
+        if _sub is None:
+            continue
+        sm = _sub.get("smoothness")
+        ct = _sub.get("control")
+        if sm is not None and ct is not None:
+            _rep["bilstm_score"] = round(max(0.0, min(100.0, (sm + ct) / 2.0)), 2)
+
+    for _rep in merged_reps:
+        h = _rep.get("heuristic_score")
+        s = _rep.get("stgcn_score")
+        b = _rep.get("bilstm_score")
+        if h is not None and s is not None and b is not None:
+            _rep["neural_score"] = round((b + s + h) / 3.0, 2)
+            _rep["neural_score_raw"] = None
+
+    # ── Generate feedback (moved here so avg_score uses final neural_score values) ──
     if exercise_config_exists and templates_config_exists and merged_reps:
         print(f"[DIAGNOSTIC] All prereqs met. Initializing FeedbackEngine...", flush=True)
         try:
@@ -859,11 +906,10 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
             )
             print(f"[DIAGNOSTIC] FeedbackEngine initialized successfully", flush=True)
             feedback_input: list[dict[str, Any]] = []
-            
+
             for rep in merged_reps:
                 sub_scores = rep.get("sub_scores") or {}
 
-                # Normalize sub_scores: squat keys for backward compat + OHP keys
                 normalized_sub_scores: dict[str, float | None] = {
                     "forward_lean": sub_scores.get("forward_lean"),
                     "hip_depth": sub_scores.get("depth"),
@@ -879,7 +925,6 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
                     "knee_error": sub_scores.get("knee_error"),
                 }
 
-                # Fallback: squat metrics only present in AQA metric_scores
                 metric_scores = rep.get("metric_scores") or {}
                 if normalized_sub_scores.get("forward_lean") is None:
                     normalized_sub_scores["forward_lean"] = metric_scores.get("forward_lean_deg")
@@ -892,7 +937,6 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
 
                 n_score = rep.get("neural_score") if rep.get("neural_score") is not None else rep.get("heuristic_score")
 
-                # Forward OHP neural keys at top level so _emit_metric_cues can find them
                 feedback_input.append({
                     "rep_id": rep.get("rep_id"),
                     "neural_score": n_score,
@@ -909,7 +953,6 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
 
             print(f"[DIAGNOSTIC] Built feedback_input for {len(feedback_input)} reps. Calling generate_feedback...", flush=True)
             feedback_result = feedback_engine.generate_feedback(feedback_input, video_id=video_id)
-            # LLM feedback enhancement — non-fatal, feature-flagged via DEEPSEEK_API_KEY
             _deepseek_key = os.environ.get("DEEPSEEK_API_KEY")
             if _deepseek_key:
                 try:
@@ -988,55 +1031,12 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
             flush=True,
         )
     else:
-        # Log why we skip feedback generation
         if not exercise_config_exists:
             print(f"[DIAGNOSTIC] Skipping feedback: exercise_config not found at {FEEDBACK_EXERCISE_CONFIG}", flush=True)
         if not templates_config_exists:
             print(f"[DIAGNOSTIC] Skipping feedback: templates_config not found at {FEEDBACK_TEMPLATES_CONFIG}", flush=True)
         if not merged_reps:
             print(f"[DIAGNOSTIC] Skipping feedback: no merged_reps to process (count={merged_reps_count})", flush=True)
-
-    # Convert sub_scores from 0-1 model-head range to 0-100 display range.
-    # Error-probability heads (lockout, knee_error): sigmoid 0-1, higher=worse → (1-val)*100.
-    # Linear quality heads (smoothness, control, depth, forward_lean, knee_tracking, …):
-    # 0-1 quality, higher=better → val*100, clamped to [0, 100].
-    _ERROR_KEYS = ("lockout", "knee_error")
-    _LINEAR_KEYS = (
-        "smoothness", "control", "depth", "forward_lean",
-        "knee_tracking", "elbow_flare", "grip_ratio",
-        "rom_top", "rom_bottom",
-    )
-    for _rep in merged_reps:
-        _sub = _rep.get("sub_scores")
-        if _sub is None:
-            continue
-        for _k in _ERROR_KEYS:
-            _v = _sub.get(_k)
-            if _v is not None:
-                _sub[_k] = round((1 - _v) * 100, 1)
-        for _k in _LINEAR_KEYS:
-            _v = _sub.get(_k)
-            if _v is not None:
-                _sub[_k] = round(max(0.0, min(100.0, _v * 100.0)), 1)
-        _smooth_relax(_sub)
-
-    # Recompute per-rep bilstm_score from relaxed sub-scores
-    for _rep in merged_reps:
-        _sub = _rep.get("sub_scores")
-        if _sub is None:
-            continue
-        sm = _sub.get("smoothness")
-        ct = _sub.get("control")
-        if sm is not None and ct is not None:
-            _rep["bilstm_score"] = round(max(0.0, min(100.0, (sm + ct) / 2.0)), 2)
-
-    for _rep in merged_reps:
-        h = _rep.get("heuristic_score")
-        s = _rep.get("stgcn_score")
-        b = _rep.get("bilstm_score")
-        if h is not None and s is not None and b is not None:
-            _rep["neural_score"] = round((b + s + h) / 3.0, 2)
-            _rep["neural_score_raw"] = None
 
     neural_scores = [r["neural_score"] for r in merged_reps if r["neural_score"] is not None]
     bilstm_scores = [r["bilstm_score"] for r in merged_reps if r["bilstm_score"] is not None]
@@ -1145,11 +1145,16 @@ def run_pipeline_sync(
     mode: str = "filtered",
     generate_viz: bool = True,
     exercise: str = "squat",
+    rep_boundaries: list[dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     """
     Run the full pipeline synchronously for a single video.
     Called from a background thread/process by the API server.
     Returns the merged result dict.
+
+    When rep_boundaries is provided (list of {start_sec, end_sec} from browser
+    real-time rep detection), the temporal segmentation stage is given a
+    --rep-boundaries path to override FSM-based rep grouping.
     """
     print(f"[DIAGNOSTIC] run_pipeline_sync START: job_id={job_id}, video={video_path.name}, stages={stages or 'default'}, mode={mode}, exercise={exercise}", flush=True)
     stages = stages or DEFAULT_STAGES
@@ -1162,6 +1167,16 @@ def run_pipeline_sync(
 
     _prepare_workspace(workspace_root, video_path, exercise)
     video_id = video_path.stem
+
+    # Write browser-captured rep boundaries when provided (Task 5: real-time boundaries bridge)
+    rep_boundaries_path: str | None = None
+    if rep_boundaries:
+        boundaries_file = workspace_root / "rep_boundaries.json"
+        boundaries_file.write_text(
+            json.dumps({"rep_boundaries": rep_boundaries}, ensure_ascii=False), encoding="utf-8"
+        )
+        rep_boundaries_path = str(boundaries_file)
+        logger.info("[pipeline] Wrote %d browser-captured rep boundaries to %s", len(rep_boundaries), boundaries_file)
     
     # Build exercise-specific stage specs
     stage_specs = _build_stage_specs(exercise)
@@ -1220,7 +1235,7 @@ def run_pipeline_sync(
             # Neural fusion is optional: if it fails, we still return feedback based on heuristic scores.
             # All other stages are mandatory: failure propagates.
             try:
-                _run_stage(key, spec.script, video_id, workspace_root, logs_root, mode, generate_viz, exercise)
+                _run_stage(key, spec.script, video_id, workspace_root, logs_root, mode, generate_viz, exercise, rep_boundaries_path)
                 _validate_stage_output(key, workspace_root, video_id, exercise)
             except RuntimeError as exc:
                 if key == "neural_fusion":
