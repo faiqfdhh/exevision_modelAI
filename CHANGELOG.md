@@ -1,5 +1,33 @@
 # ExeVision AI — Development Session Log
 
+## 2026-06-10 — Coach's Notes: data-grounded session-level LLM summary
+
+**Problem:** `session.coach_text` was pure template (`feedback_templates.json` → `trajectory_openers` +
+`coach_cue`), producing generic output like "Tough session - it happens. Next time, focus on lockout."
+regardless of actual per-rep data.
+
+**Change:**
+- `engine.py`: `generate_feedback()` now builds a `session_digest` (per-rep `score`, `tier`,
+  humanized `sub_scores`, `issues`/`wins` with cue text) during the existing rep loop, attached as
+  new backend-only `SessionSummary.session_digest` field (not sent to frontend).
+- `llm_enhancer.py`: new `LLMFeedbackEnhancer.enhance_session()` — feeds the full `session_digest`
+  JSON + exercise/avg_score/trajectory to DeepSeek via a new prompt, returns a 3-5 sentence
+  "Coach's Notes" referencing concrete metrics/trends across reps + 1-2 actionable recommendations.
+  Same fallback pattern as `enhance_rep` (any failure → original template `coach_text` survives).
+- `pipeline.py`: calls `enhance_session()` after `enhance_result()`, same `DEEPSEEK_API_KEY` gate,
+  separate try/except so a session-enhancement failure doesn't affect per-rep enhancement.
+- Webapp: consolidated duplicate "Coach's Notes" display — removed the redundant box from
+  `SessionSummary.tsx`; renamed the top "Coach Guidance" card (squat + OHP layouts) to
+  "Coach's Notes" and gave OHP the same AI disclaimer squat already had.
+- Runs uniformly for 1-rep and multi-rep sessions (no rep_count gate) — for 1 rep it just narrates
+  that rep's metrics in depth.
+
+Tests: `tests/feedback/test_llm_enhancer.py` — 5 new `enhance_session` tests (replace, fallback,
+digest payload shape, reps untouched, original not mutated). `pytest tests/` — 33 passed.
+
+**Scope note:** cloud-only. `exevision_local` has no DeepSeek/LLM feedback infra at all (see Active
+Issues #13) — local session coaching stays template-based until that infra is ported.
+
 ## 2026-06-08 — Benchmarked 9 alternative quality meta-learners vs deployed LightGBM — NONE WIN, GBM STAYS
 
 **Question:** could a different model beat the deployed LightGBM's `quality_mae=7.30`?

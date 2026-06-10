@@ -921,6 +921,12 @@ def collect_results(workspace_root: Path, video_id: str, exercise: str = "squat"
                     print("[DIAGNOSTIC] LLM feedback enhancement applied", flush=True)
                 except Exception as _llm_exc:
                     logger.warning("LLM feedback enhancement failed, returning template-based feedback: %s", _llm_exc)
+                try:
+                    if _llm_feedback_enhancer_cache is not None:
+                        feedback_result = _llm_feedback_enhancer_cache.enhance_session(feedback_result)
+                        print("[DIAGNOSTIC] LLM session enhancement applied", flush=True)
+                except Exception as _llm_session_exc:
+                    logger.warning("LLM session enhancement failed, returning template-based coach_text: %s", _llm_session_exc)
             print(f"[DIAGNOSTIC] generate_feedback returned successfully with {len(feedback_result.reps)} reps", flush=True)
             feedback_payload = {
                 "schema_version": "2.0",

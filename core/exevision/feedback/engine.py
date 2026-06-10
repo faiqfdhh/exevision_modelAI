@@ -45,6 +45,9 @@ class SessionSummary:
     aggregate_text: str
     coach_text: str
     trajectory: str
+    # Backend-only structured per-rep data for LLM session-level coaching.
+    # Not serialized into the frontend feedback payload.
+    session_digest: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -164,6 +167,7 @@ class FeedbackEngine:
     def generate_feedback(self, rep_scores: list[dict[str, Any]], video_id: str = "unknown_video") -> FeedbackResult:
         """Generate per-rep and session-level feedback from score data."""
         rep_feedbacks: list[RepFeedback] = []
+        session_digest: list[dict[str, Any]] = []
         previous_rep: dict[str, Any] | None = None
 
         threshold = float(self.exercise_config.get("improvement_threshold", 75.0))
@@ -214,6 +218,27 @@ class FeedbackEngine:
             scored_items = self._item_builder.assign_item_scores(sub_scores, all_item_dicts)
             sorted_items = self._item_builder.sort_items_by_severity(scored_items)
 
+            session_digest.append({
+                "rep_id": rep_id,
+                "score": round(score),
+                "tier": tier,
+                "sub_scores": {
+                    self._renderer.humanize_metric(k): round(v)
+                    for k, v in sub_scores.items()
+                    if v is not None
+                },
+                "issues": [
+                    {"metric": self._renderer.humanize_metric(it["metric_key"]), "score": it["score"], "cue": it["text"]}
+                    for it in sorted_items
+                    if it.get("type") == "issue"
+                ],
+                "wins": [
+                    {"metric": self._renderer.humanize_metric(it["metric_key"]), "cue": it["text"]}
+                    for it in sorted_items
+                    if it.get("type") == "win"
+                ],
+            })
+
             rep_feedbacks.append(
                 RepFeedback(
                     rep_id=rep_id,
@@ -232,7 +257,7 @@ class FeedbackEngine:
                 "sub_scores": sub_scores,
             }
 
-        session_summary = self._build_session_summary(rep_scores, threshold)
+        session_summary = self._build_session_summary(rep_scores, threshold, session_digest)
 
         return FeedbackResult(
             schema_version=self.exercise_config.get("schema_version", "1.0"),
@@ -616,7 +641,9 @@ class FeedbackEngine:
 
         return " ".join(part for part in parts if part).strip()
 
-    def _build_session_summary(self, rep_scores: list[dict[str, Any]], threshold: float) -> SessionSummary:
+    def _build_session_summary(
+        self, rep_scores: list[dict[str, Any]], threshold: float, session_digest: list[dict[str, Any]]
+    ) -> SessionSummary:
         overall_scores = [float(rep.get("neural_score") or 0.0) for rep in rep_scores]
         metric_scores = [self._sanitize_scores(rep.get("sub_scores", {})) for rep in rep_scores]
 
@@ -668,6 +695,7 @@ class FeedbackEngine:
             aggregate_text=aggregate_text,
             coach_text=coach_text,
             trajectory=trajectory,
+            session_digest=session_digest,
         )
 
     def _resolve_issue_cue_text(self, metric_key: str) -> str:

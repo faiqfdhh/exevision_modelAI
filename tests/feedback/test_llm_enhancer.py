@@ -1,6 +1,7 @@
 # tests/feedback/test_llm_enhancer.py
 """Unit tests for LLMFeedbackEnhancer — all LLM calls mocked."""
 import dataclasses
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -34,7 +35,20 @@ def _make_rep(rep_id=1, score=55.0, tier="poor", text="Original template text.")
     )
 
 
-def _make_result(reps=None, exercise="overhead_press"):
+def _make_session_digest():
+    return [
+        {
+            "rep_id": 1,
+            "score": 55,
+            "tier": "poor",
+            "sub_scores": {"rom top": 20},
+            "issues": [{"metric": "rom top", "score": 20, "cue": "Fix lockout."}],
+            "wins": [],
+        }
+    ]
+
+
+def _make_result(reps=None, exercise="overhead_press", session_digest=None):
     return FeedbackResult(
         schema_version="1.0",
         exercise=exercise,
@@ -46,15 +60,23 @@ def _make_result(reps=None, exercise="overhead_press"):
             aggregate_text="Keep working on rom_top.",
             coach_text="Next time focus on rom_top.",
             trajectory="stable",
+            session_digest=_make_session_digest() if session_digest is None else session_digest,
         ),
     )
 
 
 def _make_enhancer(llm_response: str) -> LLMFeedbackEnhancer:
-    """Build enhancer with mocked chain — no real API calls."""
+    """Build enhancer with mocked rep chain — no real API calls."""
     mock_chain = MagicMock()
     mock_chain.invoke.return_value = llm_response
     return LLMFeedbackEnhancer(api_key="fake-key", _chain=mock_chain)
+
+
+def _make_session_enhancer(llm_response: str) -> LLMFeedbackEnhancer:
+    """Build enhancer with mocked session chain — no real API calls."""
+    mock_chain = MagicMock()
+    mock_chain.invoke.return_value = llm_response
+    return LLMFeedbackEnhancer(api_key="fake-key", _session_chain=mock_chain)
 
 
 # ── tests ─────────────────────────────────────────────────────────────────────
@@ -179,3 +201,63 @@ def test_enhance_result_partial_failure_isolated():
     assert enhanced.reps[0].text == "Enhanced rep 1."
     assert enhanced.reps[1].text == "Original 2."   # fallback
     assert enhanced.reps[2].text == "Enhanced rep 3."
+
+
+# ── enhance_session tests ───────────────────────────────────────────────────
+
+def test_enhance_session_replaces_coach_text():
+    """enhance_session replaces session.coach_text with LLM output."""
+    enhancer = _make_session_enhancer("Lockout dropped from 80 to 55 across reps — drive to full extension.")
+    result = _make_result()
+    enhanced = enhancer.enhance_session(result)
+
+    assert enhanced.session.coach_text == "Lockout dropped from 80 to 55 across reps — drive to full extension."
+
+
+def test_enhance_session_falls_back_on_exception():
+    """enhance_session returns original result when chain raises."""
+    mock_chain = MagicMock()
+    mock_chain.invoke.side_effect = RuntimeError("API timeout")
+    enhancer = LLMFeedbackEnhancer(api_key="fake-key", _session_chain=mock_chain)
+    result = _make_result()
+
+    enhanced = enhancer.enhance_session(result)
+
+    assert enhanced.session.coach_text == result.session.coach_text
+
+
+def test_enhance_session_passes_digest_to_chain():
+    """enhance_session passes exercise, rep_count, avg_score, trajectory, and digest JSON."""
+    mock_chain = MagicMock()
+    mock_chain.invoke.return_value = "Enhanced session notes."
+    enhancer = LLMFeedbackEnhancer(api_key="fake-key", _session_chain=mock_chain)
+    result = _make_result(exercise="overhead_press")
+
+    enhancer.enhance_session(result)
+
+    call_kwargs = mock_chain.invoke.call_args[0][0]
+    assert call_kwargs["exercise"] == "overhead_press"
+    assert call_kwargs["rep_count"] == 1
+    assert call_kwargs["avg_score"] == 55
+    assert call_kwargs["trajectory"] == "stable"
+    assert json.loads(call_kwargs["session_digest"]) == _make_session_digest()
+
+
+def test_enhance_session_leaves_reps_unchanged():
+    """enhance_session does not modify per-rep feedback."""
+    enhancer = _make_session_enhancer("Enhanced session notes.")
+    result = _make_result()
+    enhanced = enhancer.enhance_session(result)
+
+    assert enhanced.reps == result.reps
+
+
+def test_enhance_session_original_unchanged():
+    """enhance_session returns a new object; original FeedbackResult is not mutated."""
+    enhancer = _make_session_enhancer("Enhanced session notes.")
+    result = _make_result()
+    original_coach_text = result.session.coach_text
+
+    enhancer.enhance_session(result)
+
+    assert result.session.coach_text == original_coach_text
