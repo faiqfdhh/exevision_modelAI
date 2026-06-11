@@ -29,6 +29,7 @@ load_dotenv(".env.local", override=True)  # .env.local overrides .env
 import logging
 import sys
 from pathlib import Path
+import re
 
 # Ensure apps/api/ is on sys.path so `pipeline` is importable when running
 # as `uvicorn apps.api.main:app` from the project root.
@@ -90,6 +91,15 @@ def _update_job(job_id: str, **kwargs: Any) -> None:
     with _jobs_lock:
         if job_id in _jobs:
             _jobs[job_id].update(kwargs)
+
+
+def _sanitize_error(msg: str, max_len: int = 200) -> str:
+    """Strip file paths and truncate for safe user-facing errors."""
+    msg = re.sub(r'[A-Z]:(?:\\[^\\\s]+)+', '<path>', msg)
+    msg = re.sub(r'(?:/[^/\s]+)+/', '<path>/', msg)
+    if len(msg) > max_len:
+        msg = msg[:max_len] + '…'
+    return msg
 
 
 def _normalize_stage_selection(requested_stages: list[str] | None) -> list[str]:
@@ -239,6 +249,13 @@ def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, ca
                 rep_boundaries=rep_boundaries,
             )
 
+        if result.get("extraction_failed"):
+            reason = result.get("extraction_failure_reason", "Pose extraction failed")
+            _update_job(job_id, status="failed", error=reason, completed_at=datetime.now(timezone.utc).isoformat())
+            if callback_url:
+                _fire_callback(callback_url, {"job_id": job_id, "status": "failed", "error": reason, "visualization_url": None, "visualization_available": False})
+            return
+
         _update_job(job_id, status="done", result=result, completed_at=datetime.now(timezone.utc).isoformat())
 
         # Fire-and-forget callback to Next.js / Supabase if requested
@@ -253,17 +270,18 @@ def _pipeline_task(job_id: str, video_url: str, stages: list[str], mode: str, ca
             _fire_callback(callback_url, callback_payload)
 
     except Exception as exc:
+        err_msg = _sanitize_error(str(exc))
         _update_job(
             job_id,
             status="failed",
-            error=str(exc),
+            error=err_msg,
             completed_at=datetime.now(timezone.utc).isoformat(),
         )
         if callback_url:
             callback_payload = {
                 "job_id": job_id,
                 "status": "failed",
-                "error": str(exc),
+                "error": err_msg,
                 "visualization_url": None,
                 "visualization_available": False,
             }

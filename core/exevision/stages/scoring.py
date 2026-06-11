@@ -1021,8 +1021,8 @@ def _score_overhead_press(
     pose landmarks alone; requires actual bar position detection).
     """
     weights: Dict[str, float] = config.get("metric_weights", {
-        "grip_ratio": 0.25,
-        "rom": 0.25, "lockout": 0.25, "elbow_flare": 0.25,
+        "grip_ratio": 0.30,
+        "rom": 0.35, "lockout": 0.05, "elbow_flare": 0.30,
     })
 
     # Side view: use 2D angles (Z depth unreliable when arm extends toward/away from camera)

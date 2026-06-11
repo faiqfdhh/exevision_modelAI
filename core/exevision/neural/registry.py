@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Type
 
+import numpy as np
+
 
 def _lazy_squat():
     from nn_models import BiLSTMScorer, STGCNScorer
@@ -43,6 +45,40 @@ def get_model_classes(exercise: str) -> Dict[str, Type[Any]]:
 ExerciseHandler = Dict[str, Any]
 
 
+def _squat_gbm_features(heuristic_vec, result: dict) -> np.ndarray:
+    """14-feature GBM vector for squat: 5 heads×100, heuristic×100, view one-hot."""
+    return np.array([[
+        float(heuristic_vec[0]) * 100.0,
+        result.get("smoothness", 0.0) * 100.0,
+        result.get("control", 0.0) * 100.0,
+        result.get("depth", 0.0) * 100.0,
+        result.get("forward_lean", 0.0) * 100.0,
+        result.get("knee_tracking", 0.0) * 100.0,
+        float(heuristic_vec[1]) * 100.0,
+        float(heuristic_vec[2]) * 100.0,
+        float(heuristic_vec[3]) * 100.0,
+        float(heuristic_vec[10]),
+        float(heuristic_vec[11]),
+        float(heuristic_vec[12]),
+        float(heuristic_vec[13]),
+        float(heuristic_vec[14]),
+    ]], dtype=np.float64)
+
+
+def _ohp_gbm_features(heuristic_vec, result: dict) -> np.ndarray:
+    """17-feature GBM vector for OHP — moved from neural_fusion_inference.py hardcode."""
+    return np.array([[
+        float(heuristic_vec[0]) * 100.0,
+        result.get("smoothness", 0.0), result.get("control", 0.0),
+        result.get("lockout", 0.0), result.get("elbow_flare", 0.0),
+        result.get("grip_ratio", 0.0), result.get("rom_top", 0.0), result.get("rom_bottom", 0.0),
+        float(heuristic_vec[1]) * 100.0, float(heuristic_vec[2]) * 100.0,
+        float(heuristic_vec[3]) * 100.0, float(heuristic_vec[4]) * 100.0,
+        float(heuristic_vec[11]), float(heuristic_vec[12]), float(heuristic_vec[13]),
+        float(heuristic_vec[14]), float(heuristic_vec[15]),
+    ]], dtype=np.float64)
+
+
 def _handler_squat() -> ExerciseHandler:
     from nn_models import HeuristicGuidedFusion, build_heuristic_vector
     from nn_utils import build_adjacency_matrix
@@ -59,6 +95,7 @@ def _handler_squat() -> ExerciseHandler:
         "fusion_ckpt_name": "fusion_layer.pt",
         "suppress_knee": False,
         "grip_ratio_side_exclude": False,
+        "gbm_feature_fn": _squat_gbm_features,
     }
 
 
@@ -108,6 +145,7 @@ def _handler_ohp() -> ExerciseHandler:
         # (same fallback pattern as "ensemble"). See train_quality_gbm.py.
         "quality_gbm_name": "quality_gbm.pkl",
         "quality_gbm_meta_name": "quality_gbm_meta.json",
+        "gbm_feature_fn": _ohp_gbm_features,
     }
 
 
